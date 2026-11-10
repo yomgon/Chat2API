@@ -26,7 +26,8 @@ export function mapOAuthCredentials(
 
   if (!provider.credentialFields || provider.credentialFields.length === 0) {
     console.warn(`[AccountUtils] No credential fields defined for provider ${provider.id}`)
-    return credentials as Record<string, string>
+    return Object.fromEntries(Object.entries(credentials)
+      .filter((entry): entry is [string, string] => typeof entry[1] === 'string'))
   }
 
   for (const field of provider.credentialFields) {
@@ -77,13 +78,10 @@ export function createAccount(
   return {
     providerId,
     credentials,
-    name: accountInfo?.name,
+    name: accountInfo?.name || accountInfo?.email || `${providerId} Account`,
     email: accountInfo?.email,
-    userId: accountInfo?.userId,
     status: 'active',
     lastUsed: undefined,
-    usageCount: 0,
-    metadata: {},
   }
 }
 

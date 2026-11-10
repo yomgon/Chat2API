@@ -70,7 +70,7 @@ export function LoadBalanceConfig({ onConfigChange }: LoadBalanceConfigProps) {
       
       setWeights(mergedWeights)
     } catch (error) {
-      console.error(t('proxy.failedToGetAccounts'), error)
+      console.error('[Renderer] Operation failed')
     }
   }
 

@@ -7,13 +7,14 @@ import Router from '@koa/router'
 import type { Context } from 'koa'
 import { managementAuthMiddleware } from '../../middleware/managementAuth'
 import ProviderManager from '../../../store/providers'
+import { ProviderEndpointTrustError } from '../../../providers/endpointTrust'
 import type {
   Provider,
   CreateProviderRequest,
   UpdateProviderRequest,
   ProviderStatusRequest,
   ManagementApiResponse,
-} from '../../../../../shared/types'
+} from '../../../../shared/types'
 
 const router = new Router({ prefix: '/v0/management/providers' })
 
@@ -34,6 +35,13 @@ function createSuccessResponse<T>(data: T): ManagementApiResponse<T> {
     success: true,
     data,
   }
+}
+
+function handleEndpointTrustError(ctx: Context, error: unknown): boolean {
+  if (!(error instanceof ProviderEndpointTrustError)) return false
+  ctx.status = error.code === 'endpoint_origin_change_requires_reconnect' ? 409 : 400
+  ctx.body = createErrorResponse(error.code, error.message)
+  return true
 }
 
 router.get('/', async (ctx: Context) => {
@@ -72,6 +80,11 @@ router.get('/:id', async (ctx: Context) => {
 router.post('/', async (ctx: Context) => {
   try {
     const request = ctx.request.body as CreateProviderRequest
+    if (!request || typeof request !== 'object' || Array.isArray(request)) {
+      ctx.status = 400
+      ctx.body = createErrorResponse('invalid_request', 'Request body must be an object')
+      return
+    }
 
     if (!request.name || typeof request.name !== 'string') {
       ctx.status = 400
@@ -108,6 +121,7 @@ router.post('/', async (ctx: Context) => {
     ctx.body = createSuccessResponse(provider)
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Failed to create provider'
+    if (handleEndpointTrustError(ctx, error)) return
     ctx.status = 500
     ctx.body = createErrorResponse('internal_error', errorMessage)
   }
@@ -117,6 +131,11 @@ router.put('/:id', async (ctx: Context) => {
   try {
     const id = ctx.params.id
     const request = ctx.request.body as UpdateProviderRequest
+    if (!request || typeof request !== 'object' || Array.isArray(request)) {
+      ctx.status = 400
+      ctx.body = createErrorResponse('invalid_request', 'Request body must be an object')
+      return
+    }
 
     const existingProvider = ProviderManager.getById(id)
     if (!existingProvider) {
@@ -175,6 +194,7 @@ router.put('/:id', async (ctx: Context) => {
     ctx.body = createSuccessResponse(updatedProvider)
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Failed to update provider'
+    if (handleEndpointTrustError(ctx, error)) return
 
     if (errorMessage.includes('Built-in providers cannot modify')) {
       ctx.status = 403

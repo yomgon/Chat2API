@@ -1,12 +1,14 @@
 /**
  * In-App Login Manager
- * Manages in-app browser window for OAuth login and token extraction
+ * Keeps provider credentials inside the main process and the selected session.
  */
 
-import { BrowserWindow, session, Session } from 'electron'
+import { BrowserWindow, session, Session, Cookie } from 'electron'
 import { EventEmitter } from 'events'
+import { randomUUID } from 'crypto'
 import { ProviderType } from './types'
-import { TokenExtractionConfig, getTokenExtractionConfig, TokenSource } from './tokenExtractionConfig'
+import { TokenExtractionConfig, getTokenExtractionConfig } from './tokenExtractionConfig'
+import { readZaiSessionClaims, readZaiTokenIdentity, zaiPersistentPartition } from './zaiSession'
 
 export interface InAppLoginResult {
   success: boolean
@@ -17,6 +19,8 @@ export interface InAppLoginResult {
 export interface TokenFoundEvent {
   key: string
   value: string
+  generation: number
+  allCookies?: Record<string, string>
 }
 
 export interface InAppLoginOptions {
@@ -24,254 +28,421 @@ export interface InAppLoginOptions {
   providerType: ProviderType
   timeout?: number
   proxyMode?: 'system' | 'none'
+  persistentAccountId?: string
 }
 
-const DEFAULT_TIMEOUT = 300000 // 5 minutes
-const MIN_LOGIN_TIME = 5000 // Minimum time before checking tokens (5 seconds)
+const DEFAULT_TIMEOUT = 300000
+const MIN_LOGIN_TIME = 5000
+const TOKEN_CHECK_INTERVAL = 2000
+const TOKEN_READ_TIMEOUT = 1500
+const FLUSH_TIMEOUT = 5000
+const ZAI_ORIGIN = 'https://chat.z.ai'
+const ZAI_COOKIE_URL = ZAI_ORIGIN + '/api/v1/auths/'
+// webRequest has one listener per event, so a session must have one login owner.
+const sessionOwners = new WeakMap<Session, object>()
+
+interface TokenCheckOperation {
+  generation: number
+  documentGeneration: number
+  window: BrowserWindow
+  cancelWaiters: Set<() => void>
+}
+
+interface TokenReadLease {
+  window: BrowserWindow
+  kind: 'storage' | 'cookies'
+}
+
+function isExactZaiUrl(value: unknown): boolean {
+  if (typeof value !== 'string') return false
+  try {
+    const url = new URL(value)
+    return url.origin === ZAI_ORIGIN && !url.username && !url.password
+  } catch {
+    return false
+  }
+}
+
+function isZaiTokenCookie(cookie: Cookie): boolean {
+  if (cookie.name !== 'token' || typeof cookie.value !== 'string') return false
+  const domain = cookie.domain
+  const matchesHost = domain === 'chat.z.ai' ||
+    (domain === '.chat.z.ai' && cookie.hostOnly !== true) ||
+    ((domain === 'z.ai' || domain === '.z.ai') && cookie.hostOnly === false)
+  const path = cookie.path
+  const requestPath = '/api/v1/auths/'
+  const matchesPath = typeof path === 'string' && path.startsWith('/') &&
+    (requestPath === path || (requestPath.startsWith(path) &&
+      (path.endsWith('/') || requestPath[path.length] === '/')))
+  const unexpired = cookie.expirationDate === undefined ||
+    (Number.isFinite(cookie.expirationDate) && cookie.expirationDate > Date.now() / 1000)
+  return matchesHost && matchesPath && unexpired
+}
 
 export class InAppLoginManager extends EventEmitter {
   private loginWindow: BrowserWindow | null = null
   private loginSession: Session | null = null
-  private foundTokens: Map<string, string> = new Map()
   private config: TokenExtractionConfig | null = null
-  private isCompleted: boolean = false
-  private timeoutId: NodeJS.Timeout | null = null
-  private resolvePromise: ((result: InAppLoginResult) => void) | null = null
-  private loginStartTime: number = 0
-  private lastTokenCheckTime: number = 0
   private options: InAppLoginOptions | null = null
-
-  constructor() {
-    super()
-  }
+  private isCompleted = false
+  private finalizing = false
+  private attemptGeneration = 0
+  // Public validation ticket: a navigation cannot reuse a previous document's
+  // authenticated result, even while the same login window remains open.
+  private generation = 0
+  private documentGeneration = 0
+  private documentReady = false
+  private navigationPending = false
+  private loginStartTime = 0
+  private timeoutId: NodeJS.Timeout | null = null
+  private tokenCheckTimer: NodeJS.Timeout | null = null
+  private flushTimer: NodeJS.Timeout | null = null
+  private cancelFlush: (() => void) | null = null
+  private resolvePromise: ((result: InAppLoginResult) => void) | null = null
+  private checkingOperation: TokenCheckOperation | null = null
+  private readonly pendingTokenReads = new Set<TokenReadLease>()
+  private sessionOwner: object = {}
+  private cookieChangedHandler: ((event: Electron.Event, cookie: Cookie, cause: string, removed: boolean) => void) | null = null
+  private detachWindowHandlers: (() => void) | null = null
+  private readonly seenZaiTokens = new Set<string>()
+  private zaiStorageSeenInDocument = false
 
   async startLogin(options: InAppLoginOptions): Promise<InAppLoginResult> {
-    if (this.loginWindow) {
-      return {
-        success: false,
-        error: 'A login window is already open',
-      }
+    if (this.loginWindow || this.resolvePromise) {
+      return { success: false, error: 'A login window is already open' }
     }
-
-    this.config = getTokenExtractionConfig(options.providerType)
-    if (!this.config) {
-      return {
-        success: false,
-        error: `No token extraction config found for provider: ${options.providerType}`,
-      }
+    if (options.persistentAccountId !== undefined && options.providerType !== 'zai') {
+      return { success: false, error: 'Persistent login is only supported for Z.ai' }
     }
-
-    this.foundTokens.clear()
+    if (options.timeout !== undefined &&
+        (!Number.isFinite(options.timeout) || options.timeout <= 0 || options.timeout > DEFAULT_TIMEOUT)) {
+      return { success: false, error: 'Invalid login timeout' }
+    }
+    const config = getTokenExtractionConfig(options.providerType)
+    if (!config || (options.providerType === 'zai' && !isExactZaiUrl(config.loginUrl))) {
+      return { success: false, error: 'No trusted login configuration is available' }
+    }
+    this.config = config
+    this.options = { ...options }
     this.isCompleted = false
+    this.finalizing = false
+    this.documentReady = false
+    this.navigationPending = false
+    this.documentGeneration = 0
+    this.cancelTokenCheck()
     this.loginStartTime = Date.now()
-    this.lastTokenCheckTime = 0
-    this.options = options
+    this.seenZaiTokens.clear()
+    this.zaiStorageSeenInDocument = false
+    this.sessionOwner = {}
+    const generation = ++this.attemptGeneration
+    this.generation++
 
     return new Promise((resolve) => {
       this.resolvePromise = resolve
-
       this.timeoutId = setTimeout(() => {
-        this.complete({
-          success: false,
-          error: 'Login timeout',
-        })
-      }, options.timeout || DEFAULT_TIMEOUT)
-
-      this.emit('status', { status: 'starting', message: 'Opening login window...' })
-
-      this.createLoginWindow()
-      this.setupTokenInterception()
+        this.complete({ success: false, error: 'Login timeout' }, generation)
+      }, options.timeout ?? DEFAULT_TIMEOUT)
+      try {
+        this.emit('status', { status: 'starting', message: 'Opening login window...' })
+        this.createLoginWindow(generation)
+      } catch {
+        this.complete({ success: false, error: 'Unable to start login' }, generation)
+      }
     })
   }
 
-  private createLoginWindow(): void {
-    if (!this.config) return
+  private isZai(): boolean {
+    return this.options?.providerType === 'zai'
+  }
 
-    const partition = `persist:oauth-${Date.now()}`
-    this.loginSession = session.fromPartition(partition)
-
-    if (this.options?.proxyMode === 'none') {
-      this.loginSession.setProxy({ mode: 'direct' }).catch((error) => {
-        console.error('[InAppLogin] Failed to set direct proxy:', error)
-      })
+  private isZaiTokenCandidate(value: unknown): boolean {
+    if (this.options?.persistentAccountId !== undefined) {
+      const identity = readZaiTokenIdentity(value)
+      if (!identity) return false
+      // Unknown expiry is a candidate only. The persistent account manager must
+      // verify it with the official server before calling completeWithSuccess.
+      if (!identity.expiryKnown) return true
     }
+    return readZaiSessionClaims(value)?.usable === true
+  }
 
-    this.loginWindow = new BrowserWindow({
+  private isCurrent(generation: number, window: BrowserWindow | null = this.loginWindow): boolean {
+    return generation === this.attemptGeneration && !this.isCompleted &&
+      !!window && window === this.loginWindow && !window.isDestroyed() &&
+      !window.webContents.isDestroyed()
+  }
+
+  private canCapture(generation: number, window: BrowserWindow, documentGeneration?: number): boolean {
+    if (!this.isCurrent(generation, window) || this.finalizing) return false
+    if (documentGeneration !== undefined && documentGeneration !== this.documentGeneration) return false
+    return !this.isZai() || (!this.navigationPending && this.documentReady &&
+      isExactZaiUrl(window.webContents.getURL()))
+  }
+
+  private createLoginWindow(generation: number = this.attemptGeneration): void {
+    if (!this.config) return
+    const partition = this.options?.persistentAccountId !== undefined
+      ? zaiPersistentPartition(this.options.persistentAccountId)
+      : 'oauth-' + randomUUID()
+    const loginSession = session.fromPartition(partition)
+    if (sessionOwners.has(loginSession)) throw new Error('Login session is already in use')
+    sessionOwners.set(loginSession, this.sessionOwner)
+    this.loginSession = loginSession
+    const window = new BrowserWindow({
       width: 500,
       height: 700,
       show: false,
       webPreferences: {
         nodeIntegration: false,
         contextIsolation: true,
+        sandbox: true,
         partition,
         webSecurity: true,
+        allowRunningInsecureContent: false,
         javascript: true,
       },
       title: this.config.windowTitle || 'Login',
       autoHideMenuBar: true,
     })
-
-    this.loginWindow.once('ready-to-show', () => {
-      this.loginWindow?.show()
+    this.loginWindow = window
+    const ready = () => {
+      if (!this.isCurrent(generation, window)) return
+      window.show()
       this.emit('status', { status: 'ready', message: 'Login window ready - please log in' })
-    })
-
-    this.loginWindow.on('closed', () => {
-      if (!this.isCompleted) {
-        this.complete({
-          success: false,
-          error: 'Login window was closed',
-        })
+    }
+    const closed = () => {
+      this.complete({ success: false, error: 'Login window was closed' }, generation)
+    }
+    const loaded = () => {
+      if (!this.isCurrent(generation, window) || this.navigationPending) return
+      this.documentReady = true
+      this.delayedTokenCheck(generation)
+    }
+    const navigating = (_event: Electron.Event, _url: string, inPlace: boolean, isMainFrame: boolean) => {
+      if (!isMainFrame || inPlace || !this.isCurrent(generation, window)) return
+      this.documentGeneration++
+      this.generation++
+      this.seenZaiTokens.clear()
+      this.zaiStorageSeenInDocument = false
+      this.navigationPending = true
+      this.cancelTokenCheck()
+    }
+    const committed = () => {
+      if (!this.isCurrent(generation, window)) return
+      if (!this.navigationPending) {
+        this.documentGeneration++
+        this.generation++
+        this.seenZaiTokens.clear()
+        this.zaiStorageSeenInDocument = false
+        this.cancelTokenCheck()
       }
-    })
-
-    this.loginWindow.loadURL(this.config.loginUrl).catch((error) => {
-      this.complete({
-        success: false,
-        error: `Failed to load login page: ${error.message}`,
+      this.navigationPending = false
+      this.documentReady = false
+    }
+    const stopped = () => {
+      if (!this.isCurrent(generation, window) || window.webContents.isLoadingMainFrame()) return
+      // A cancelled provisional navigation may leave the previously ready
+      // document displayed. Never revive its old validation ticket.
+      if (this.navigationPending && this.documentReady && isExactZaiUrl(window.webContents.getURL())) {
+        this.navigationPending = false
+      }
+      this.delayedTokenCheck(generation)
+    }
+    const inPage = (_event: Electron.Event, _url: string, isMainFrame: boolean) => {
+      if (isMainFrame === false || !this.isCurrent(generation, window)) return
+      this.delayedTokenCheck(generation)
+    }
+    const navigationGuard = (event: Electron.Event, url: string) => {
+      try {
+        const parsed = new URL(url)
+        if (parsed.protocol === 'https:' && !parsed.username && !parsed.password) return
+      } catch {
+        // Navigation errors may contain credentials; do not expose the URL.
+      }
+      event.preventDefault()
+      stopped()
+    }
+    window.once('ready-to-show', ready)
+    window.on('closed', closed)
+    window.webContents.on('dom-ready', loaded)
+    window.webContents.on('did-finish-load', loaded)
+    window.webContents.on('did-start-navigation', navigating)
+    window.webContents.on('did-navigate', committed)
+    window.webContents.on('did-stop-loading', stopped)
+    window.webContents.on('did-navigate-in-page', inPage)
+    if (this.isZai()) {
+      window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
+      window.webContents.on('will-navigate', navigationGuard)
+      window.webContents.on('will-redirect', navigationGuard)
+    }
+    this.detachWindowHandlers = () => {
+      window.off('ready-to-show', ready)
+      window.off('closed', closed)
+      window.webContents.off('dom-ready', loaded)
+      window.webContents.off('did-finish-load', loaded)
+      window.webContents.off('did-start-navigation', navigating)
+      window.webContents.off('did-navigate', committed)
+      window.webContents.off('did-stop-loading', stopped)
+      window.webContents.off('did-navigate-in-page', inPage)
+      window.webContents.off('will-navigate', navigationGuard)
+      window.webContents.off('will-redirect', navigationGuard)
+    }
+    this.setupTokenInterception(generation)
+    const loginUrl = this.config.loginUrl
+    const navigate = () => {
+      if (!this.isCurrent(generation, window)) return
+      this.delayedTokenCheck(generation)
+      const initialDocument = this.documentGeneration + 1
+      void window.loadURL(loginUrl).catch(() => {
+        if (this.documentGeneration > initialDocument) return
+        this.complete({ success: false, error: 'Failed to load login page' }, generation)
       })
-    })
+    }
+    if (this.isZai() || this.options?.proxyMode === 'none') {
+      // A reused persistent session retains its previous proxy mode.
+      const mode = this.options?.proxyMode === 'none' ? 'direct' : 'system'
+      void loginSession.setProxy({ mode }).then(navigate).catch(() => {
+        this.complete({ success: false, error: 'Unable to configure login connection' }, generation)
+      })
+    } else {
+      navigate()
+    }
   }
 
-  private setupTokenInterception(): void {
-    if (!this.loginSession || !this.config) return
+  private setupTokenInterception(generation: number = this.attemptGeneration): void {
+    const loginSession = this.loginSession
+    const window = this.loginWindow
+    const config = this.config
+    if (!loginSession || !window || !config) return
+    const isZai = this.isZai()
+    const requestIsOwned = (details: { url: string; webContentsId?: number }) =>
+      !isZai || (isExactZaiUrl(details.url) && details.webContentsId === window.webContents.id)
 
-    // Intercept response headers to capture Set-Cookie headers
-    // This is needed for HttpOnly + Secure cookies that may not be accessible via cookies.get()
-    this.loginSession.webRequest.onHeadersReceived((details, callback) => {
-      if (this.isCompleted) {
+    loginSession.webRequest.onHeadersReceived((details, callback) => {
+      try {
+        if (!this.canCapture(generation, window) || !requestIsOwned(details)) return
+        if (!this.hasMinTimePassed()) {
+          this.delayedTokenCheck(generation)
+          return
+        }
+        const headers = details.responseHeaders?.['set-cookie'] || details.responseHeaders?.['Set-Cookie']
+        if (!Array.isArray(headers)) return
+        if (isZai) {
+          // The browser validates Domain/Path/expiry. Never trust raw Set-Cookie
+          // values; read only the current token cookie for the exact auth URL.
+          if (headers.some(header => typeof header === 'string' && /^token=/.test(header))) {
+            this.delayedTokenCheck(generation)
+          }
+          return
+        }
+        for (const header of headers) {
+          const nameValue = header.split(';')[0]?.trim()
+          const equal = nameValue?.indexOf('=') ?? -1
+          if (equal <= 0) continue
+          const name = nameValue.substring(0, equal)
+          let value = nameValue.substring(equal + 1)
+          if (value.startsWith('"') && value.endsWith('"')) value = value.slice(1, -1)
+          for (const source of config.tokenSources) {
+            if (source.type === 'cookie' && source.key === name) {
+              this.emitToken(name, value, generation, window)
+            }
+          }
+        }
+      } catch {
+        console.error('[InAppLogin] Unable to inspect login response')
+      } finally {
         callback({})
-        return
       }
-
-      const setCookieHeaders = details.responseHeaders?.['set-cookie'] || details.responseHeaders?.['Set-Cookie']
-      if (setCookieHeaders && Array.isArray(setCookieHeaders)) {
-        for (const cookieHeader of setCookieHeaders) {
-          console.log('[InAppLogin] Set-Cookie header:', cookieHeader.substring(0, 100))
-          
-          const cookieParts = cookieHeader.split(';')
-          const nameValue = cookieParts[0]?.trim()
-          if (nameValue) {
-            const equalIndex = nameValue.indexOf('=')
-            if (equalIndex > 0) {
-              const name = nameValue.substring(0, equalIndex)
-              let value = nameValue.substring(equalIndex + 1)
-              
-              // Remove surrounding quotes from the value (RFC 6265 allows quoted cookie values)
-              if (value.startsWith('"') && value.endsWith('"')) {
-                value = value.slice(1, -1)
-                console.log('[InAppLogin] Removed quotes from cookie value:', name)
-              }
-              
-              for (const source of this.config!.tokenSources) {
-                if (source.type === 'cookie' && name === source.key) {
-                  console.log('[InAppLogin] Found target cookie in Set-Cookie header:', name)
-                  if (this.isValidToken(value)) {
-                    console.log('[InAppLogin] Cookie token is valid from Set-Cookie header')
-                    this.emit('tokenFound', { key: source.key, value: value })
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-
-      callback({})
     })
 
-    this.loginSession.webRequest.onBeforeSendHeaders((details, callback) => {
-      if (this.isCompleted) {
+    loginSession.webRequest.onBeforeSendHeaders((details, callback) => {
+      try {
+        if (!this.canCapture(generation, window) || !requestIsOwned(details)) return
+        if (!this.hasMinTimePassed()) {
+          this.delayedTokenCheck(generation)
+          return
+        }
+        const auth = details.requestHeaders['Authorization'] || details.requestHeaders['authorization']
+        if (typeof auth !== 'string') return
+        if (isZai) {
+          const match = /^Bearer ([A-Za-z0-9_.-]+)$/.exec(auth)
+          if (match) this.emitToken('token', match[1], generation, window)
+          return
+        }
+        for (const source of config.tokenSources) {
+          if (source.type !== 'networkHeader') continue
+          const match = source.extractPattern ? auth.match(new RegExp(source.extractPattern)) : null
+          const value = match?.[1] ?? (auth.startsWith('Bearer ') ? auth.substring(7) : auth)
+          this.emitToken(source.key, value, generation, window)
+        }
+      } catch {
+        console.error('[InAppLogin] Unable to inspect login request')
+      } finally {
         callback({ requestHeaders: details.requestHeaders })
-        return
       }
+    })
 
-      if (!this.hasMinTimePassed()) {
-        callback({ requestHeaders: details.requestHeaders })
-        return
-      }
-
-      const authHeader = details.requestHeaders['Authorization'] || details.requestHeaders['authorization']
-      if (authHeader) {
-        for (const source of this.config!.tokenSources) {
-          if (source.type === 'networkHeader') {
-            let token = authHeader
-            if (source.extractPattern) {
-              const match = authHeader.match(new RegExp(source.extractPattern))
-              if (match && match[1]) {
-                token = match[1]
-              }
-            } else if (authHeader.startsWith('Bearer ')) {
-              token = authHeader.substring(7)
-            }
-            if (this.isValidToken(token)) {
-              this.emit('tokenFound', { key: source.key, value: token })
-            }
+    this.cookieChangedHandler = (_event, cookie, _cause, removed) => {
+      try {
+        if (removed || !this.canCapture(generation, window)) return
+        if (isZai) {
+          // Cookie events are session-wide and have no originating window.
+          if (isZaiTokenCookie(cookie)) this.delayedTokenCheck(generation)
+          return
+        }
+        if (!this.hasMinTimePassed()) {
+          this.delayedTokenCheck(generation)
+          return
+        }
+        for (const source of config.tokenSources) {
+          if (source.type === 'cookie' && source.key === cookie.name) {
+            this.emitToken(source.key, cookie.value, generation, window)
           }
         }
+        void this.checkForTokens(generation)
+      } catch {
+        console.error('[InAppLogin] Unable to inspect login cookie')
       }
-
-      callback({ requestHeaders: details.requestHeaders })
-    })
-
-    this.loginSession.cookies.on('changed', async (_event, cookie, _cause, removed) => {
-      if (this.isCompleted || removed) return
-
-      console.log('[InAppLogin] Cookie changed:', { name: cookie.name, value: cookie.value ? cookie.value.substring(0, 50) + '...' : 'null', removed })
-
-      if (!this.hasMinTimePassed()) {
-        console.log('[InAppLogin] Min time not passed, skipping cookie check')
-        return
-      }
-
-      for (const source of this.config!.tokenSources) {
-        if (source.type === 'cookie' && cookie.name === source.key) {
-          console.log('[InAppLogin] Cookie matches source key:', source.key)
-          if (this.isValidToken(cookie.value)) {
-            console.log('[InAppLogin] Cookie token is valid, emitting tokenFound')
-            this.emit('tokenFound', { key: source.key, value: cookie.value })
-          } else {
-            console.log('[InAppLogin] Cookie token is invalid:', cookie.value ? cookie.value.substring(0, 50) : 'null')
-          }
-        }
-      }
-
-      console.log('[InAppLogin] Checking all cookies after change')
-      await this.checkForTokens()
-    })
-
-    this.loginWindow?.webContents.on('did-finish-load', () => {
-      console.log('[InAppLogin] Page finished loading, starting token checks')
-      this.delayedTokenCheck()
-    })
-
-    this.loginWindow?.webContents.on('did-navigate-in-page', () => {
-      console.log('[InAppLogin] Page navigated, starting delayed token check')
-      this.delayedTokenCheck()
-    })
+    }
+    loginSession.cookies.on('changed', this.cookieChangedHandler)
   }
 
   private hasMinTimePassed(): boolean {
     return Date.now() - this.loginStartTime >= MIN_LOGIN_TIME
   }
 
-  private delayedTokenCheck(): void {
-    const now = Date.now()
-    if (now - this.lastTokenCheckTime < 2000) return
-    this.lastTokenCheckTime = now
+  private delayedTokenCheck(generation: number = this.attemptGeneration, delay = 1000): void {
+    if (!this.isCurrent(generation) || this.finalizing || this.tokenCheckTimer) return
+    const wait = Math.max(delay, MIN_LOGIN_TIME - (Date.now() - this.loginStartTime))
+    const timer = setTimeout(() => {
+      if (this.tokenCheckTimer === timer) this.tokenCheckTimer = null
+      if (!this.isCurrent(generation) || this.finalizing) return
+      void this.checkForTokens(generation).then(() => {
+        if (this.isCurrent(generation) && !this.finalizing) {
+          this.delayedTokenCheck(generation, TOKEN_CHECK_INTERVAL)
+        }
+      }).catch(() => {
+        console.error('[InAppLogin] Unable to check login storage')
+      })
+    }, wait)
+    this.tokenCheckTimer = timer
+  }
 
-    setTimeout(() => {
-      if (this.isCompleted) return
-      if (!this.loginWindow || this.loginWindow.isDestroyed()) return
-      if (this.loginWindow.webContents.isDestroyed()) return
-      if (this.hasMinTimePassed()) {
-        this.checkForTokens()
-      }
-    }, 1000)
+  private emitToken(key: string, value: unknown, generation: number, window: BrowserWindow,
+    allCookies?: Record<string, string>): void {
+    if (!this.canCapture(generation, window) || !this.hasMinTimePassed() || typeof value !== 'string') return
+    if (this.isZai()) {
+      if (key !== 'token' || !this.isZaiTokenCandidate(value) ||
+          this.seenZaiTokens.has(value) || this.seenZaiTokens.size >= 32) return
+      this.seenZaiTokens.add(value)
+      this.emit('tokenFound', { key: 'token', value, generation: this.generation } satisfies TokenFoundEvent)
+    } else if (this.isValidToken(value)) {
+      this.emit('tokenFound', { key, value, generation: this.generation, ...(allCookies ? { allCookies } : {}) } satisfies TokenFoundEvent)
+    }
   }
 
   private isValidToken(value: string): boolean {
-    console.log('[InAppLogin] Checking token validity:', value.length, value.substring(0, 20))
+    console.log('[InAppLogin] Checking token validity')
     
     if (!value || value.length < 5) {
       console.log('[InAppLogin] Token rejected: too short or empty')
@@ -298,7 +469,7 @@ export class InAppLoginManager extends EventEmitter {
       if (parts.length === 3) {
         try {
           const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString())
-          console.log('[InAppLogin] JWT payload:', payload)
+          console.log('[InAppLogin] JWT payload decoded')
           
           // Reject guest accounts
           if (payload.email && payload.email.includes('@guest.com')) {
@@ -347,185 +518,291 @@ export class InAppLoginManager extends EventEmitter {
     return false
   }
 
-  private async checkForTokens(): Promise<void> {
-    if (!this.loginWindow || this.isCompleted || !this.config) return
+  private isTokenCheckCurrent(operation: TokenCheckOperation): boolean {
+    return this.checkingOperation === operation &&
+      this.canCapture(operation.generation, operation.window, operation.documentGeneration)
+  }
 
-    if (this.loginWindow.isDestroyed()) {
-      console.log('[InAppLogin] Window is destroyed, skipping token check')
-      return
-    }
-
-    const webContents = this.loginWindow.webContents
-    if (webContents.isDestroyed()) {
-      console.log('[InAppLogin] webContents is destroyed, skipping token check')
-      return
-    }
-
-    const localStorageSources = this.config.tokenSources.filter((s) => s.type === 'localStorage')
-    const cookieSources = this.config.tokenSources.filter((s) => s.type === 'cookie')
-
-    if (localStorageSources.length === 0 && cookieSources.length === 0) return
-
-    console.log('[InAppLogin] Checking tokens, localStorage:', localStorageSources.map(s => s.key), 'cookies:', cookieSources.map(s => s.key))
-
-    try {
-      for (const source of localStorageSources) {
-        if (webContents.isDestroyed() || this.isCompleted) {
-          console.log('[InAppLogin] webContents destroyed or login completed, stopping token check')
-          return
-        }
-        const script = `
-          (function() {
-            try {
-              const value = localStorage.getItem('${source.key}');
-              console.log('[InAppLogin] localStorage.getItem("${source.key}"):', value);
-              return value || null;
-            } catch (e) {
-              console.error('[InAppLogin] Error reading localStorage:', e);
-              return null;
-            }
-          })()
-        `
-        const value = await webContents.executeJavaScript(script)
-        console.log('[InAppLogin] Got value from localStorage:', source.key, value ? value.substring(0, 50) + '...' : 'null')
-
-        if (source.key === 'user_detail_agent' && value) {
-          try {
-            const parsed = JSON.parse(value)
-            const realUserID = parsed.realUserID || parsed.id
-            if (realUserID) {
-              console.log('[InAppLogin] Found realUserID from user_detail_agent:', realUserID)
-              this.emit('tokenFound', { key: 'realUserID', value: String(realUserID) })
-            }
-          } catch (e) {
-            console.error('[InAppLogin] Error parsing user_detail_agent:', e)
-          }
-          continue
-        }
-
-        let tokenValue = value
-        if (value && value.startsWith('{') && value.endsWith('}')) {
-          try {
-            const parsed = JSON.parse(value)
-            if (parsed.value) {
-              tokenValue = parsed.value
-              console.log('[InAppLogin] Extracted token from JSON:', tokenValue.substring(0, 50) + '...')
-            }
-          } catch (e) {
-            console.error('[InAppLogin] Error parsing JSON token:', e)
-          }
-        }
-
-        if (tokenValue && typeof tokenValue === 'string' && this.isValidToken(tokenValue)) {
-          console.log('[InAppLogin] Token found and valid from localStorage:', source.key)
-          const emitKey = source.key === '_token' ? 'token' : source.key
-          this.emit('tokenFound', { key: emitKey, value: tokenValue })
-        }
-      }
-
-      for (const source of cookieSources) {
-        if (!this.loginSession) continue
-
-        const allCookies = await this.loginSession.cookies.get({})
-        console.log('[InAppLogin] All cookies count:', allCookies.length)
-        console.log('[InAppLogin] All cookies:', allCookies.map(c => `${c.name}=${c.value?.substring(0, 20)}...`))
-        
-        const targetDomains = this.config?.targetDomains || []
-        let cookiesToSearch = allCookies
-        
-        for (const domain of targetDomains) {
-          try {
-            const domainCookies = await this.loginSession.cookies.get({ domain })
-            console.log(`[InAppLogin] Domain cookies for ${domain}:`, domainCookies.map(c => c.name))
-            for (const dc of domainCookies) {
-              if (!cookiesToSearch.find(c => c.name === dc.name)) {
-                cookiesToSearch.push(dc)
-              }
-            }
-          } catch (e) {
-            console.log(`[InAppLogin] Error getting cookies for domain ${domain}:`, e)
-          }
-        }
-        
-        console.log('[InAppLogin] Combined cookies to search:', cookiesToSearch.map(c => c.name))
-
-        const cookie = cookiesToSearch.find(c => c.name === source.key)
-        if (cookie) {
-          console.log('[InAppLogin] Found cookie:', source.key, cookie.value ? cookie.value.substring(0, 50) + '...' : 'null')
-
-          if (cookie.value && this.isValidToken(cookie.value)) {
-            console.log('[InAppLogin] Token found and valid from cookie:', source.key, 'emitting tokenFound event')
-            const allCookiesObj: Record<string, string> = {}
-            for (const c of cookiesToSearch) {
-              if (c.value) {
-                allCookiesObj[c.name] = c.value
-              }
-            }
-            this.emit('tokenFound', { key: source.key, value: cookie.value, allCookies: allCookiesObj })
-          } else {
-            console.log('[InAppLogin] Cookie token is invalid:', source.key, cookie.value ? cookie.value.substring(0, 50) : 'null')
-          }
-        } else {
-          console.log('[InAppLogin] Cookie not found:', source.key)
-        }
-      }
-    } catch (error) {
-      console.error('[InAppLogin] Error in checkForTokens:', error)
+  private cancelTokenCheck(): void {
+    const operation = this.checkingOperation
+    this.checkingOperation = null
+    if (operation) {
+      for (const cancel of [...operation.cancelWaiters]) cancel()
     }
   }
 
-  completeWithSuccess(credentials: Record<string, string>): void {
-    this.complete({
-      success: true,
-      credentials,
+  private async readTokenValue<T>(
+    operation: TokenCheckOperation,
+    kind: TokenReadLease['kind'],
+    read: () => Promise<T>,
+  ): Promise<T | undefined> {
+    if (!this.isTokenCheckCurrent(operation) ||
+        [...this.pendingTokenReads].some(lease => lease.window === operation.window && lease.kind === kind)) return
+    // A timeout stops waiting; Electron cannot cancel executeJavaScript. Keep
+    // one physical read per source/window until its promise actually settles.
+    const lease: TokenReadLease = { window: operation.window, kind }
+    this.pendingTokenReads.add(lease)
+    let pending: Promise<T>
+    try {
+      pending = Promise.resolve(read())
+    } catch {
+      this.pendingTokenReads.delete(lease)
+      console.error('[InAppLogin] Unable to read login storage')
+      return
+    }
+    const observed = pending.then(value => {
+      this.pendingTokenReads.delete(lease)
+      return value
+    }, () => {
+      this.pendingTokenReads.delete(lease)
+      console.error('[InAppLogin] Unable to read login storage')
+      return undefined
+    })
+    return new Promise<T | undefined>(resolve => {
+      let settled = false
+      let timer: NodeJS.Timeout | undefined
+      const finish = (value: T | undefined) => {
+        if (settled) return
+        settled = true
+        if (timer) clearTimeout(timer)
+        operation.cancelWaiters.delete(cancel)
+        resolve(value)
+      }
+      const cancel = () => finish(undefined)
+      operation.cancelWaiters.add(cancel)
+      timer = setTimeout(cancel, TOKEN_READ_TIMEOUT)
+      void observed.then(finish)
+      if (!this.isTokenCheckCurrent(operation)) cancel()
     })
   }
 
-  private complete(result: InAppLoginResult): void {
-    if (this.isCompleted) return
+  private async checkForTokens(generation: number = this.attemptGeneration): Promise<void> {
+    const window = this.loginWindow
+    const loginSession = this.loginSession
+    const config = this.config
+    if (!window || !loginSession || !config || !this.canCapture(generation, window) ||
+        !this.hasMinTimePassed() || this.checkingOperation) return
+    const operation: TokenCheckOperation = {
+      generation, documentGeneration: this.documentGeneration, window, cancelWaiters: new Set(),
+    }
+    this.checkingOperation = operation
+    const isZai = this.isZai()
+    const checkStorage = async () => {
+      const localSources = isZai ? [{ key: 'token' }] :
+        config.tokenSources.filter(source => source.type === 'localStorage')
+      for (const source of localSources) {
+        if (!this.isTokenCheckCurrent(operation)) return
+        const script = [
+          '(function() {',
+          '  try {',
+          isZai ? '    if (location.origin !== "https://chat.z.ai" || new URL(location.href).username || new URL(location.href).password) return null;' : '',
+          '    return localStorage.getItem(' + JSON.stringify(source.key) + ') || null;',
+          '  } catch { return null; }',
+          '})()',
+        ].join('\n')
+        const value = await this.readTokenValue(operation, 'storage',
+          () => window.webContents.executeJavaScript(script))
+        if (!this.isTokenCheckCurrent(operation)) return
+        if (typeof value !== 'string') continue
+        if (!isZai && source.key === 'user_detail_agent') {
+          try {
+            const parsed = JSON.parse(value)
+            const userId = parsed.realUserID || parsed.id
+            if (userId) this.emitToken('realUserID', String(userId), generation, window)
+          } catch {
+            console.error('[InAppLogin] Error parsing user details')
+          }
+          continue
+        }
+        let token: unknown = value
+        if (!isZai && value.startsWith('{') && value.endsWith('}')) {
+          try {
+            const parsed = JSON.parse(value)
+            if (parsed.value) token = parsed.value
+          } catch {
+            console.error('[InAppLogin] Error parsing JSON token')
+          }
+        }
+        if (isZai && this.isZaiTokenCandidate(token)) {
+          // The official web client reads localStorage.token. After observing
+          // one eligible storage token, stale cookie reads must not supersede
+          // it in this document even when the two reads settle out of order.
+          this.zaiStorageSeenInDocument = true
+        }
+        this.emitToken(source.key === '_token' ? 'token' : source.key, token, generation, window)
+      }
+    }
+    const checkCookies = async () => {
+      if (!this.isTokenCheckCurrent(operation)) return
+      if (isZai) {
+        const cookies = await this.readTokenValue(operation, 'cookies',
+          () => loginSession.cookies.get({ url: ZAI_COOKIE_URL, name: 'token' }))
+        if (!this.isTokenCheckCurrent(operation) || !cookies) return
+        const values = [...new Set(cookies.filter(isZaiTokenCookie).map(cookie => cookie.value))]
+        // Different applicable cookies with the same name are ambiguous.
+        if (values.length === 1 && !this.zaiStorageSeenInDocument) {
+          this.emitToken('token', values[0], generation, window)
+        }
+        return
+      }
+      for (const source of config.tokenSources.filter(entry => entry.type === 'cookie')) {
+        if (!this.isTokenCheckCurrent(operation)) return
+        const initialCookies = await this.readTokenValue(operation, 'cookies', () => loginSession.cookies.get({}))
+        if (!this.isTokenCheckCurrent(operation) || !initialCookies) return
+        const cookies = [...initialCookies]
+        for (const domain of config.targetDomains || []) {
+          const extra = await this.readTokenValue(operation, 'cookies', () => loginSession.cookies.get({ domain }))
+          if (!this.isTokenCheckCurrent(operation)) return
+          for (const cookie of extra || []) {
+            if (!cookies.some(existing => existing.name === cookie.name)) cookies.push(cookie)
+          }
+        }
+        if (!this.isTokenCheckCurrent(operation)) return
+        const cookie = cookies.find(entry => entry.name === source.key)
+        if (cookie) {
+          const allCookies: Record<string, string> = {}
+          for (const entry of cookies) {
+            if (entry.value) allCookies[entry.name] = entry.value
+          }
+          this.emitToken(source.key, cookie.value, generation, window, allCookies)
+        }
+      }
+    }
+    try {
+      // Cookie extraction must work even while Electron suspends renderer code
+      // until loading stops, or when either source rejects or never settles.
+      if (isZai) await Promise.all([checkCookies(), checkStorage()])
+      else {
+        await checkStorage()
+        await checkCookies()
+      }
+    } catch {
+      console.error('[InAppLogin] Error checking login storage')
+    } finally {
+      for (const cancel of [...operation.cancelWaiters]) cancel()
+      if (this.checkingOperation === operation) this.checkingOperation = null
+    }
+  }
+  completeWithSuccess(credentials: Record<string, string>, expectedGeneration?: number): void {
+    const generation = this.attemptGeneration
+    const window = this.loginWindow
+    if (!window || !this.canCapture(generation, window) || !this.hasMinTimePassed() ||
+        (expectedGeneration !== undefined && expectedGeneration !== this.generation)) return
+    // An asynchronous Z.ai validation must identify the document that emitted it.
+    // Persistent callers must have verified the identity with the official server;
+    // structural capture alone (including unknown expiry) never completes login.
+    if (this.isZai() && (expectedGeneration === undefined || !this.isZaiTokenCandidate(credentials.token))) return
+    const saved = this.isZai() ? { token: credentials.token } : { ...credentials }
+    if (this.options?.persistentAccountId !== undefined && this.loginSession) {
+      this.finalizing = true
+      this.cancelTokenCheck()
+      if (this.tokenCheckTimer) clearTimeout(this.tokenCheckTimer)
+      this.tokenCheckTimer = null
+      void this.flushAndComplete(saved, generation, this.generation, window, this.loginSession)
+    } else {
+      this.complete({ success: true, credentials: saved }, generation)
+    }
+  }
+
+  private async flushAndComplete(credentials: Record<string, string>, generation: number, validationGeneration: number,
+    window: BrowserWindow, loginSession: Session): Promise<void> {
+    const stopped = new Promise<boolean>((resolve) => {
+      this.cancelFlush = () => resolve(false)
+      this.flushTimer = setTimeout(() => resolve(false), FLUSH_TIMEOUT)
+    })
+    const flushed = Promise.resolve().then(async () => {
+      if (!this.isCurrent(generation, window)) return false
+      loginSession.flushStorageData()
+      await loginSession.cookies.flushStore()
+      return true
+    }).catch(() => false)
+    const success = await Promise.race([stopped, flushed])
+    if (!this.isCurrent(generation, window)) return
+    if (validationGeneration !== this.generation || !this.documentReady ||
+        !isExactZaiUrl(window.webContents.getURL())) {
+      this.complete({ success: false, error: 'Login page changed before completion' }, generation)
+      return
+    }
+    this.complete(success
+      ? { success: true, credentials }
+      : { success: false, error: 'Unable to preserve the login session' }, generation)
+  }
+
+  private complete(result: InAppLoginResult, generation: number = this.attemptGeneration): void {
+    if (generation !== this.attemptGeneration || this.isCompleted) return
     this.isCompleted = true
-
-    if (this.timeoutId) {
-      clearTimeout(this.timeoutId)
-      this.timeoutId = null
-    }
-
-    if (this.loginWindow && !this.loginWindow.isDestroyed()) {
-      this.loginWindow.close()
-    }
-
+    this.finalizing = false
+    const window = this.loginWindow
+    const resolve = this.resolvePromise
+    this.resolvePromise = null
     this.cleanup()
-
-    if (this.resolvePromise) {
-      this.resolvePromise(result)
-      this.resolvePromise = null
+    if (window && !window.isDestroyed()) {
+      try {
+        // Do not allow a page's beforeunload handler to retain the old session.
+        window.destroy()
+      } catch {
+        console.error('[InAppLogin] Unable to close login window')
+      }
     }
-
-    this.emit('complete', result)
+    resolve?.(result)
+    try {
+      this.emit('complete', result)
+    } catch {
+      console.error('[InAppLogin] Login completion listener failed')
+    }
   }
 
   private cleanup(): void {
-    if (this.loginSession) {
+    if (this.timeoutId) clearTimeout(this.timeoutId)
+    if (this.tokenCheckTimer) clearTimeout(this.tokenCheckTimer)
+    if (this.flushTimer) clearTimeout(this.flushTimer)
+    this.timeoutId = null
+    this.tokenCheckTimer = null
+    this.flushTimer = null
+    const cancelFlush = this.cancelFlush
+    this.cancelFlush = null
+    cancelFlush?.()
+    this.cancelTokenCheck()
+    this.pendingTokenReads.clear()
+    const loginSession = this.loginSession
+    const cookieHandler = this.cookieChangedHandler
+    this.loginSession = null
+    this.cookieChangedHandler = null
+    if (loginSession && sessionOwners.get(loginSession) === this.sessionOwner) {
       try {
-        this.loginSession.webRequest.onBeforeSendHeaders(() => {})
-        this.loginSession.cookies.removeAllListeners()
-      } catch (error) {
-        console.error('[InAppLogin] Error cleaning up session:', error)
+        loginSession.webRequest.onBeforeSendHeaders(null)
+      } catch {
+        console.error('[InAppLogin] Error detaching login request listener')
       }
-      this.loginSession = null
+      try {
+        loginSession.webRequest.onHeadersReceived(null)
+      } catch {
+        console.error('[InAppLogin] Error detaching login response listener')
+      }
+      try {
+        if (cookieHandler) loginSession.cookies.off('changed', cookieHandler)
+      } catch {
+        console.error('[InAppLogin] Error detaching login cookie listener')
+      }
+      sessionOwners.delete(loginSession)
     }
-
+    try {
+      this.detachWindowHandlers?.()
+    } catch {
+      console.error('[InAppLogin] Error detaching login window listeners')
+    }
+    this.detachWindowHandlers = null
     this.loginWindow = null
     this.config = null
+    this.options = null
+    this.documentReady = false
+    this.navigationPending = false
+    this.seenZaiTokens.clear()
+    this.zaiStorageSeenInDocument = false
   }
 
   cancel(): void {
-    if (!this.isCompleted) {
-      this.complete({
-        success: false,
-        error: 'Login cancelled by user',
-      })
-    }
+    if (!this.isCompleted) this.complete({ success: false, error: 'Login cancelled by user' })
   }
 
   isWindowOpen(): boolean {
@@ -539,5 +816,4 @@ export class InAppLoginManager extends EventEmitter {
 }
 
 export const inAppLoginManager = new InAppLoginManager()
-
 export default InAppLoginManager

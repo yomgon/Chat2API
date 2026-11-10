@@ -170,7 +170,7 @@ export function LoginGuideDialog({
       try {
         await window.electronAPI?.app.openExternal(guide.loginUrl)
       } catch (err) {
-        console.error('Failed to open browser:', err)
+        console.error('Failed to open browser:')
         setError(t('loginGuide.openBrowserFailedDesc', { url: guide.loginUrl }))
       }
     }
@@ -182,7 +182,7 @@ export function LoginGuideDialog({
       setCredentials(prev => ({ ...prev, [fieldName]: text }))
       setError(null)
     } catch (err) {
-      console.error('Paste failed:', err)
+      console.error('Paste failed:')
       setError(t('loginGuide.pasteFailedDesc'))
     }
   }
@@ -209,7 +209,7 @@ export function LoginGuideDialog({
       await onSuccess(credentials)
       setSuccess(true)
     } catch (err) {
-      console.error('Validation failed:', err)
+      console.error('Validation failed:')
       const errorMessage = err instanceof Error ? err.message : t('loginGuide.addFailed')
       setError(errorMessage)
     } finally {

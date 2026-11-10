@@ -50,6 +50,11 @@ export const glmConfig: BuiltinProviderConfig = {
   ],
   tokenCheckEndpoint: '/chatglm/user-api/user/refresh',
   tokenCheckMethod: 'POST',
+  // First-party web page's signed read-only catalog action. Our explicit
+  // guest mode reads its model picker in an isolated in-memory renderer,
+  // never submitting the locally saved GLM refresh token.
+  modelsApiEndpoint: 'https://chatglm.cn/chatglm/agent-api/operation/detail?tag=available_models',
+  modelsApiMethod: 'GET',
 }
 
 export default glmConfig

@@ -170,7 +170,7 @@ export function ModelMappingConfig({ onConfigChange }: ModelMappingConfigProps) 
       const data = await window.electronAPI.providers.getAll()
       setProviders(data.filter(p => p.enabled))
     } catch (error) {
-      console.error('Failed to fetch providers:', error)
+      console.error('Failed to fetch providers:')
     }
   }
 
@@ -179,7 +179,7 @@ export function ModelMappingConfig({ onConfigChange }: ModelMappingConfigProps) 
       const data = await window.electronAPI.accounts.getAll()
       setAccounts(data.filter(a => a.status === 'active'))
     } catch (error) {
-      console.error('Failed to fetch accounts:', error)
+      console.error('Failed to fetch accounts:')
     }
   }
 

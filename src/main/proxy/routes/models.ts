@@ -9,8 +9,30 @@ import { ModelsResponse, ModelInfo } from '../types'
 import { loadBalancer } from '../loadbalancer'
 import { storeManager } from '../../store/store'
 import { modelMapper } from '../modelMapper'
+import type { Provider, ModelMapping } from '../../store/types'
 
 const router = new Router({ prefix: '/v1' })
+
+/** A model mapping is only advertised if an enabled, configured provider
+ * actually lists its target model and has an active account to route through.
+ * This still does NOT constitute a successful live inference test. */
+function mappingHasConfiguredTarget(mapping: ModelMapping, providers: Provider[]): boolean {
+  if (!mapping || typeof mapping.actualModel !== 'string' || !mapping.actualModel) return false
+  for (const provider of providers) {
+    if (mapping.preferredProviderId && provider.id !== mapping.preferredProviderId) continue
+    const activeAccounts = storeManager.getAccountsByProviderId(provider.id)
+      .filter(account => account.status === 'active')
+    if (!activeAccounts.length) continue
+    if (mapping.preferredAccountId
+      && !activeAccounts.some(account => account.id === mapping.preferredAccountId)) continue
+    const models = storeManager.getEffectiveModels(provider.id)
+    if (models.some(model =>
+      model.actualModelId === mapping.actualModel || model.displayName === mapping.actualModel)) {
+      return true
+    }
+  }
+  return false
+}
 
 /**
  * Get all available models
@@ -45,7 +67,7 @@ router.get('/models', async (ctx: Context) => {
   const config = storeManager.getConfig()
   const mappings = config.modelMappings || {}
   for (const [requestModel, mapping] of Object.entries(mappings)) {
-    if (!addedModels.has(requestModel)) {
+    if (!addedModels.has(requestModel) && mappingHasConfiguredTarget(mapping, providers)) {
       addedModels.add(requestModel)
       models.push({
         id: requestModel,
@@ -73,7 +95,8 @@ router.get('/models/:model', async (ctx: Context) => {
 
   const config = storeManager.getConfig()
   const mappings = config.modelMappings || {}
-  if (mappings[modelId]) {
+  const enabledProviders = storeManager.getProviders().filter(p => p.enabled)
+  if (mappings[modelId] && mappingHasConfiguredTarget(mappings[modelId], enabledProviders)) {
     ctx.set('Content-Type', 'application/json')
     ctx.body = {
       id: modelId,
@@ -84,7 +107,7 @@ router.get('/models/:model', async (ctx: Context) => {
     return
   }
 
-  const providers = storeManager.getProviders().filter(p => p.enabled)
+  const providers = enabledProviders
 
   for (const provider of providers) {
     const accounts = storeManager.getAccountsByProviderId(provider.id)

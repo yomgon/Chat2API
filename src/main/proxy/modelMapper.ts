@@ -124,13 +124,14 @@ export class ModelMapper {
    */
   addMapping(requestModel: string, actualModel: string, preferredProviderId?: string, preferredAccountId?: string): void {
     const config = storeManager.getConfig()
-    config.modelMappings[requestModel] = {
+    const mappings = { ...config.modelMappings }
+    mappings[requestModel] = {
       requestModel,
       actualModel,
       preferredProviderId,
       preferredAccountId,
     }
-    storeManager.getStore()?.set('config', config)
+    storeManager.updateConfig({ modelMappings: mappings })
   }
 
   /**
@@ -139,8 +140,9 @@ export class ModelMapper {
   removeMapping(requestModel: string): boolean {
     const config = storeManager.getConfig()
     if (config.modelMappings[requestModel]) {
-      delete config.modelMappings[requestModel]
-      storeManager.getStore()?.set('config', config)
+      const mappings = { ...config.modelMappings }
+      delete mappings[requestModel]
+      storeManager.updateConfig({ modelMappings: mappings })
       return true
     }
     return false

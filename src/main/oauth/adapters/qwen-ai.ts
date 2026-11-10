@@ -7,7 +7,6 @@ import axios from 'axios'
 import { BaseOAuthAdapter } from './base'
 import {
   OAuthResult,
-  OAuthOptions,
   TokenValidationResult,
   CredentialInfo,
   AdapterConfig,
@@ -15,6 +14,35 @@ import {
 } from '../types'
 
 const QWEN_AI_API_BASE = 'https://chat.qwen.ai'
+const QWEN_AI_AUTH_FAILURE = 'Qwen AI session verification failed'
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function isGuestEmail(value: unknown): boolean {
+  return typeof value === 'string' && value.trim().toLowerCase().endsWith('@guest.com')
+}
+
+function hasValidTokenTimes(payload: Record<string, unknown>): boolean {
+  const now = Date.now() / 1000
+  if (!Number.isFinite(now)) return false
+  for (const key of ['exp', 'nbf'] as const) {
+    if (!Object.prototype.hasOwnProperty.call(payload, key)) continue
+    const value = payload[key]
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 ||
+        (key === 'exp' ? value <= now : value > now)) return false
+  }
+  return true
+}
+
+function isUserInfo(value: unknown): value is Record<string, unknown> {
+  if (!isRecord(value) || Object.keys(value).length === 0 || value.error != null) return false
+  // Existing successful profiles may omit is_guest. A present value must be
+  // explicitly false; do not invent a required server-side identity field.
+  if (Object.prototype.hasOwnProperty.call(value, 'is_guest') && value.is_guest !== false) return false
+  return !isGuestEmail(value.email)
+}
 
 const FAKE_HEADERS = {
   Accept: 'application/json',
@@ -50,12 +78,12 @@ export class QwenAiAdapter extends BaseOAuthAdapter {
     try {
       const validation = await this.validateToken({ token })
       
-      if (!validation.valid) {
+      if (validation?.valid !== true) {
         return {
           success: false,
           providerId,
           providerType: 'qwen-ai',
-          error: validation.error || 'Token validation failed',
+          error: QWEN_AI_AUTH_FAILURE,
         }
       }
       
@@ -68,13 +96,12 @@ export class QwenAiAdapter extends BaseOAuthAdapter {
         credentials: { token },
         accountInfo: validation.accountInfo,
       }
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Validation request failed'
+    } catch {
       return {
         success: false,
         providerId,
         providerType: 'qwen-ai',
-        error: errorMessage,
+        error: QWEN_AI_AUTH_FAILURE,
       }
     }
   }
@@ -84,74 +111,40 @@ export class QwenAiAdapter extends BaseOAuthAdapter {
   }
 
   async validateToken(credentials: Record<string, string>): Promise<TokenValidationResult> {
-    const token = credentials.token
-    
-    if (!token) {
+    const invalid = (): TokenValidationResult => ({ valid: false, error: QWEN_AI_AUTH_FAILURE })
+    try {
+      const token = credentials?.token
+      if (typeof token !== 'string' || token.length > 8192 || !token.startsWith('eyJ')) return invalid()
+      const parts = token.split('.')
+      if (parts.length !== 3 || parts.some(part => !/^[A-Za-z0-9_-]+$/.test(part))) return invalid()
+      const header: unknown = JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8'))
+      const payload: unknown = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'))
+      if (!isRecord(header) || typeof header.alg !== 'string' || !header.alg ||
+          header.alg.trim() !== header.alg || header.alg.toLowerCase() === 'none' ||
+          !isRecord(payload) || !hasValidTokenTimes(payload) || isGuestEmail(payload.email)) return invalid()
+
+      const userId = payload.sub ?? payload.id ?? payload.user_id ?? payload.uid
+      if (typeof userId !== 'string' || !userId.trim()) return invalid()
+
+      // Decoding metadata does not authenticate a JWT. Only the fixed official
+      // lookup may confirm this token; missing time claims never supply proof.
+      const userInfo = await this.getUserInfo(token)
+      if (!isUserInfo(userInfo) || !hasValidTokenTimes(payload)) return invalid()
+
+      const email = typeof payload.email === 'string' ? payload.email : ''
+      const name = typeof payload.name === 'string' ? payload.name : ''
       return {
-        valid: false,
-        error: 'Token cannot be empty',
+        valid: true,
+        tokenType: 'access',
+        accountInfo: {
+          userId,
+          email: email || (typeof userInfo.email === 'string' ? userInfo.email : ''),
+          name: name || (typeof userInfo.name === 'string' ? userInfo.name : '') || email || userId,
+        },
       }
-    }
-    
-    if (token.startsWith('eyJ') && token.split('.').length === 3) {
-      try {
-        const parts = token.split('.')
-        const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString())
-        
-        if (payload.email && payload.email.includes('@guest.com')) {
-          return {
-            valid: false,
-            error: 'Guest account not allowed, please login with a real account',
-          }
-        }
-        
-        if (payload && (payload.sub || payload.id || payload.user_id || payload.uid)) {
-          const userId = payload.sub || payload.id || payload.user_id || payload.uid
-          
-          try {
-            const userInfo = await this.getUserInfo(token)
-            console.log('[QwenAi OAuth] User info:', userInfo)
-            
-            if (userInfo && userInfo.is_guest === true) {
-              return {
-                valid: false,
-                error: 'Guest account not allowed, please login with a real account',
-              }
-            }
-            
-            return {
-              valid: true,
-              tokenType: 'access',
-              accountInfo: {
-                userId: userId,
-                email: payload.email || userInfo?.email || '',
-                name: payload.name || userInfo?.name || payload.email || userId,
-              },
-            }
-          } catch (apiError) {
-            console.log('[QwenAi OAuth] API validation failed, using JWT payload only:', apiError)
-            return {
-              valid: true,
-              tokenType: 'access',
-              accountInfo: {
-                userId: userId,
-                email: payload.email || '',
-                name: payload.name || payload.email || userId,
-              },
-            }
-          }
-        }
-      } catch {
-        return {
-          valid: false,
-          error: 'Invalid JWT token',
-        }
-      }
-    }
-    
-    return {
-      valid: false,
-      error: 'Token is invalid',
+    } catch {
+      // Provider exceptions and malformed JWT parser messages can contain secrets.
+      return invalid()
     }
   }
 
@@ -163,14 +156,19 @@ export class QwenAiAdapter extends BaseOAuthAdapter {
           ...FAKE_HEADERS,
         },
         timeout: 15000,
+        maxRedirects: 0,
+        maxContentLength: 64 * 1024,
+        responseType: 'json',
         validateStatus: () => true,
       })
-      
-      if (response.status !== 200 || !response.data?.success) {
+
+      const body: unknown = response.data
+      if (response.status !== 200 || !isRecord(body) || body.success !== true ||
+          body.error != null || !isUserInfo(body.data)) {
         return null
       }
-      
-      return response.data.data
+
+      return body.data
     } catch {
       return null
     }

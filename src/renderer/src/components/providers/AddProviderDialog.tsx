@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
 import {
   Dialog,
@@ -32,6 +32,8 @@ interface AddProviderDialogProps {
   builtinProviders: BuiltinProviderConfig[]
   onSelectBuiltin: (provider: BuiltinProviderConfig, credentials: Record<string, string>) => void
   onCreateCustom: () => void
+  /** Z.ai web credentials never traverse the legacy OAuth renderer bridge. */
+  onOpenProtectedZaiAccounts?: (provider: BuiltinProviderConfig) => Promise<void>
   onValidateToken?: (providerId: string, credentials: Record<string, string>) => Promise<{
     valid: boolean
     error?: string
@@ -57,10 +59,7 @@ const providerIcons: Record<string, string> = {
 }
 
 function mapOAuthCredentials(providerId: string | undefined, credentials: Record<string, string>): Record<string, string> {
-  console.log('[mapOAuthCredentials] Input providerId:', providerId, 'credentials:', JSON.stringify(credentials, null, 2))
-  
   if (!providerId) {
-    console.log('[mapOAuthCredentials] No providerId, returning as-is')
     return credentials
   }
 
@@ -93,57 +92,45 @@ function mapOAuthCredentials(providerId: string | undefined, credentials: Record
           if (parsed.value) {
             tokenValue = parsed.value
           }
-        } catch (e) {
-          console.error('[mapOAuthCredentials] Error parsing JSON token:', e)
+        } catch {
+          console.error('[mapOAuthCredentials] Could not parse wrapped token')
         }
       }
-      console.log('[mapOAuthCredentials] Mapped', oauthKey, 'to', fieldName)
       return { [fieldName]: tokenValue }
     }
   }
 
   if (providerId === 'perplexity' && credentials['__Secure-next-auth.session-token']) {
-    console.log('[mapOAuthCredentials] Mapped Perplexity secure token')
     return { sessionToken: credentials['__Secure-next-auth.session-token'] }
   }
   if (providerId === 'perplexity' && credentials['next-auth.session-token']) {
-    console.log('[mapOAuthCredentials] Mapped Perplexity session token')
     return { sessionToken: credentials['next-auth.session-token'] }
   }
 
   if (providerId === 'mimo') {
-    console.log('[mapOAuthCredentials] Processing Mimo credentials')
     const result: Record<string, string> = {}
     
     if (credentials['serviceToken']) {
       result['service_token'] = credentials['serviceToken']
-      console.log('[mapOAuthCredentials] Mapped serviceToken -> service_token')
     } else if (credentials['service_token']) {
       result['service_token'] = credentials['service_token']
-      console.log('[mapOAuthCredentials] Using existing service_token')
     }
     
     if (credentials['userId']) {
       result['user_id'] = credentials['userId']
-      console.log('[mapOAuthCredentials] Mapped userId -> user_id')
     } else if (credentials['user_id']) {
       result['user_id'] = credentials['user_id']
-      console.log('[mapOAuthCredentials] Using existing user_id')
     }
     
     if (credentials['xiaomichatbot_ph']) {
       result['ph_token'] = credentials['xiaomichatbot_ph']
-      console.log('[mapOAuthCredentials] Mapped xiaomichatbot_ph -> ph_token')
     } else if (credentials['ph_token']) {
       result['ph_token'] = credentials['ph_token']
-      console.log('[mapOAuthCredentials] Using existing ph_token')
     }
     
-    console.log('[mapOAuthCredentials] Mimo result:', JSON.stringify(result, null, 2))
     return result
   }
 
-  console.log('[mapOAuthCredentials] No special mapping needed, returning as-is')
   return credentials
 }
 
@@ -153,6 +140,7 @@ export function AddProviderDialog({
   builtinProviders,
   onSelectBuiltin,
   onCreateCustom,
+  onOpenProtectedZaiAccounts,
   onValidateToken,
 }: AddProviderDialogProps) {
   const { t } = useTranslation()
@@ -178,6 +166,7 @@ export function AddProviderDialog({
   const [oauthStatus, setOAuthStatus] = useState<string>('')
   const [visibleFields, setVisibleFields] = useState<Record<string, boolean>>({})
   const [copiedFields, setCopiedFields] = useState<Record<string, boolean>>({})
+  const protectedZaiOpening = useRef(false)
 
   const toggleFieldVisibility = (fieldName: string) => {
     setVisibleFields(prev => ({
@@ -194,8 +183,8 @@ export function AddProviderDialog({
       setTimeout(() => {
         setCopiedFields(prev => ({ ...prev, [fieldName]: false }))
       }, 2000)
-    } catch (err) {
-      console.error('Failed to copy:', err)
+    } catch {
+      console.error('[AddProviderDialog] Could not copy credential')
     }
   }
 
@@ -217,6 +206,32 @@ export function AddProviderDialog({
   const selectedProviderData = selectedProvider 
     ? providers.find((p) => p.id === selectedProvider) 
     : null
+  const isProtectedZaiSelection = selectedProviderData?.id === 'zai'
+
+  const handleOpenProtectedZaiAccounts = async () => {
+    if (!open || !isProtectedZaiSelection || !selectedProviderData || protectedZaiOpening.current) return
+    if (!onOpenProtectedZaiAccounts) {
+      setOAuthStatus('Protected Z.ai account management is unavailable. Existing accounts were not changed.')
+      return
+    }
+    protectedZaiOpening.current = true
+    setIsSubmitting(true)
+    setOAuthStatus('Opening protected Z.ai account management...')
+    try {
+      // Only a public built-in provider definition crosses this callback.
+      // Do not invoke legacy OAuth or return credentials to the renderer.
+      await onOpenProtectedZaiAccounts(selectedProviderData)
+      onOpenChange(false)
+      setStep(1)
+      setSelectedProvider(null)
+      setOAuthStatus('')
+    } catch {
+      setOAuthStatus('Could not open protected Z.ai accounts. Existing accounts were not changed.')
+    } finally {
+      protectedZaiOpening.current = false
+      setIsSubmitting(false)
+    }
+  }
 
   const supportsOAuth = selectedProviderData && ['deepseek', 'glm', 'kimi', 'mimo', 'minimax', 'qwen', 'qwen-ai', 'zai', 'perplexity'].includes(selectedProviderData.id)
 
@@ -256,6 +271,7 @@ export function AddProviderDialog({
   }
 
   const handleValidate = async () => {
+    if (isProtectedZaiSelection) return
     if (!selectedProviderData || !onValidateToken) return
 
     const credentialFields = selectedProviderData.credentialFields || []
@@ -287,6 +303,7 @@ export function AddProviderDialog({
   }
 
   const handleSubmit = async () => {
+    if (isProtectedZaiSelection) return
     if (!selectedProviderData) return
 
     const credentialFields = selectedProviderData.credentialFields || []
@@ -323,40 +340,31 @@ export function AddProviderDialog({
 
   const handleOpenOAuthBrowser = async () => {
     if (!selectedProviderData) return
+    if (isProtectedZaiSelection) {
+      await handleOpenProtectedZaiAccounts()
+      return
+    }
     
     setIsOAuthLoading(true)
     setOAuthStatus(t('providers.openingLoginWindow'))
     
     try {
-      console.log('[AddProviderDialog] Starting OAuth login for:', selectedProviderData.id)
+      console.info('[AddProviderDialog] Starting OAuth login')
       
       const result = await window.electronAPI?.oauth.startInAppLogin(
         selectedProviderData.id,
         selectedProviderData.id as ProviderVendor
       )
       
-      console.log('[AddProviderDialog] OAuth result:', JSON.stringify(result, null, 2))
-      
       if (result?.success && result.credentials) {
-        console.log('[AddProviderDialog] OAuth success, credentials:', JSON.stringify(result.credentials, null, 2))
-        
         const mappedCredentials = mapOAuthCredentials(selectedProviderData?.id, result.credentials)
-        console.log('[AddProviderDialog] Mapped credentials:', JSON.stringify(mappedCredentials, null, 2))
         
         const hasAllRequiredFields = selectedProviderData.credentialFields
           .filter(f => f.required)
           .every(f => mappedCredentials[f.name])
         
-        console.log('[AddProviderDialog] Has all required fields:', hasAllRequiredFields)
-        console.log('[AddProviderDialog] Required fields:', selectedProviderData.credentialFields.filter(f => f.required).map(f => f.name))
-        console.log('[AddProviderDialog] Mapped credentials keys:', Object.keys(mappedCredentials))
-        
         if (!hasAllRequiredFields) {
-          console.error('[AddProviderDialog] Missing required fields!')
-          const missing = selectedProviderData.credentialFields
-            .filter(f => f.required && !mappedCredentials[f.name])
-            .map(f => f.name)
-          console.error('[AddProviderDialog] Missing:', missing)
+          console.warn('[AddProviderDialog] OAuth response missing required credential fields')
         }
         
         setCredentials(mappedCredentials)
@@ -368,7 +376,7 @@ export function AddProviderDialog({
         })
       } else {
         const errorMsg = result?.error || ''
-        console.error('[AddProviderDialog] OAuth failed:', errorMsg)
+        console.error('[AddProviderDialog] OAuth failed')
         const translatedError = errorMsg === 'Login window was closed' 
           ? t('providers.loginWindowClosed')
           : errorMsg === 'A login window is already open'
@@ -380,7 +388,7 @@ export function AddProviderDialog({
       }
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : t('providers.loginFailed')
-      console.error('[AddProviderDialog] OAuth error:', errorMessage)
+      console.error('[AddProviderDialog] OAuth request failed')
       setOAuthStatus(errorMessage)
     } finally {
       setIsOAuthLoading(false)
@@ -764,7 +772,17 @@ export function AddProviderDialog({
         </div>
       </div>
 
-      <div className="border-t pt-4">
+      {isProtectedZaiSelection ? (
+        <div className="border-t pt-4 space-y-3">
+          <h4 className="text-sm font-medium">Protected Z.ai account connection</h4>
+          <p className="text-sm text-muted-foreground">
+            Z.ai web login uses a protected, account-specific session. The generic OAuth login cannot
+            collect or expose Z.ai credentials. Open the Z.ai account list to reconnect an existing
+            account without changing its ID or model mappings, or explicitly add a new account.
+          </p>
+          {oauthStatus && <p role="status" className="text-sm text-muted-foreground">{oauthStatus}</p>}
+        </div>
+      ) : <div className="border-t pt-4">
         <h4 className="text-sm font-medium mb-3">{t('providers.credentials')}</h4>
         
         {supportsOAuth ? (
@@ -836,7 +854,7 @@ export function AddProviderDialog({
             </div>
           </div>
         )}
-      </div>
+      </div>}
     </div>
   )
 
@@ -877,6 +895,12 @@ export function AddProviderDialog({
                 <ArrowLeft className="mr-2 h-4 w-4" />
                 {t('common.previous')}
               </Button>
+              {isProtectedZaiSelection ? (
+                <Button onClick={handleOpenProtectedZaiAccounts}
+                  disabled={isSubmitting || typeof onOpenProtectedZaiAccounts !== 'function'}>
+                  {isSubmitting ? 'Opening protected Z.ai accounts...' : 'Open protected Z.ai accounts'}
+                </Button>
+              ) : <>
               {onValidateToken && (
                 <Button
                   variant="outline"
@@ -909,6 +933,7 @@ export function AddProviderDialog({
                   t('providers.addAccount')
                 )}
               </Button>
+              </>}
             </>
           )}
         </DialogFooter>

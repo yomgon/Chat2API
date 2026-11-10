@@ -79,7 +79,7 @@ export abstract class BasePromptAdapter implements PromptAdapter {
     
     for (const sig of this.detectSignatures) {
       if (allContent.includes(sig)) {
-        console.log(`[${this.name}] Detected existing prompt injection with signature: ${sig}`)
+        console.log('[PromptAdapter] Existing prompt injection detected')
         return true
       }
     }
@@ -119,7 +119,7 @@ export abstract class BasePromptAdapter implements PromptAdapter {
     }
 
     const variant = this.getPromptVariant(model, provider)
-    const toolsPrompt = this.toolsToPrompt(tools, variant)
+    const toolsPrompt = this.toolsToPrompt(tools, variant ?? undefined)
     
     const transformedMessages = this.injectPrompt(messages, toolsPrompt)
 
@@ -127,7 +127,7 @@ export abstract class BasePromptAdapter implements PromptAdapter {
       messages: transformedMessages,
       tools: undefined,
       injected: true,
-      variant,
+      variant: variant ?? undefined,
     }
   }
 
@@ -166,7 +166,7 @@ export abstract class BasePromptAdapter implements PromptAdapter {
             if (typeof part === 'string') {
               parts.push(part)
             } else if (part && typeof part === 'object' && 'text' in part) {
-              parts.push(part.text)
+              parts.push(part.text ?? '')
             }
           }
         }

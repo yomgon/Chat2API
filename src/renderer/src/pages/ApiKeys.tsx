@@ -39,15 +39,23 @@ import type { ApiKey } from '@/types/electron'
 
 function generateApiKey(): string {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
+  const bytes = new Uint8Array(64)
+  const limit = 256 - (256 % chars.length)
   let key = 'sk-'
-  for (let i = 0; i < 48; i++) {
-    key += chars.charAt(Math.floor(Math.random() * chars.length))
+  while (key.length < 51) {
+    globalThis.crypto.getRandomValues(bytes)
+    for (const byte of bytes) {
+      // Rejection sampling avoids bias while keeping the existing key format.
+      if (byte >= limit) continue
+      key += chars[byte % chars.length]
+      if (key.length === 51) break
+    }
   }
   return key
 }
 
 function generateId(): string {
-  return Date.now().toString(36) + Math.random().toString(36).substr(2)
+  return globalThis.crypto.randomUUID()
 }
 
 export default function ApiKeysPage() {
@@ -85,13 +93,23 @@ export default function ApiKeysPage() {
       return
     }
 
-    const newKey: ApiKey = {
-      id: generateId(),
-      name: newKeyName.trim(),
-      key: generateApiKey(),
-      enabled: true,
-      createdAt: Date.now(),
-      usageCount: 0,
+    let newKey: ApiKey
+    try {
+      newKey = {
+        id: generateId(),
+        name: newKeyName.trim(),
+        key: generateApiKey(),
+        enabled: true,
+        createdAt: Date.now(),
+        usageCount: 0,
+      }
+    } catch {
+      toast({
+        title: t('common.error'),
+        description: t('settings.configSaveFailed'),
+        variant: 'destructive',
+      })
+      return
     }
 
     await updateConfig({ apiKeys: [...apiKeys, newKey] })

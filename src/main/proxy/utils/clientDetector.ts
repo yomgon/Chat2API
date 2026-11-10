@@ -270,7 +270,7 @@ export function cleanToolPrompts(messages: ChatMessage[]): ChatMessage[] {
   const allContent = extractAllContent(messages)
   const clientResult = detectClientFromContent(allContent)
 
-  if (!clientResult.promptSectionMarkers) {
+  if (!getPromptSectionMarkers(clientResult.clientType)) {
     return messages
   }
 

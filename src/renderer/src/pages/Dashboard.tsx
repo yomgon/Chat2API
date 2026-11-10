@@ -76,7 +76,7 @@ export function Dashboard() {
       }
       refreshData()
     } catch (err) {
-      console.error('Failed to toggle proxy:', err)
+      console.error('Failed to toggle proxy:')
     }
   }, [proxyStatus, setProxyEnabled, refreshData])
 

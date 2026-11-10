@@ -5,11 +5,12 @@
 
 import Router from '@koa/router'
 import type { Context } from 'koa'
-import { PassThrough } from 'stream'
+import type { Readable } from 'stream'
 import { ChatCompletionRequest, ChatCompletionResponse, ProxyContext } from '../types'
 import { loadBalancer } from '../loadbalancer'
 import { requestForwarder } from '../forwarder'
 import { streamHandler } from '../stream'
+import { createOpenAIStreamTerminalGate, hasCompletedNonStreamAnswer } from '../streamTerminalGate'
 import { proxyStatusManager } from '../status'
 import { modelMapper } from '../modelMapper'
 import { storeManager } from '../../store/store'
@@ -20,6 +21,16 @@ import {
 } from '../utils/toolFormatConverter'
 
 const router = new Router({ prefix: '/v1/chat' })
+
+// Local-safe diagnostics only. A stage is not proof that a remote write did or
+// did not happen. Never copy untrusted provider exception details to a caller.
+const ZAI_FAILURE_CODES: Record<NonNullable<import('../types').ForwardResult['failureStage']>, string> = {
+  'auth-preflight': 'zai_auth_preflight_failed',
+  'chat-creation': 'zai_chat_creation_failed',
+  'chat-completion': 'zai_chat_completion_failed',
+  'response-decoding': 'zai_response_decoding_failed',
+  'unclassified': 'zai_provider_failure_unclassified',
+}
 
 /**
  * Generate Request ID
@@ -179,7 +190,7 @@ router.post('/completions', async (ctx: Context) => {
   proxyStatusManager.recordRequestStart(request.model, provider.id, account.id)
 
   try {
-    const result = await requestForwarder.forwardChatCompletion(
+    const forwarded = await requestForwarder.forwardChatCompletion(
       request,
       account,
       provider,
@@ -187,10 +198,29 @@ router.post('/completions', async (ctx: Context) => {
       context
     )
 
+    // A stream handshake, HTTP 200 or a fabricated empty choice is not proof
+    // of a completed model answer. Refuse success before changing user state.
+    const missingCompletion = forwarded.success && (
+      request.stream === true ? !forwarded.stream : !hasCompletedNonStreamAnswer(forwarded.body)
+    )
+    const result = missingCompletion ? {
+      ...forwarded,
+      success: false,
+      status: 502,
+      failureStage: 'response-decoding' as const,
+      failureCode: 'provider_completion_unconfirmed' as const,
+      error: 'Provider completion was not confirmed',
+      body: undefined,
+      stream: undefined,
+    } : forwarded
+
     const latency = Date.now() - startTime
 
     if (!result.success) {
       proxyStatusManager.recordRequestFailure(latency)
+
+      const safeFailureCode = result.failureCode ??
+        (provider.id === 'zai' && result.failureStage ? ZAI_FAILURE_CODES[result.failureStage] : null)
 
       if (result.status && result.status >= 400 && result.status !== 429) {
         loadBalancer.markAccountFailed(account.id)
@@ -199,28 +229,33 @@ router.post('/completions', async (ctx: Context) => {
       ctx.status = result.status || 500
       ctx.body = {
         error: {
-          message: result.error || 'Request failed',
+          message: 'Provider request failed',
           type: 'api_error',
           param: null,
-          code: null,
+          code: safeFailureCode,
         },
       }
 
-      storeManager.addLog('error', `Request failed: ${result.error}`, {
+      storeManager.addLog('error', 'Provider request failed', {
         requestId,
         providerId: provider.id,
         accountId: account.id,
         model: request.model,
         latency,
+        data: safeFailureCode ? {
+          failureStage: result.failureStage ?? 'unclassified',
+          failureCode: safeFailureCode,
+          upstreamStatus: result.status ?? null,
+        } : undefined,
       })
 
       const userInput = extractUserInput(request.messages)
       const errorResponseBody = JSON.stringify({
         error: {
-          message: result.error || 'Request failed',
+          message: 'Provider request failed',
           type: 'api_error',
           param: null,
-          code: null,
+          code: safeFailureCode,
         },
       })
       storeManager.addRequestLog({
@@ -243,7 +278,7 @@ router.post('/completions', async (ctx: Context) => {
         responseBody: errorResponseBody,
         latency,
         isStream: request.stream || false,
-        errorMessage: result.error,
+        errorMessage: 'Provider request failed',
       })
 
       storeManager.recordRequestInStats(false, latency, request.model, provider.id, account.id)
@@ -251,31 +286,26 @@ router.post('/completions', async (ctx: Context) => {
       return
     }
 
-    loadBalancer.clearAccountFailure(account.id)
-
-    proxyStatusManager.recordRequestSuccess(latency)
-
-    storeManager.updateAccount(account.id, {
-      lastUsed: Date.now(),
-      requestCount: (account.requestCount || 0) + 1,
-      todayUsed: (account.todayUsed || 0) + 1,
-    })
-
-    storeManager.addLog('debug', `Request succeeded`, {
-      requestId,
-      providerId: provider.id,
-      accountId: account.id,
-      model: request.model,
-      actualModel,
-      latency,
-      isStream: request.stream,
-    })
+    // Streaming success must be decided after the final verified terminal,
+    // not when forwarder returns a Readable before the provider has answered.
+    if (request.stream !== true) {
+      loadBalancer.clearAccountFailure(account.id)
+      proxyStatusManager.recordRequestSuccess(latency)
+      storeManager.recordAccountSuccess(account.id, provider.id)
+      storeManager.addLog('debug', 'Request succeeded', {
+        requestId,
+        providerId: provider.id,
+        accountId: account.id,
+        model: request.model,
+        actualModel,
+        latency,
+        isStream: false,
+      })
+    }
 
     const userInput = extractUserInput(request.messages)
-    // Prepare response body for logging (only for non-stream requests)
-    const responseBodyForLog = !request.stream && result.body
-      ? JSON.stringify(result.body)
-      : undefined
+    // Store only fixed provenance, never the raw provider/model response body.
+    const responseBodyForLog: string | undefined = undefined
 
     // For streaming requests, we'll collect content and update the log later
     let logEntryId: string | undefined
@@ -305,11 +335,11 @@ router.post('/completions', async (ctx: Context) => {
       })
       logEntryId = logEntry.id
     } else {
-      // Streaming: record log now, will update response body later
+      // Streaming: provisional fail-closed receipt until terminal is proven.
       const logEntry = storeManager.addRequestLog({
         timestamp: startTime,
-        status: 'success',
-        statusCode: 200,
+        status: 'error',
+        statusCode: 502,
         method: 'POST',
         url: '/v1/chat/completions',
         model: request.model,
@@ -322,14 +352,17 @@ router.post('/completions', async (ctx: Context) => {
         userInput,
         webSearch: request.web_search,
         reasoningEffort: request.reasoning_effort,
-        responseStatus: 200,
+        responseStatus: 502,
         latency,
         isStream: true,
+        errorMessage: 'Stream completion not yet confirmed',
       })
       logEntryId = logEntry.id
     }
 
-    storeManager.recordRequestInStats(true, latency, request.model, provider.id, account.id)
+    if (request.stream !== true) {
+      storeManager.recordRequestInStats(true, latency, request.model, provider.id, account.id)
+    }
 
     if (request.stream === true && result.stream) {
       ctx.set('Content-Type', 'text/event-stream')
@@ -337,131 +370,86 @@ router.post('/completions', async (ctx: Context) => {
       ctx.set('Connection', 'keep-alive')
       ctx.set('X-Accel-Buffering', 'no')
 
-      // Create a wrapper stream to handle errors and collect content
-      const wrapperStream = new PassThrough()
-
-      // Collect stream content for logging (raw SSE output)
-      let collectedContent = ''
-
-      // Handle stream errors
-      result.stream.once('error', (err: Error) => {
-        console.error('[Chat] Stream error:', err.message)
-
-        // Send error as SSE event
-        const errorEvent = {
-          id: requestId,
-          object: 'chat.completion.chunk',
-          created: Math.floor(Date.now() / 1000),
-          model: actualModel,
-          choices: [{
-            index: 0,
-            delta: {
-              content: `\n\n[Error: ${err.message}]`,
-            },
-            finish_reason: 'stop',
-          }],
-        }
-
-        wrapperStream.write(`data: ${JSON.stringify(errorEvent)}\n\n`)
-        wrapperStream.write('data: [DONE]\n\n')
-        wrapperStream.end()
-
-        storeManager.addLog('error', `Stream error: ${err.message}`, {
-          requestId,
-          providerId: provider.id,
-          accountId: account.id,
-          model: request.model,
+      // Adapters produce OpenAI SSE; a generic provider may first need the
+      // legacy normalization transform. Only the verified terminal gate may
+      // emit a downstream [DONE] and declare this operation successful.
+      let normalizedStream: Readable = result.stream as Readable
+      if (!result.skipTransform) {
+        const transformStream = streamHandler.createTransformStream(actualModel, requestId)
+        const rawStream = normalizedStream
+        rawStream.once('error', () => {
+          transformStream.destroy(new Error('Provider stream transform aborted'))
         })
-      })
-
-      // Check if stream is already in correct SSE format (from adapters like Kimi, GLM, DeepSeek)
-      if (result.skipTransform) {
-        // Stream is already formatted, pipe through wrapper and collect
-        result.stream.on('data', (chunk: Buffer) => {
-          collectedContent += chunk.toString()
-        })
-
-        result.stream.pipe(wrapperStream, { end: false })
-
-        // When source stream ends normally, update log and end wrapper
-        result.stream.once('end', () => {
-          // Update log with collected response
-          if (logEntryId) {
-            storeManager.updateRequestLog(logEntryId, {
-              responseBody: collectedContent || undefined,
-            })
+        // A raw transport can close without emitting 'end' or 'error'. If
+        // the normalization Transform stays writable, neither the terminal
+        // gate nor the HTTP response would ever settle.
+        rawStream.once('close', () => {
+          if (!rawStream.readableEnded) {
+            transformStream.destroy(new Error('Provider stream transport closed prematurely'))
           }
-          wrapperStream.end()
         })
-      } else {
-        // Need to transform the stream
-        const transformStream = streamHandler.createTransformStream(
-          actualModel,
-          requestId,
-          () => {
-            storeManager.addLog('debug', `Stream response completed`, { requestId })
-          }
-        )
-
-        // Collect from transform stream output
-        transformStream.on('data', (chunk: Buffer) => {
-          collectedContent += chunk.toString()
-        })
-
-        result.stream.pipe(transformStream)
-        transformStream.pipe(wrapperStream, { end: false })
-
-        transformStream.once('end', () => {
-          // Update log with collected response
-          if (logEntryId) {
-            storeManager.updateRequestLog(logEntryId, {
-              responseBody: collectedContent || undefined,
-            })
-          }
-          wrapperStream.end()
-        })
+        normalizedStream = rawStream.pipe(transformStream)
       }
 
-      ctx.body = wrapperStream
+      ctx.body = createOpenAIStreamTerminalGate(normalizedStream, completed => {
+        const finalLatency = Date.now() - startTime
+        if (completed) {
+          // A complete, nonempty answer and a valid normal stream terminal
+          // have now been observed. Account usage must not change earlier.
+          loadBalancer.clearAccountFailure(account.id)
+          proxyStatusManager.recordRequestSuccess(finalLatency)
+          storeManager.recordRequestInStats(true, finalLatency, request.model, provider.id, account.id)
+          storeManager.recordAccountSuccess(account.id, provider.id)
+          if (logEntryId) {
+            storeManager.updateRequestLog(logEntryId, {
+              status: 'success', statusCode: 200, responseStatus: 200,
+              errorMessage: undefined, latency: finalLatency,
+            })
+          }
+          storeManager.addLog('debug', 'Stream response completed', {
+            requestId, providerId: provider.id, accountId: account.id,
+            model: request.model, actualModel, latency: finalLatency,
+          })
+        } else {
+          // A response may have affected the remote service despite local
+          // failure. Preserve UNKNOWN; never replay or switch accounts.
+          // Once HTTP headers are committed, status cannot be rewritten; the
+          // terminal gate emits a fixed SSE error without a false [DONE].
+          // Before commitment, report the same failure as HTTP 502.
+          if (!ctx.res?.headersSent && !ctx.headerSent) ctx.status = 502
+          proxyStatusManager.recordRequestFailure(finalLatency)
+          storeManager.recordRequestInStats(false, finalLatency, request.model, provider.id, account.id)
+          if (logEntryId) {
+            storeManager.updateRequestLog(logEntryId, {
+              status: 'error', statusCode: 502, responseStatus: 502,
+              errorMessage: 'Provider stream completion unconfirmed',
+              latency: finalLatency,
+            })
+          }
+          storeManager.addLog('error', 'Provider stream completion unconfirmed', {
+            requestId, providerId: provider.id, accountId: account.id,
+            model: request.model, latency: finalLatency,
+            data: { failureStage: 'response-decoding', failureCode: 'provider_stream_incomplete' },
+          })
+        }
+      })
     } else {
       ctx.set('Content-Type', 'application/json')
 
-      if (result.body) {
-        // Check if we need to transform to Anthropic format
-        if (isAnthropicToolFormat(request.tool_format)) {
-          ctx.body = transformResponseToAnthropic(result.body)
-          console.log('[Chat] Transformed response to Anthropic tool format')
-        } else {
-          ctx.body = result.body
-        }
+      // The preflight above already rejected an absent/uncompleted body.
+      if (isAnthropicToolFormat(request.tool_format)) {
+        ctx.body = transformResponseToAnthropic(result.body)
+        console.log('[Chat] Transformed response to Anthropic tool format')
       } else {
-        ctx.body = {
-          id: requestId,
-          object: 'chat.completion',
-          created: Math.floor(Date.now() / 1000),
-          model: actualModel,
-          choices: [{
-            index: 0,
-            message: {
-              role: 'assistant',
-              content: '',
-            },
-            finish_reason: 'stop',
-          }],
-          usage: {
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            total_tokens: 0,
-          },
-        }
+        ctx.body = result.body
       }
     }
   } catch (error) {
     const latency = Date.now() - startTime
     proxyStatusManager.recordRequestFailure(latency)
 
-    const errorMessage = error instanceof Error ? error.message : 'Unknown error'
-    const errorStack = error instanceof Error ? error.stack : undefined
+    const errorMessage = 'Internal proxy error'
+    const errorStack = undefined
 
     ctx.status = 500
     ctx.body = {
@@ -473,13 +461,12 @@ router.post('/completions', async (ctx: Context) => {
       },
     }
 
-    storeManager.addLog('error', `Request exception: ${errorMessage}`, {
+    storeManager.addLog('error', 'Internal proxy request exception', {
       requestId,
       providerId: provider.id,
       accountId: account.id,
       model: request.model,
       latency,
-      error: errorMessage,
     })
 
     const userInput = extractUserInput(request.messages)

@@ -26,6 +26,14 @@ export const kimiConfig: BuiltinProviderConfig = {
   },
   enabled: true,
   description: 'Kimi K2.6 AI assistant by Moonshot, supports thinking mode and web search',
+  // Public, read-only ConnectRPC model settings (POST with an empty JSON body).
+  // Agent scenarios are NOT chat completions and must never be auto-enabled.
+  modelsApiEndpoint: 'https://www.kimi.com/apiv2/kimi.gateway.config.v1.ConfigService/GetAvailableModels',
+  modelsApiMethod: 'POST',
+  modelsApiHeaders: {
+    Accept: 'application/json',
+    'Content-Type': 'application/json',
+  },
   supportedModels: [
     'Kimi-K2.6',
   ],

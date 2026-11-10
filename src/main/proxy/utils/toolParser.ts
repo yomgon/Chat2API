@@ -25,7 +25,6 @@ export function parseToolCallsFromText(text: string, modelType: string = 'defaul
   content: string
   toolCalls: ParsedToolCall[] 
 } {
-  console.log('[ToolParser] parseToolCallsFromText called, modelType:', modelType, 'text length:', text?.length || 0)
   if (!text) {
     return { content: '', toolCalls: [] }
   }
@@ -38,7 +37,6 @@ export function parseToolCallsFromText(text: string, modelType: string = 'defaul
                            text.includes('function_calls]') ||
                            /\[call[:=]/.test(text)
   
-  console.log('[ToolParser] hasFunctionCalls:', hasFunctionCalls)
   
   if (!hasFunctionCalls) {
     return { content: text, toolCalls: [] }
@@ -53,7 +51,6 @@ export function parseToolCallsFromText(text: string, modelType: string = 'defaul
   if (!processedText.includes('[function_calls]') && missingBracketRegex.test(processedText)) {
     // Replace function_calls] with [function_calls] when not preceded by [ or /
     processedText = processedText.replace(/(^|[^\/\[])(function_calls\])/g, '$1[$2')
-    console.log('[ToolParser] Prepended opening bracket, processedText:', processedText.substring(0, 100))
   }
 
   // Extract the content inside [function_calls]...[/function_calls]
@@ -63,7 +60,6 @@ export function parseToolCallsFromText(text: string, modelType: string = 'defaul
 
   while ((blockMatch = blockRegex.exec(processedText)) !== null) {
     const blockContent = blockMatch[1]
-    console.log('[ToolParser] blockContent:', blockContent?.substring(0, 200))
 
     // Parse individual [call:name]...[/call] inside the block
     if (modelType === 'kimi' || modelType === 'glm' || modelType === 'minimax' || modelType === 'zai') {

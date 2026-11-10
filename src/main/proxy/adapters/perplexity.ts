@@ -1,6 +1,6 @@
 import { net } from 'electron'
 import { Readable } from 'stream'
-import { Account, Provider } from '../store/types'
+import { Account, Provider } from '../../store/types'
 
 const PERPLEXITY_URL = 'https://www.perplexity.ai'
 const QUERY_ENDPOINT = `${PERPLEXITY_URL}/rest/sse/perplexity_ask`
@@ -22,7 +22,7 @@ const FAKE_HEADERS: Record<string, string> = {
 
 interface PerplexityMessage {
   role: 'user' | 'assistant' | 'system' | 'tool'
-  content: string | null
+  content: string | any[] | null
   tool_call_id?: string
   tool_calls?: any[]
 }
@@ -166,7 +166,14 @@ export class PerplexityAdapter {
     this.account = account
     this.cookie = account.credentials.sessionToken || account.credentials.cookie || account.credentials.token || ''
     // Store all cookies from credentials for Cloudflare-protected requests
-    this.allCookies = account.credentials.cookies || {}
+    // Persistent stores can hold a protected cookie object, while the public
+    // Account type also allows legacy cookie strings. Never spread a string
+    // into per-character cookie values or mutate the original credential map.
+    const savedCookies: unknown = (account.credentials as Record<string, unknown>).cookies
+    this.allCookies = savedCookies && typeof savedCookies === 'object' && !Array.isArray(savedCookies)
+      ? Object.fromEntries(Object.entries(savedCookies)
+          .filter((entry): entry is [string, string] => typeof entry[1] === 'string'))
+      : {}
     // Ensure session token is in allCookies
     if (this.cookie && !this.allCookies['__Secure-next-auth.session-token']) {
       this.allCookies['__Secure-next-auth.session-token'] = this.cookie
@@ -357,12 +364,12 @@ export class PerplexityAdapter {
           })
           response.on('end', () => {
             const errorMsg = `HTTP ${statusCode}: ${errorBody.substring(0, 200)}`
-            console.error('[Perplexity] Server error:', errorMsg)
+            console.error('[Perplexity] Server error')
             stream.emit('error', new Error(errorMsg))
             reject(new Error(errorMsg))
           })
           response.on('error', (error) => {
-            console.error('[Perplexity] Error response stream error:', error)
+            console.error('[Perplexity] Error response stream error')
             const errorMsg = `HTTP ${statusCode}: Failed to read error response`
             stream.emit('error', new Error(errorMsg))
             reject(new Error(errorMsg))
@@ -381,7 +388,7 @@ export class PerplexityAdapter {
         })
         
         response.on('error', (error) => {
-          console.error('[Perplexity] Response error:', error)
+          console.error('[Perplexity] Response error')
           const errorMessage = this.formatNetworkError(error)
           stream.emit('error', new Error(errorMessage))
         })
@@ -390,7 +397,7 @@ export class PerplexityAdapter {
       })
       
       request_.on('error', (error) => {
-        console.error('[Perplexity] Request error:', error)
+        console.error('[Perplexity] Request error')
         const errorMessage = this.formatNetworkError(error)
         const wrappedError = new Error(errorMessage)
         stream.emit('error', wrappedError)
@@ -486,7 +493,7 @@ export class PerplexityAdapter {
         })
 
         request_.on('error', (error) => {
-          console.error('[Perplexity] Delete request error:', error)
+          console.error('[Perplexity] Delete request error')
           sessionCache.delete(cacheKey)
           resolve(false)
         })
@@ -495,7 +502,7 @@ export class PerplexityAdapter {
         request_.end()
       })
     } catch (error) {
-      console.error('[Perplexity] Delete session error:', error)
+      console.error('[Perplexity] Delete session error')
       sessionCache.delete(cacheKey)
       return false
     }
@@ -564,7 +571,7 @@ export class PerplexityAdapter {
       })
 
       request_.on('error', (error) => {
-        console.error('[Perplexity] Delete all chats error:', error)
+        console.error('[Perplexity] Delete all chats error')
         resolve(false)
       })
 

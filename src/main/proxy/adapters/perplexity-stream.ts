@@ -168,7 +168,7 @@ export class PerplexityStreamHandler {
     })
 
     stream.on('error', (err) => {
-      console.error('[Perplexity Stream] Stream error:', err)
+      console.error('[Perplexity Stream] Stream error')
       const errorMessage = err.message || String(err)
       const userFriendlyError = this.formatStreamError(errorMessage)
       transStream.emit('error', new Error(userFriendlyError))

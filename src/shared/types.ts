@@ -30,6 +30,7 @@ export type LoadBalanceStrategy = 'round-robin' | 'fill-first' | 'failover'
 
 export type Theme = 'light' | 'dark' | 'system'
 
+import type { ToolCallingConfig, LegacyToolPromptConfig } from './toolCalling'
 export type {
   LegacyToolPromptConfig,
   ToolCallingConfig,
@@ -59,6 +60,8 @@ export interface Provider {
   apiEndpoint: string
   chatPath?: string
   headers: Record<string, string>
+  /** Form metadata only, not any stored user credential values. */
+  credentialFields?: CredentialField[]
   enabled: boolean
   createdAt: number
   updatedAt: number
@@ -66,6 +69,11 @@ export interface Provider {
   icon?: string
   supportedModels?: string[]
   modelMappings?: Record<string, string>
+  /** Last successful model-list discovery; not proof of working inference. */
+  modelCatalog?: {
+    source: 'provider-web'
+    syncedAt: number
+  }
   status?: ProviderStatus
   lastStatusCheck?: number
 }

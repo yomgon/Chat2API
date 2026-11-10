@@ -406,12 +406,12 @@ export class MimoAdapter {
 
       const { code } = response.data || {}
       if (response.status !== 200 || code !== 0) {
-        console.warn('[Mimo] Failed to generate conversation title:', response.status, response.data)
+        console.warn('[Mimo] Failed to generate conversation title')
         return false
       }
       return true
     } catch (error) {
-      console.warn('[Mimo] Failed to generate conversation title:', error)
+      console.warn('[Mimo] Failed to generate conversation title')
       return false
     }
   }
@@ -496,7 +496,7 @@ export class MimoAdapter {
       }
     )
 
-    console.log('[Mimo] Get conversation list page', pageNum, 'response:', JSON.stringify(response.data, null, 2))
+    console.log('[Mimo] Conversation list page received')
 
     const { code, data } = response.data || {}
     if (response.status !== 200 || code !== 0) {
@@ -508,7 +508,7 @@ export class MimoAdapter {
     const conversationIds = conversationList.map((c: any) => c.conversationId).filter(Boolean)
     const hasMore = conversationList.length >= pageSize
 
-    console.log('[Mimo] Found', conversationIds.length, 'conversations, hasMore:', hasMore)
+    console.log('[Mimo] Conversations found')
     return { conversationIds, hasMore }
   }
 
@@ -540,7 +540,7 @@ export class MimoAdapter {
       }
     )
 
-    console.log('[Mimo] Delete conversations response:', JSON.stringify(response.data, null, 2))
+    console.log('[Mimo] Delete conversations response')
 
     const { code } = response.data || {}
     return response.status === 200 && code === 0
@@ -575,7 +575,7 @@ export class MimoAdapter {
         return true
       }
 
-      console.log('[Mimo] Found', allConversationIds.length, 'conversations to delete')
+      console.log('[Mimo] Conversations found')
 
       const success = await this.deleteConversations(allConversationIds)
       if (success) {
@@ -583,7 +583,7 @@ export class MimoAdapter {
       }
       return success
     } catch (error) {
-      console.error('[Mimo] Failed to delete all chats:', error)
+      console.error('[Mimo] Failed to delete all chats')
       return false
     }
   }

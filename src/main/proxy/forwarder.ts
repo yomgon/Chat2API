@@ -7,31 +7,52 @@ import axios, { AxiosRequestConfig, AxiosResponse, AxiosError } from 'axios'
 import http2 from 'http2'
 import { PassThrough } from 'stream'
 import { Account, Provider } from '../store/types'
-import { ForwardResult, ChatCompletionRequest, ProxyContext } from './types'
+import { ForwardResult, ChatCompletionRequest, ProxyContext, type ChatMessage as ContextChatMessage } from './types'
 import { proxyStatusManager } from './status'
 import { storeManager } from '../store/store'
 import { DeepSeekAdapter } from './adapters/deepseek'
 import { DeepSeekStreamHandler } from './adapters/deepseek-stream'
 import { GLMAdapter, GLMStreamHandler } from './adapters/glm'
-import { KimiAdapter, KimiStreamHandler } from './adapters/kimi'
+import { KimiAdapter, KimiProxyFailure, KimiStreamHandler } from './adapters/kimi'
 import { MimoAdapter, MimoStreamHandler } from './adapters/mimo'
 import { QwenAdapter, QwenStreamHandler } from './adapters/qwen'
-import { QwenAiAdapter, QwenAiStreamHandler } from './adapters/qwen-ai'
-import { ZaiAdapter, ZaiStreamHandler } from './adapters/zai'
+import { QwenAiAdapter, QwenAiProxyFailure, QwenAiStreamHandler } from './adapters/qwen-ai'
+import { ZaiAdapter, ZaiProxyFailure, ZaiStreamHandler } from './adapters/zai'
 import { MiniMaxAdapter, MiniMaxStreamHandler } from './adapters/minimax'
 import { PerplexityAdapter } from './adapters/perplexity'
 import { PerplexityStreamHandler } from './adapters/perplexity-stream'
 import { ToolCallingEngine } from './toolCalling/ToolCallingEngine'
 import type { ToolCallingTransformResult } from './toolCalling/types'
 import { sessionManager } from './sessionManager'
+import { hasCompletedNonStreamAnswer } from './streamTerminalGate'
 import {
   createContextManagementService,
   SummaryGenerator,
-  type ChatMessage as ContextChatMessage,
 } from './services/contextManagementService'
 
 function shouldDeleteSession(): boolean {
   return sessionManager.shouldDeleteAfterChat()
+}
+
+/** Only a numeric status is allowed across a rejected web-client boundary. */
+function safeWebErrorStatus(error: unknown): number | undefined {
+  if (!error || typeof error !== 'object') return undefined
+  const typed = error as { upstreamStatus?: unknown; response?: { status?: unknown } }
+  const status = typed.upstreamStatus ?? typed.response?.status
+  return Number.isInteger(status) && (status as number) >= 400 && (status as number) <= 599
+    ? status as number : undefined
+}
+
+/** A failed response decoder cannot establish whether a remote effect ran. */
+function unconfirmedProviderCompletion(latency: number): ForwardResult {
+  return {
+    success: false,
+    status: 502,
+    error: 'Provider completion was not confirmed',
+    failureStage: 'response-decoding',
+    failureCode: 'provider_completion_unconfirmed',
+    latency,
+  }
 }
 
 type ProviderForwarder = {
@@ -208,10 +229,10 @@ export class RequestForwarder {
           return summaryContent
         }
 
-        console.warn('[SummaryGenerator] Failed to generate summary:', result.error)
+        console.warn('[SummaryGenerator] Failed to generate summary')
         return 'Failed to generate conversation summary.'
       } catch (error) {
-        console.error('[SummaryGenerator] Error generating summary:', error)
+        console.error('[SummaryGenerator] Error generating summary')
         return 'Failed to generate conversation summary due to an error.'
       }
     }
@@ -229,9 +250,17 @@ export class RequestForwarder {
   ): Promise<ForwardResult> {
     const startTime = Date.now()
     const config = storeManager.getConfig()
-    const maxRetries = config.retryCount
+    // Every dedicated consumer-web adapter may create a remote conversation
+    // before its completion POST. A timeout, rejection or lost ACK is not an
+    // idempotent operation, irrespective of provider. Do not replay ANY of
+    // these web-session effects, including aliases that match a web adapter.
+    const consumerWebAdapter = this.providerForwarders.some(forwarder => forwarder.matches(provider))
+    const maxRetries = consumerWebAdapter ? 0 : config.retryCount
 
     let lastError: string | undefined
+    let lastStatus: number | undefined
+    let lastFailureStage: ForwardResult['failureStage']
+    let lastFailureCode: ForwardResult['failureCode']
 
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       if (attempt > 0) {
@@ -240,7 +269,11 @@ export class RequestForwarder {
 
       let modifiedRequest = request
 
-      if (config.contextManagement?.enabled && modifiedRequest.messages && modifiedRequest.messages.length > 0) {
+      // Context summarization can issue an additional independent upstream
+      // model request. Never add such an implicit effect to a stateful
+      // consumer-web chat operation from any dedicated provider.
+      if (!consumerWebAdapter && config.contextManagement?.enabled &&
+          modifiedRequest.messages && modifiedRequest.messages.length > 0) {
         try {
           const summaryGenerator = this.createSummaryGenerator(
             account,
@@ -285,7 +318,7 @@ export class RequestForwarder {
             }
           }
         } catch (error) {
-          console.error('[Forwarder] Context management failed:', error)
+          console.error('[Forwarder] Context management failed')
         }
       }
 
@@ -297,17 +330,27 @@ export class RequestForwarder {
         }
 
         lastError = result.error
+        lastStatus = result.status
+        lastFailureStage = result.failureStage
+        lastFailureCode = result.failureCode
 
         if (result.status && result.status < 500 && result.status !== 429) {
           break
         }
       } catch (error) {
-        lastError = error instanceof Error ? error.message : 'Unknown error'
+        lastError = ZaiAdapter.isZaiProvider(provider)
+          ? 'Z.ai provider operation failed' : error instanceof Error ? error.message : 'Unknown error'
+        lastStatus = undefined
+        lastFailureStage = ZaiAdapter.isZaiProvider(provider) ? 'unclassified' : undefined
+        lastFailureCode = undefined
       }
     }
 
     return {
       success: false,
+      status: lastStatus,
+      failureStage: lastFailureStage,
+      failureCode: lastFailureCode,
       error: lastError || 'Request failed after retries',
       latency: Date.now() - startTime,
     }
@@ -341,6 +384,9 @@ export class RequestForwarder {
         url,
         headers,
         data: body,
+        // A redirect must never forward authorization, Cookie or custom
+        // provider headers to a different origin without a new trust decision.
+        maxRedirects: 0,
         timeout: proxyStatusManager.getConfig().timeout,
         responseType: request.stream ? 'stream' : 'json',
         validateStatus: () => true,
@@ -349,11 +395,13 @@ export class RequestForwarder {
       const response: AxiosResponse = await this.axiosInstance.request(axiosConfig)
       const latency = Date.now() - startTime
 
-      if (response.status >= 400) {
+      if (response.status >= 300) {
         return {
           success: false,
           status: response.status,
-          error: this.extractErrorMessage(response),
+          error: response.status >= 300 && response.status < 400
+            ? 'Provider redirect refused to protect local credentials'
+            : this.extractErrorMessage(response),
           latency,
         }
       }
@@ -416,7 +464,11 @@ export class RequestForwarder {
       const adapter = new DeepSeekAdapter(provider, account)
       
       const { response, sessionId } = await adapter.chatCompletion({
-        model: request.model,
+        // A discovered website model can have a localized display label.
+        // The selector already resolved its exact upstream model_type; do
+        // not reinterpret the public alias as a wire ID.
+        model: actualModel,
+        originalModel: request.model,
         messages: transformedRequest.messages as any,
         stream: transformedRequest.stream,
         temperature: transformedRequest.temperature,
@@ -446,12 +498,12 @@ export class RequestForwarder {
       }
 
       // Prepare callback for deleting session
-      const deleteSessionCallback = shouldDeleteSession()
+      const deleteSessionCallback = request.stream && shouldDeleteSession()
         ? async () => {
             try {
               await adapter.deleteSession(sessionId)
             } catch (error) {
-              console.error('[DeepSeek] Failed to delete session:', error)
+              console.error('[DeepSeek] Failed to delete session')
             }
           }
         : undefined
@@ -485,9 +537,10 @@ export class RequestForwarder {
       const result = await handler.handleNonStream(response.data)
       
       this.applyToolCallsToResponse(result, transformed)
+      if (!hasCompletedNonStreamAnswer(result)) return unconfirmedProviderCompletion(latency)
       
-      if (deleteSessionCallback) {
-        await deleteSessionCallback()
+      if (shouldDeleteSession()) {
+        await adapter.deleteSession(sessionId)
       }
 
       return {
@@ -561,24 +614,26 @@ export class RequestForwarder {
         }
       }
 
-      const handler = new GLMStreamHandler(actualModel, undefined, undefined, transformed.plan)
+      // Cleanup is another independent upstream effect. It is permitted only
+      // after the adapter confirms its clean model terminal, never whenever a
+      // local PassThrough happens to end (which also happens on errors).
+      let cleanupScheduled = false
+      let handler: GLMStreamHandler
+      const onCompletedStream = shouldDeleteSession()
+        ? () => {
+            if (cleanupScheduled) return
+            const convId = handler.getConversationId()
+            if (!convId) return
+            cleanupScheduled = true
+            adapter.deleteConversation(convId).catch(() => {
+              console.error('[GLM] Failed to delete session')
+            })
+          }
+        : undefined
+      handler = new GLMStreamHandler(actualModel, onCompletedStream, undefined, transformed.plan)
       
       if (request.stream) {
         const transformedStream = await handler.handleStream(response.data)
-        
-        // If delete session after chat is enabled, we need to handle it after stream ends
-        if (shouldDeleteSession()) {
-          const originalEnd = transformedStream.end.bind(transformedStream)
-          transformedStream.end = function(chunk?: any, encoding?: any, callback?: any) {
-            const convId = handler.getConversationId()
-            if (convId) {
-              adapter.deleteConversation(convId).catch(err => {
-                console.error('[GLM] Failed to delete session:', err)
-              })
-            }
-            return originalEnd(chunk, encoding, callback)
-          }
-        }
         
         return {
           success: true,
@@ -594,6 +649,7 @@ export class RequestForwarder {
       const result = await handler.handleNonStream(response.data)
       
       this.applyToolCallsToResponse(result, transformed)
+      if (!hasCompletedNonStreamAnswer(result)) return unconfirmedProviderCompletion(latency)
       
       if (shouldDeleteSession()) {
         const convId = handler.getConversationId()
@@ -627,6 +683,7 @@ export class RequestForwarder {
     actualModel: string,
     startTime: number
   ): Promise<ForwardResult> {
+    let responseAvailable = false
     try {
       const transformed = this.transformRequestForPromptToolUse(request, provider)
       
@@ -637,17 +694,18 @@ export class RequestForwarder {
         messages: transformed.messages,
         stream: request.stream,
         temperature: request.temperature,
-        enableThinking: !!request.reasoning_effort,
-        enableWebSearch: !!request.web_search,
+        enableThinking: request.reasoning_effort === undefined ? undefined : !!request.reasoning_effort,
+        enableWebSearch: request.web_search === undefined ? undefined : !!request.web_search,
       })
+      responseAvailable = true
 
       const latency = Date.now() - startTime
 
-      if (response.status >= 400) {
+      if (response.status !== 200) {
         let errorMessage = `HTTP ${response.status}`
         return {
           success: false,
-          status: response.status,
+          status: response.status >= 400 ? response.status : 502,
           error: errorMessage,
           latency,
         }
@@ -660,16 +718,17 @@ export class RequestForwarder {
         
         // Add delete conversation callback if needed
         if (shouldDeleteSession()) {
-          const originalEnd = transformedStream.end.bind(transformedStream)
-          transformedStream.end = function(chunk?: any, encoding?: any, callback?: any) {
+          // Delete only after a proven successful terminal frame, exactly
+          // once. A premature close or provider error has UNKNOWN remote state.
+          transformedStream.once('end', () => {
+            if (!handler.hasSuccessfulTerminal()) return
             const realChatId = handler.getConversationId()
             if (realChatId) {
               adapter.deleteConversation(realChatId).catch(err => {
-                console.error('[Kimi] Failed to delete conversation:', err)
+                console.error('[Kimi] Failed to delete conversation')
               })
             }
-            return originalEnd(chunk, encoding, callback)
-          }
+          })
         }
         
         return {
@@ -686,6 +745,7 @@ export class RequestForwarder {
       const result = await handler.handleNonStream(response.data)
 
       this.applyToolCallsToResponse(result, transformed)
+      if (!hasCompletedNonStreamAnswer(result)) return unconfirmedProviderCompletion(latency)
 
       if (shouldDeleteSession()) {
         const realChatId = handler.getConversationId()
@@ -704,9 +764,14 @@ export class RequestForwarder {
       }
     } catch (error) {
       const latency = Date.now() - startTime
+      const known = typeof KimiProxyFailure === 'function' && error instanceof KimiProxyFailure
+        ? error : null
       return {
         success: false,
-        error: error instanceof Error ? error.message : 'Unknown error',
+        status: known?.upstreamStatus ?? safeWebErrorStatus(error) ?? 502,
+        error: 'Kimi provider operation failed',
+        failureCode: 'kimi_upstream_operation_failed',
+        failureStage: known?.stage ?? (responseAvailable ? 'response-decoding' : 'unclassified'),
         latency,
       }
     }
@@ -753,12 +818,12 @@ export class RequestForwarder {
         }
       }
 
-      const deleteSessionCallback = shouldDeleteSession()
+      const deleteSessionCallback = request.stream && shouldDeleteSession()
         ? async (sid: string) => {
             try {
               await adapter.deleteSession(sid)
             } catch (err) {
-              console.error('[Qwen] Failed to delete session:', err)
+              console.error('[Qwen] Failed to delete session')
             }
           }
         : undefined
@@ -782,10 +847,11 @@ export class RequestForwarder {
       const result = await handler.handleNonStream(response.data, response)
 
       this.applyToolCallsToResponse(result, transformed)
+      if (!hasCompletedNonStreamAnswer(result)) return unconfirmedProviderCompletion(latency)
 
       const sid = handler.getSessionId()
-      if (deleteSessionCallback && sid) {
-        await deleteSessionCallback(sid)
+      if (shouldDeleteSession() && sid) {
+        await adapter.deleteSession(sid)
       }
 
       return {
@@ -816,6 +882,7 @@ export class RequestForwarder {
     actualModel: string,
     startTime: number
   ): Promise<ForwardResult> {
+    let responseAvailable = false
     try {
       const transformed = this.transformRequestForPromptToolUse(request, provider)
       
@@ -828,6 +895,7 @@ export class RequestForwarder {
         temperature: request.temperature,
         enable_thinking: !!request.reasoning_effort,
       })
+      responseAvailable = true
 
       const latency = Date.now() - startTime
 
@@ -841,20 +909,20 @@ export class RequestForwarder {
         }
       }
 
-      const handler = new QwenAiStreamHandler(actualModel)
+      const handler = new QwenAiStreamHandler(actualModel, undefined,
+        request.tool_choice !== 'none')
       handler.setChatId(chatId)
 
       if (request.stream) {
         const transformedStream = await handler.handleStream(response.data)
 
         if (shouldDeleteSession()) {
-          const originalEnd = transformedStream.end.bind(transformedStream)
-          transformedStream.end = function(chunk?: any, encoding?: any, callback?: any) {
-            adapter.deleteChat(chatId).catch(err => {
-              console.error('[QwenAI] Failed to delete chat:', err)
+          transformedStream.once('end', () => {
+            if (!handler.hasSuccessfulTerminal()) return
+            adapter.deleteChat(chatId).catch(() => {
+              console.error('[QwenAI] Failed to delete chat')
             })
-            return originalEnd(chunk, encoding, callback)
-          }
+          })
         }
 
         return {
@@ -871,6 +939,7 @@ export class RequestForwarder {
       const result = await handler.handleNonStream(response.data)
 
       this.applyToolCallsToResponse(result, transformed)
+      if (!hasCompletedNonStreamAnswer(result)) return unconfirmedProviderCompletion(latency)
 
       if (shouldDeleteSession()) {
         await adapter.deleteChat(chatId)
@@ -886,9 +955,14 @@ export class RequestForwarder {
       }
     } catch (error) {
       const latency = Date.now() - startTime
+      const known = typeof QwenAiProxyFailure === 'function' && error instanceof QwenAiProxyFailure
+        ? error : null
       return {
         success: false,
-        error: error instanceof Error ? error.message : 'Unknown error',
+        status: known?.upstreamStatus ?? safeWebErrorStatus(error) ?? 502,
+        error: 'Qwen AI provider operation failed',
+        failureCode: 'qwen_ai_upstream_operation_failed',
+        failureStage: known?.stage ?? (responseAvailable ? 'response-decoding' : 'unclassified'),
         latency,
       }
     }
@@ -904,8 +978,7 @@ export class RequestForwarder {
     actualModel: string,
     startTime: number
   ): Promise<ForwardResult> {
-    console.log('[forwardZai] actualModel:', actualModel)
-    console.log('[forwardZai] provider.modelMappings:', provider.modelMappings)
+    let responseAvailable = false
     try {
       const transformed = this.transformRequestForPromptToolUse(request, provider)
       
@@ -919,30 +992,36 @@ export class RequestForwarder {
         web_search: request.web_search,
         reasoning_effort: request.reasoning_effort,
       })
+      responseAvailable = true
 
       const latency = Date.now() - startTime
 
-      if (response.status >= 400) {
-        let errorMessage = `HTTP ${response.status}`
+      // Any non-200 response (including a redirect or unexpected 2xx) is a
+      // failed completion, never a successful empty model response. Redirects
+      // are not forwarded and must not cause a second upstream POST.
+      if (response.status !== 200) {
         return {
           success: false,
-          status: response.status,
-          error: errorMessage,
+          status: Number.isInteger(response.status) && response.status >= 400 && response.status <= 599
+            ? response.status : 502,
+          error: 'Z.ai completion did not return HTTP 200',
+          failureStage: 'chat-completion',
           latency,
         }
       }
 
-      const deleteChatCallback = shouldDeleteSession()
+      const deleteChatCallback = request.stream && shouldDeleteSession()
         ? async (cid: string) => {
             try {
               await adapter.deleteChat(cid)
             } catch (error) {
-              console.error('[Z.ai] Failed to delete chat:', error)
+              console.error('[Z.ai] Failed to delete chat')
             }
           }
         : undefined
 
-      const handler = new ZaiStreamHandler(actualModel, deleteChatCallback)
+      const handler = new ZaiStreamHandler(actualModel, deleteChatCallback,
+        request.tool_choice !== 'none')
       handler.setChatId(chatId)
       
       if (request.stream === true) {
@@ -962,9 +1041,14 @@ export class RequestForwarder {
       const result = await handler.handleNonStream(response.data)
 
       this.applyToolCallsToResponse(result, transformed)
+      if (!hasCompletedNonStreamAnswer(result)) return unconfirmedProviderCompletion(latency)
       
-      if (deleteChatCallback) {
-        await deleteChatCallback(chatId)
+      if (shouldDeleteSession()) {
+        try {
+          await adapter.deleteChat(chatId)
+        } catch {
+          console.error('[Z.ai] Failed to delete chat')
+        }
       }
 
       return {
@@ -977,9 +1061,14 @@ export class RequestForwarder {
       }
     } catch (error) {
       const latency = Date.now() - startTime
+      const known = error instanceof ZaiProxyFailure ? error : null
       return {
         success: false,
-        error: error instanceof Error ? error.message : 'Unknown error',
+        // Preserve only a validated numeric upstream HTTP status, never a raw
+        // Axios error/URL/body. The downstream API uses fixed error messages.
+        status: known?.upstreamHttpStatus ?? 502,
+        error: 'Z.ai provider operation failed',
+        failureStage: known?.stage ?? (responseAvailable ? 'response-decoding' : 'unclassified'),
         latency,
       }
     }
@@ -995,8 +1084,6 @@ export class RequestForwarder {
     actualModel: string,
     startTime: number
   ): Promise<ForwardResult> {
-    console.log('[forwardMiniMax] actualModel:', actualModel)
-    console.log('[forwardMiniMax] provider.modelMappings:', provider.modelMappings)
     try {
       const transformed = this.transformRequestForPromptToolUse(request, provider)
       
@@ -1026,7 +1113,7 @@ export class RequestForwarder {
             try {
               await adapter.deleteChat(cid)
             } catch (error) {
-              console.error('[MiniMax] Failed to delete chat:', error)
+              console.error('[MiniMax] Failed to delete chat')
             }
           }
         : undefined
@@ -1039,7 +1126,7 @@ export class RequestForwarder {
           const originalEnd = originalStream.end.bind(originalStream)
           originalStream.end = function(chunk?: any, encoding?: any, callback?: any) {
             deleteChatCallback(chatId).catch(err => {
-              console.error('[MiniMax] Failed to delete chat:', err)
+              console.error('[MiniMax] Failed to delete chat')
             })
             return originalEnd(chunk, encoding, callback)
           }
@@ -1133,7 +1220,7 @@ export class RequestForwarder {
             try {
               await adapter.deleteSession(sessionId)
             } catch (error) {
-              console.error('[Mimo] Failed to delete session:', error)
+              console.error('[Mimo] Failed to delete session')
             }
           }
         : undefined
@@ -1159,7 +1246,7 @@ export class RequestForwarder {
             }
             transformedStream.end()
           } catch (error) {
-            console.error('[Mimo] Stream error:', error)
+            console.error('[Mimo] Stream error')
             transformedStream.end()
           }
         })()
@@ -1198,7 +1285,7 @@ export class RequestForwarder {
       }
     } catch (error) {
       const latency = Date.now() - startTime
-      console.error('[Mimo] Forward error:', error)
+      console.error('[Mimo] Forward error')
       return {
         success: false,
         error: error instanceof Error ? error.message : 'Unknown error',
@@ -1218,7 +1305,6 @@ export class RequestForwarder {
     actualModel: string,
     startTime: number
   ): Promise<ForwardResult> {
-    console.log('[forwardPerplexity] actualModel:', actualModel)
     try {
       const transformed = this.transformRequestForPromptToolUse(request, provider)
       
@@ -1239,7 +1325,7 @@ export class RequestForwarder {
               try {
                 await adapter.deleteSession(sessionId)
               } catch (error) {
-                console.error('[Perplexity] Failed to delete session:', error)
+                console.error('[Perplexity] Failed to delete session')
               }
             }
           : undefined

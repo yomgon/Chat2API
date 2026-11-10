@@ -22,7 +22,7 @@ export type OAuthStatus = 'idle' | 'pending' | 'success' | 'error' | 'cancelled'
 /**
  * Token type
  */
-export type TokenType = 'jwt' | 'refresh' | 'access' | 'cookie'
+export type TokenType = 'jwt' | 'refresh' | 'access' | 'cookie' | 'token'
 
 /**
  * OAuth login result
@@ -130,6 +130,9 @@ export interface ManualTokenConfig {
  * Manual input config for each provider
  */
 export const MANUAL_TOKEN_CONFIGS: Record<ProviderType, ManualTokenConfig[]> = {
+  // Protected web-account flows do not have a generic manual-token form.
+  mimo: [],
+  zai: [],
   deepseek: [
     {
       providerType: 'deepseek',

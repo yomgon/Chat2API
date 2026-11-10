@@ -3,7 +3,7 @@
  * Supports OAuth login and manual input methods
  */
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import { useTranslation } from 'react-i18next'
 import {
   Dialog,
@@ -72,7 +72,7 @@ function mapOAuthCredentials(providerId: string | undefined, credentials: Record
             tokenValue = parsed.value
           }
         } catch (e) {
-          console.error('[AddAccountDialog] Error parsing JSON token:', e)
+          console.error('[AddAccountDialog] Error parsing JSON token:')
         }
       }
       return { [fieldName]: tokenValue }
@@ -113,6 +113,31 @@ function mapOAuthCredentials(providerId: string | undefined, credentials: Record
   return credentials
 }
 
+function zaiCreateFailureMessage(reason: unknown): string {
+  switch (reason) {
+    case 'invalid_name':
+      return 'Enter an account name before signing in.'
+    case 'busy':
+      return 'Another sign-in is already in progress. Finish or cancel it before trying again.'
+    case 'provider_unavailable':
+      return 'Z.ai sign-in is currently unavailable.'
+    case 'login_cancelled':
+      return 'Z.ai sign-in was cancelled.'
+    case 'login_timeout':
+    case 'authentication_timeout':
+      return 'Z.ai sign-in timed out. Open the login window again to continue.'
+    case 'storage_unavailable':
+      return 'The verified account could not be saved. Check local storage availability before trying again.'
+    case 'invalid_session':
+    case 'invalid_auth_response':
+    case 'authentication_failed':
+    case 'identity_mismatch':
+      return 'Official Z.ai authentication could not be verified. Sign in again to continue.'
+    default:
+      return 'Z.ai account creation could not be completed. Check the account list before trying again.'
+  }
+}
+
 interface AddAccountDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
@@ -135,6 +160,11 @@ interface AddAccountDialogProps {
   }>
   editingAccount?: Account | null
   onUpdateAccount?: (id: string, updates: Partial<Account>) => Promise<void>
+  onCreateZaiAccount?: (name: string) => Promise<{
+    success: boolean
+    accountId?: string
+    reason?: string
+  }>
 }
 
 export function AddAccountDialog({
@@ -145,6 +175,7 @@ export function AddAccountDialog({
   onValidateToken,
   editingAccount,
   onUpdateAccount,
+  onCreateZaiAccount,
 }: AddAccountDialogProps) {
   const { t } = useTranslation()
   const [activeTab, setActiveTab] = useState<string>('manual')
@@ -165,11 +196,50 @@ export function AddAccountDialog({
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [isOAuthLoading, setIsOAuthLoading] = useState(false)
   const [oauthStatus, setOAuthStatus] = useState<string>('')
+  const [isCreatingZai, setIsCreatingZai] = useState(false)
+  const [zaiCreateStatus, setZaiCreateStatus] = useState('')
+  const zaiCreateAttempt = useRef<{ terminal: boolean } | null>(null)
 
   const isEditing = !!editingAccount
+  const isNewZaiAccount = provider?.id === 'zai' && !isEditing
+  const isZaiBrowserFlow = isNewZaiAccount && activeTab === 'oauth'
+  const zaiCreateLocked = isCreatingZai || zaiCreateAttempt.current !== null
+  const isBrowserLoading = isNewZaiAccount ? isCreatingZai : isOAuthLoading
+  const browserStatus = isNewZaiAccount ? zaiCreateStatus : oauthStatus
   const builtinProvider = provider as BuiltinProviderConfig | null
   const credentialFields: CredentialField[] = builtinProvider?.credentialFields || getDefaultCredentialFields(provider?.authType, t)
   const supportsOAuth = provider && ['deepseek', 'glm', 'kimi', 'mimo', 'minimax', 'qwen', 'qwen-ai', 'zai', 'perplexity'].includes(provider.id)
+
+  const cancelPendingZaiCreate = useCallback(() => {
+    const attempt = zaiCreateAttempt.current
+    if (!attempt) return
+    zaiCreateAttempt.current = null
+    if (attempt.terminal) return
+    try {
+      const oauth = window.electronAPI?.oauth
+      if (typeof oauth?.cancelInAppLogin === 'function') {
+        void Promise.resolve(oauth.cancelInAppLogin()).catch(() => {})
+      }
+    } catch {
+      // Cancellation is best effort; never expose an IPC/provider exception.
+    }
+  }, [])
+
+  useEffect(() => {
+    setIsCreatingZai(false)
+    setZaiCreateStatus('')
+    // Callback identities change on ordinary parent renders. Only a dialog
+    // context change or unmount invalidates this operation.
+    return cancelPendingZaiCreate
+  }, [open, provider?.id, editingAccount?.id, cancelPendingZaiCreate])
+
+  const handleDialogOpenChange = (nextOpen: boolean) => {
+    if (!nextOpen) {
+      cancelPendingZaiCreate()
+      setIsCreatingZai(false)
+    }
+    onOpenChange(nextOpen)
+  }
 
   useEffect(() => {
     if (open) {
@@ -203,6 +273,7 @@ export function AddAccountDialog({
   }
 
   const handleValidate = async () => {
+    if (zaiCreateAttempt.current || isZaiBrowserFlow) return
     if (!provider) return
 
     const requiredFields = credentialFields.filter(f => f.required)
@@ -239,6 +310,7 @@ export function AddAccountDialog({
   }
 
   const handleSubmit = async () => {
+    if (zaiCreateAttempt.current || isZaiBrowserFlow) return
     if (!name.trim()) {
       setValidationResult({
         valid: false,
@@ -265,7 +337,7 @@ export function AddAccountDialog({
       let finalCredentials = { ...credentials }
       if (provider?.id === 'minimax' && credentials.realUserID && credentials.realUserID.trim()) {
         // realUserID is provided separately, keep both fields
-        console.log('[AddAccountDialog] MiniMax realUserID provided:', credentials.realUserID)
+        console.log('[AddAccountDialog] MiniMax identifier supplied')
       }
 
       const data = {
@@ -292,7 +364,56 @@ export function AddAccountDialog({
     }
   }
 
+  const handleCreateZaiAccount = async () => {
+    if (!open || !isNewZaiAccount || zaiCreateAttempt.current || isSubmitting || isValidating) return
+    const accountName = name.trim()
+    if (!accountName) {
+      setZaiCreateStatus(zaiCreateFailureMessage('invalid_name'))
+      return
+    }
+    if (typeof onCreateZaiAccount !== 'function') {
+      setZaiCreateStatus(zaiCreateFailureMessage('provider_unavailable'))
+      return
+    }
+    const attempt = { terminal: false }
+    zaiCreateAttempt.current = attempt
+    setIsCreatingZai(true)
+    setValidationResult({})
+    setZaiCreateStatus('Complete sign-in in the official Z.ai window. The new account is added after authentication is verified.')
+    try {
+      const result = await onCreateZaiAccount(accountName)
+      if (zaiCreateAttempt.current !== attempt) return
+      if (result?.success === true) {
+        // A success may already represent a committed write. Never offer a
+        // second save/retry merely because its receipt is incomplete.
+        attempt.terminal = true
+        if (typeof result.accountId !== 'string' || !result.accountId.trim()) {
+          setZaiCreateStatus('Account creation could not be confirmed. Check the account list before trying again.')
+          return
+        }
+        setZaiCreateStatus('Z.ai account added.')
+        onOpenChange(false)
+        resetForm()
+      } else {
+        setZaiCreateStatus(zaiCreateFailureMessage(result?.reason))
+      }
+    } catch {
+      if (zaiCreateAttempt.current === attempt && !attempt.terminal) {
+        setZaiCreateStatus(zaiCreateFailureMessage(undefined))
+      }
+    } finally {
+      if (zaiCreateAttempt.current === attempt) {
+        if (!attempt.terminal) zaiCreateAttempt.current = null
+        setIsCreatingZai(false)
+      }
+    }
+  }
+
   const handleOpenOAuthBrowser = async () => {
+    if (isNewZaiAccount) {
+      await handleCreateZaiAccount()
+      return
+    }
     if (!provider) return
     
     setIsOAuthLoading(true)
@@ -341,7 +462,7 @@ export function AddAccountDialog({
 
   return (
     <>
-      <Dialog open={open} onOpenChange={onOpenChange}>
+      <Dialog open={open} onOpenChange={handleDialogOpenChange}>
         <DialogContent className="sm:max-w-[500px]">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
@@ -360,11 +481,12 @@ export function AddAccountDialog({
                 id="name"
                 placeholder={t('providers.accountNamePlaceholder')}
                 value={name}
+                disabled={isNewZaiAccount && zaiCreateLocked}
                 onChange={(e) => setName(e.target.value)}
               />
             </div>
 
-            <div className="space-y-2">
+            {!isZaiBrowserFlow && <div className="space-y-2">
               <Label htmlFor="dailyLimit">{t('providers.dailyLimitOptional')}</Label>
               <Input
                 id="dailyLimit"
@@ -373,13 +495,15 @@ export function AddAccountDialog({
                 value={dailyLimit}
                 onChange={(e) => setDailyLimit(e.target.value)}
               />
-            </div>
+            </div>}
 
             {supportsOAuth && !isEditing && (
-              <Tabs value={activeTab} onValueChange={setActiveTab}>
+              <Tabs value={activeTab} onValueChange={(value) => {
+                if (!zaiCreateAttempt.current) setActiveTab(value)
+              }}>
                 <TabsList className="grid w-full grid-cols-2">
-                  <TabsTrigger value="manual">{t('providers.manualInput')}</TabsTrigger>
-                  <TabsTrigger value="oauth">{t('providers.oauthLogin')}</TabsTrigger>
+                  <TabsTrigger value="manual" disabled={isNewZaiAccount && zaiCreateLocked}>{t('providers.manualInput')}</TabsTrigger>
+                  <TabsTrigger value="oauth" disabled={isNewZaiAccount && zaiCreateLocked}>{t('providers.oauthLogin')}</TabsTrigger>
                 </TabsList>
 
                 <TabsContent value="manual" className="mt-4">
@@ -396,31 +520,45 @@ export function AddAccountDialog({
                   <div className="flex flex-col items-center justify-center py-6 space-y-4">
                     <div className="text-center">
                       <p className="text-sm text-muted-foreground mb-4">
-                        {t('providers.clickToOpenOAuth')}
+                        {isNewZaiAccount
+                          ? 'Sign in with your Z.ai account in the official web login window.'
+                          : t('providers.clickToOpenOAuth')}
                       </p>
                       <p className="text-xs text-muted-foreground">
-                        {t('providers.oauthAutoCapture')}
+                        {isNewZaiAccount
+                          ? 'One NEW account record is added only after official web authentication is verified. Existing accounts are preserved.'
+                          : t('providers.oauthAutoCapture')}
                       </p>
                     </div>
                     <Button 
                       onClick={handleOpenOAuthBrowser}
-                      disabled={isOAuthLoading}
+                      disabled={isNewZaiAccount
+                        ? zaiCreateLocked || !name.trim() || typeof onCreateZaiAccount !== 'function' || isSubmitting || isValidating
+                        : isOAuthLoading}
                     >
-                      {isOAuthLoading ? (
+                      {isBrowserLoading ? (
                         <>
                           <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                          {oauthStatus || t('providers.loggingIn')}
+                          {isNewZaiAccount ? 'Signing in and verifying...' : oauthStatus || t('providers.loggingIn')}
                         </>
                       ) : (
                         <>
                           <ExternalLink className="mr-2 h-4 w-4" />
-                          {t('providers.openOAuthLogin')}
+                          {isNewZaiAccount ? 'Sign in and add Z.ai account' : t('providers.openOAuthLogin')}
                         </>
                       )}
                     </Button>
-                    {oauthStatus && !isOAuthLoading && (
-                      <p className={`text-sm ${validationResult.valid ? 'text-green-600' : 'text-red-500'}`}>
-                        {oauthStatus}
+                    {browserStatus && (isNewZaiAccount || !isOAuthLoading) && (
+                      <p className={isNewZaiAccount ? 'text-sm text-muted-foreground' : `text-sm ${validationResult.valid ? 'text-green-600' : 'text-red-500'}`}>
+                        <span role="status">{browserStatus}</span>
+                      </p>
+                    )}
+                    {isNewZaiAccount && !browserStatus &&
+                      (typeof onCreateZaiAccount !== 'function' || !name.trim()) && (
+                      <p className="text-sm text-muted-foreground" role="status">
+                        {typeof onCreateZaiAccount !== 'function'
+                          ? zaiCreateFailureMessage('provider_unavailable')
+                          : zaiCreateFailureMessage('invalid_name')}
                       </p>
                     )}
                   </div>
@@ -463,15 +601,16 @@ export function AddAccountDialog({
           <DialogFooter className="mt-6">
             <Button
               variant="outline"
-              onClick={() => onOpenChange(false)}
+              onClick={() => handleDialogOpenChange(false)}
               disabled={isSubmitting}
             >
               {t('common.cancel')}
             </Button>
+            {!isZaiBrowserFlow && <>
             <Button
               variant="outline"
               onClick={handleValidate}
-              disabled={isValidating || isSubmitting}
+              disabled={isValidating || isSubmitting || (isNewZaiAccount && zaiCreateLocked)}
             >
               {isValidating ? (
                 <>
@@ -487,7 +626,7 @@ export function AddAccountDialog({
             </Button>
             <Button
               onClick={handleSubmit}
-              disabled={isSubmitting || isValidating}
+              disabled={isSubmitting || isValidating || (isNewZaiAccount && zaiCreateLocked)}
             >
               {isSubmitting ? (
                 <>
@@ -498,6 +637,7 @@ export function AddAccountDialog({
                 isEditing ? t('providers.saveChanges') : t('providers.addAccount')
               )}
             </Button>
+            </>}
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -533,7 +673,7 @@ function CredentialFieldsForm({ fields, credentials, onChange, t, providerId }: 
         setCopiedFields(prev => ({ ...prev, [fieldName]: false }))
       }, 2000)
     } catch (err) {
-      console.error('Failed to copy:', err)
+      console.error('Failed to copy:')
     }
   }
 

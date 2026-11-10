@@ -48,6 +48,8 @@ interface AccountListProps {
   onEditAccount: (account: Account) => void
   onDeleteAccount: (id: string) => void
   onValidateAccount: (id: string) => void
+  onReconnectZaiAccount: (id: string) => Promise<void>
+  reconnectProgress?: string | null
   onViewDetail: (account: Account) => void
 }
 
@@ -58,6 +60,8 @@ export function AccountList({
   onEditAccount,
   onDeleteAccount,
   onValidateAccount,
+  onReconnectZaiAccount,
+  reconnectProgress,
   onViewDetail,
 }: AccountListProps) {
   const { t } = useTranslation()
@@ -65,6 +69,20 @@ export function AccountList({
   const [clearingChatsId, setClearingChatsId] = useState<string | null>(null)
   const [showClearChatsDialog, setShowClearChatsDialog] = useState(false)
   const [selectedAccountForClear, setSelectedAccountForClear] = useState<Account | null>(null)
+  const [selectedAccountForReconnect, setSelectedAccountForReconnect] = useState<Account | null>(null)
+  const [reconnectingId, setReconnectingId] = useState<string | null>(null)
+
+  const confirmReconnectZai = async () => {
+    const account = selectedAccountForReconnect
+    if (!account || providerId !== 'zai' || reconnectingId) return
+    setReconnectingId(account.id)
+    try {
+      await onReconnectZaiAccount(account.id)
+    } finally {
+      setReconnectingId(null)
+      setSelectedAccountForReconnect(null)
+    }
+  }
 
   const statusConfig: Record<AccountStatus, { 
     labelKey: string
@@ -123,12 +141,12 @@ export function AccountList({
     try {
       const result = await window.electronAPI.accounts.clearChats(selectedAccountForClear.id)
       if (result.success) {
-        console.log(t('providers.clearChatsSuccess'))
+        console.log('[Renderer] Operation event')
       } else {
-        console.error(result.error || t('providers.clearChatsFailed'))
+        console.error('[Renderer] Operation failed')
       }
     } catch (error) {
-      console.error('Failed to clear chats:', error)
+      console.error('Failed to clear chats:')
     } finally {
       setClearingChatsId(null)
       setShowClearChatsDialog(false)
@@ -279,6 +297,18 @@ export function AccountList({
                             )} />
                             {isValidating ? t('oauth.validating') : t('providers.validateCredentials')}
                           </DropdownMenuItem>
+                          {providerId === 'zai' && (
+                            <DropdownMenuItem
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                setSelectedAccountForReconnect(account)
+                              }}
+                              disabled={reconnectingId !== null}
+                            >
+                              <RefreshCw className="mr-2 h-4 w-4" />
+                              Reconnect Z.ai (keep account)
+                            </DropdownMenuItem>
+                          )}
                           <DropdownMenuSeparator />
                           <DropdownMenuItem 
                             onClick={(e) => {
@@ -352,6 +382,35 @@ export function AccountList({
               className="bg-amber-600 hover:bg-amber-700"
             >
               {t('common.confirm')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Explicit account-bound consent. The official site may require the
+          user to complete CAPTCHA/2FA; no account replacement is authorized. */}
+      <Dialog open={!!selectedAccountForReconnect} onOpenChange={(open) => {
+        if (!open && !reconnectingId) setSelectedAccountForReconnect(null)
+      }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Reconnect existing Z.ai account</DialogTitle>
+            <DialogDescription>
+              Continue with the official Z.ai web login for <strong>{selectedAccountForReconnect?.name}</strong>?
+              The existing account, provider mapping and credentials will be kept if login fails.
+              Only the same Z.ai identity can replace this account's expired token.
+              Sign in inside the Z.ai window opened by this app; a separate Chrome login is not imported.
+              {reconnectingId && reconnectProgress && (
+                <span className="mt-3 block" role="status">{reconnectProgress}</span>
+              )}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" disabled={!!reconnectingId} onClick={() => setSelectedAccountForReconnect(null)}>
+              {t('common.cancel')}
+            </Button>
+            <Button disabled={!!reconnectingId} onClick={() => void confirmReconnectZai()}>
+              {reconnectingId ? 'Waiting for Z.ai login…' : 'Open Z.ai login'}
             </Button>
           </DialogFooter>
         </DialogContent>

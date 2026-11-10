@@ -151,7 +151,7 @@ export class CherryStudioPromptAdapter extends BasePromptAdapter {
           },
         })
       } catch {
-        console.warn('[CherryStudioAdapter] Failed to parse XML tool arguments:', argsStr)
+        console.warn('[CherryStudioAdapter] Failed to parse XML tool arguments')
       }
     }
     
@@ -177,14 +177,14 @@ export class CherryStudioPromptAdapter extends BasePromptAdapter {
     }
 
     const variant = this.getPromptVariant(model)
-    const toolsPrompt = this.toolsToPrompt(tools, variant)
+    const toolsPrompt = this.toolsToPrompt(tools, variant ?? undefined)
     const transformedMessages = this.injectPrompt(messages, toolsPrompt)
 
     return {
       messages: transformedMessages,
       tools: undefined,
       injected: true,
-      variant,
+      variant: variant ?? undefined,
     }
   }
 }

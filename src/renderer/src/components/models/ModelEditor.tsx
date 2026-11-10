@@ -68,7 +68,7 @@ export function ModelEditor({
       const effectiveModels = await window.electronAPI.providers.getEffectiveModels(providerId)
       setModels(effectiveModels || [])
     } catch (error) {
-      console.error('Failed to load models:', error)
+      console.error('Failed to load models:')
       toast({
         title: t('common.error'),
         description: error instanceof Error ? error.message : 'Failed to load models',
@@ -131,7 +131,7 @@ export function ModelEditor({
         throw new Error(result.error || 'Failed to add model')
       }
     } catch (error) {
-      console.error('Failed to add model:', error)
+      console.error('Failed to add model:')
       toast({
         title: t('common.error'),
         description: error instanceof Error ? error.message : t('modelEditor.addError'),
@@ -158,7 +158,7 @@ export function ModelEditor({
         throw new Error(result.error || 'Failed to remove model')
       }
     } catch (error) {
-      console.error('Failed to remove model:', error)
+      console.error('Failed to remove model:')
       toast({
         title: t('common.error'),
         description: error instanceof Error ? error.message : t('modelEditor.removeError'),
@@ -189,7 +189,7 @@ export function ModelEditor({
         throw new Error(result.error || 'Failed to reset models')
       }
     } catch (error) {
-      console.error('Failed to reset models:', error)
+      console.error('Failed to reset models:')
       toast({
         title: t('common.error'),
         description: error instanceof Error ? error.message : t('modelEditor.resetError'),

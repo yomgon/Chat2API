@@ -191,7 +191,7 @@ export const useLogsStore = create<LogsState>((set, get) => ({
         get().applyFilter()
       }
     } catch (error) {
-      console.error('Failed to load more logs:', error)
+      console.error('Failed to load more logs:')
     } finally {
       set({ isLoading: false })
     }
@@ -222,7 +222,7 @@ export const useLogsStore = create<LogsState>((set, get) => ({
         isLoading: false,
       })
     } catch (error) {
-      console.error('Failed to refresh logs:', error)
+      console.error('Failed to refresh logs:')
       set({ isLoading: false })
     }
   },

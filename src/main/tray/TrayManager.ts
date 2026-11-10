@@ -2,6 +2,7 @@ import {
   Tray,
   Menu,
   nativeImage,
+  type NativeImage,
   app,
   BrowserWindow,
   ipcMain,
@@ -21,7 +22,7 @@ function getIconPath(): string {
   return path.join(__dirname, '../../build/icon.png')
 }
 
-function loadAppIcon(): nativeImage {
+function loadAppIcon(): NativeImage {
   const iconPath = getIconPath()
   
   try {
@@ -39,7 +40,7 @@ function loadAppIcon(): nativeImage {
   return createFallbackIcon()
 }
 
-function createFallbackIcon(): nativeImage {
+function createFallbackIcon(): NativeImage {
   const size = 22
   const canvas = Buffer.alloc(size * size * 4)
   
@@ -84,7 +85,11 @@ export class TrayManager {
     if (this.tray) return
 
     this.mainWindow = mainWindow
-    if (!isLinux) {
+    // Windows (and Linux) use the native tray/menu and open the main window.
+    // Loading an unused hidden TrayWindow on Windows creates a SECOND renderer
+    // that immediately invokes main-window-only CONFIG_GET IPC, which the
+    // correct trusted-sender guard denies. Do not weaken that guard.
+    if (!isLinux && !isWindows) {
       this.trayWindow = new TrayWindow()
     }
 
@@ -95,7 +100,9 @@ export class TrayManager {
 
     this.setupEventHandlers()
     this.updateContextMenu()
-    this.setupIpcHandlers()
+    // The tray IPC contract belongs to the real macOS overlay only.
+    // Windows and Linux never expose these unguarded unused channels.
+    if (this.trayWindow) this.setupIpcHandlers()
   }
 
   private setupEventHandlers(): void {

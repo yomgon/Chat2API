@@ -26,6 +26,13 @@ export const mimoConfig: BuiltinProviderConfig = {
   },
   enabled: true,
   description: 'XiaomiMIMO - Xiaomi General Intelligence Foundation Model',
+  // Public AI Studio configuration contains separate chat/TTS/ASR catalogs.
+  // Only chat models are imported by the guarded parser.
+  modelsApiEndpoint: 'https://aistudio.xiaomimimo.com/open-apis/bot/config',
+  modelsApiHeaders: {
+    Accept: 'application/json',
+    Referer: 'https://aistudio.xiaomimimo.com/',
+  },
   supportedModels: [
     'MiMo-V2.5-Pro',
     'MiMo-V2.5',

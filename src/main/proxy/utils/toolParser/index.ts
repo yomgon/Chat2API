@@ -7,7 +7,7 @@ import { ToolCallFormat } from '../../constants/signatures'
 export interface ToolParseResult {
   content: string
   toolCalls: ToolCall[]
-  format: ToolCallFormat
+  format: ToolCallFormat | 'unknown'
   rawMatches: string[]
 }
 
@@ -257,7 +257,7 @@ export function flushToolCallBuffer(
         finish_reason: null
       })
     } else if (state.contentBuffer && state.hasEmittedToolCall) {
-      console.warn('[StreamHandler] Discarding remaining buffer because tool calls were emitted:', state.contentBuffer.substring(0, 200) + '...')
+      console.warn('[StreamHandler] Discarding remaining buffer after tool calls (contents redacted)')
     }
   }
 

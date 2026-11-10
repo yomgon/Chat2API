@@ -1,6 +1,8 @@
 import { BrowserWindow, app, shell } from 'electron'
 import { join } from 'path'
+import { pathToFileURL } from 'url'
 import { storeManager } from '../store/store'
+import { isSafeExternalLink, isTrustedRendererNavigation } from './navigationGuard'
 
 let mainWindow: BrowserWindow | null = null
 
@@ -19,7 +21,7 @@ export function createWindow(options: WindowOptions = {}): BrowserWindow {
     height = 800,
     minWidth = 800,
     minHeight = 600,
-    title = 'Chat2API',
+    title = 'Chat2API Private Local',
     show = false,
   } = options
 
@@ -32,7 +34,7 @@ export function createWindow(options: WindowOptions = {}): BrowserWindow {
       preload: join(__dirname, '../preload/index.js'),
       nodeIntegration: false,
       contextIsolation: true,
-      sandbox: false,
+      sandbox: true,
       webSecurity: true,
     },
     title,
@@ -44,24 +46,22 @@ export function createWindow(options: WindowOptions = {}): BrowserWindow {
   })
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    shell.openExternal(url)
+    if (isSafeExternalLink(url)) {
+      void shell.openExternal(url).catch(() => {})
+    }
     return { action: 'deny' }
   })
 
   mainWindow.webContents.on('will-navigate', (event, url) => {
     const isDev = process.env.NODE_ENV === 'development'
     const devUrl = process.env.ELECTRON_RENDERER_URL || 'http://localhost:5173'
-    const prodPrefix = 'file://'
-
-    if (isDev) {
-      if (!url.startsWith(devUrl)) {
-        event.preventDefault()
-        shell.openExternal(url)
-      }
-    } else {
-      if (!url.startsWith(prodPrefix)) {
-        event.preventDefault()
-        shell.openExternal(url)
+    const expectedPage = isDev
+      ? devUrl
+      : pathToFileURL(join(__dirname, '../renderer/index.html')).href
+    if (!isTrustedRendererNavigation(url, expectedPage)) {
+      event.preventDefault()
+      if (isSafeExternalLink(url)) {
+        void shell.openExternal(url).catch(() => {})
       }
     }
   })
@@ -72,15 +72,15 @@ export function createWindow(options: WindowOptions = {}): BrowserWindow {
   })
 
   mainWindow.on('close', (event) => {
-    if (!app.isQuitting) {
+    if (!(app as typeof app & { isQuitting?: boolean }).isQuitting) {
       try {
         const config = storeManager.getConfig()
         if (config.minimizeToTray) {
           event.preventDefault()
           mainWindow?.hide()
         }
-      } catch (error) {
-        console.error('[Window] Failed to get config during close:', error)
+      } catch {
+        console.error('[Window] Failed to get config during close')
       }
     }
   })

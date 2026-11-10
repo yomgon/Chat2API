@@ -162,10 +162,10 @@ export const useProxyStore = create<ProxyState>((set, get) => ({
   },
 
   fetchAppConfig: async () => {
-    if (!window.electronAPI?.store?.get) return
+    if (!window.electronAPI?.config?.get) return
     try {
       set({ isLoading: true })
-      const config = await window.electronAPI.store.get<AppConfig>('config')
+      const config = await window.electronAPI.config.get()
       if (config) {
         set({
           appConfig: config,
@@ -188,7 +188,7 @@ export const useProxyStore = create<ProxyState>((set, get) => ({
   },
 
   saveAppConfig: async (config) => {
-    if (!window.electronAPI?.store?.set) return false
+    if (!window.electronAPI?.config?.update) return false
     try {
       set({ isLoading: true, error: null })
       const currentConfig = get().appConfig
@@ -216,7 +216,7 @@ export const useProxyStore = create<ProxyState>((set, get) => ({
         }
       }
       
-      await window.electronAPI.store.set('config', newConfig)
+      await window.electronAPI.config.update(newConfig)
       set({ appConfig: newConfig })
       return true
     } catch (error) {

@@ -65,7 +65,7 @@ export class UpdaterManager extends EventEmitter {
 
   private setupAutoUpdater(): void {
     autoUpdater.autoDownload = false
-    autoUpdater.autoInstallOnAppQuit = true
+    autoUpdater.autoInstallOnAppQuit = false
     autoUpdater.allowPrerelease = false
     autoUpdater.allowDowngrade = false
 
@@ -136,69 +136,22 @@ export class UpdaterManager extends EventEmitter {
   }
 
   public async checkForUpdates(): Promise<void> {
-    if (this.status.checking) {
-      console.log('[Updater] Already checking for updates')
-      return
-    }
-
-    if (this.status.downloading) {
-      console.log('[Updater] Download in progress, cannot check for updates')
-      return
-    }
-
-    try {
-      this.updateStatus({ checking: true, error: null })
-      await autoUpdater.checkForUpdates()
-    } catch (error) {
-      console.error('[Updater] Check for updates failed:', error)
-      const errorMessage = error instanceof Error ? error.message : String(error)
-      this.updateStatus({ checking: false, error: errorMessage })
-      this.sendToRenderer(IpcChannels.APP_UPDATE_ERROR, { message: errorMessage })
-    }
+    // Private fork: never contact the original project's release service.
+    const message = 'Automatic updates are disabled for this private-local build'
+    this.updateStatus({ checking: false, available: false, downloading: false, error: message })
+    this.sendToRenderer(IpcChannels.APP_UPDATE_ERROR, { message })
   }
 
   public async downloadUpdate(): Promise<void> {
-    if (!this.status.available) {
-      const error = 'No update available to download'
-      console.error('[Updater]', error)
-      this.updateStatus({ error })
-      this.sendToRenderer(IpcChannels.APP_UPDATE_ERROR, { message: error })
-      return
-    }
-
-    if (this.status.downloading) {
-      console.log('[Updater] Download already in progress')
-      return
-    }
-
-    if (this.status.downloaded) {
-      console.log('[Updater] Update already downloaded')
-      return
-    }
-
-    try {
-      this.updateStatus({ downloading: true, error: null })
-      console.log('[Updater] Starting download...')
-      await autoUpdater.downloadUpdate()
-    } catch (error) {
-      console.error('[Updater] Download failed:', error)
-      const errorMessage = error instanceof Error ? error.message : String(error)
-      this.updateStatus({ downloading: false, error: errorMessage })
-      this.sendToRenderer(IpcChannels.APP_UPDATE_ERROR, { message: errorMessage })
-    }
+    const message = 'Automatic updates are disabled for this private-local build'
+    this.updateStatus({ downloading: false, error: message })
+    this.sendToRenderer(IpcChannels.APP_UPDATE_ERROR, { message })
   }
 
   public quitAndInstall(): void {
-    if (!this.status.downloaded) {
-      const error = 'No update downloaded to install'
-      console.error('[Updater]', error)
-      this.updateStatus({ error })
-      this.sendToRenderer(IpcChannels.APP_UPDATE_ERROR, { message: error })
-      return
-    }
-
-    console.log('[Updater] Quitting and installing update...')
-    autoUpdater.quitAndInstall(false, true)
+    const message = 'Automatic updates are disabled for this private-local build'
+    this.updateStatus({ downloaded: false, error: message })
+    this.sendToRenderer(IpcChannels.APP_UPDATE_ERROR, { message })
   }
 
   public getStatus(): UpdateStatus {

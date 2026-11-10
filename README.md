@@ -1,5 +1,12 @@
 # Chat2API
 
+> **Windows maintenance fork** of [xiaoY233/Chat2API](https://github.com/xiaoY233/Chat2API). Original copyright and GPL-3.0 license are retained.
+>
+> Focus: local proxy security, credential handling, Windows desktop compatibility and web-chat model catalog management.
+> Version `1.4.0-local.22`: 1,286 offline/security tests passed and Windows Electron build passed (2026-11-10). These use synthetic/offline tests; not every provider or live model inference path is verified. No binaries are distributed here.
+>
+> Website integrations may rely on unofficial interfaces, which can change. Follow applicable provider terms. This is an independent community-maintained fork.
+
 <p align="center">
   <img src="build/icons.png" alt="Chat2API Logo" width="128" height="128">
 </p>

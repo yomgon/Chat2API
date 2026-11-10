@@ -41,6 +41,9 @@ export function Providers() {
   const [typeFilter, setTypeFilter] = useState<FilterType>('all')
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all')
   const [isRefreshing, setIsRefreshing] = useState(false)
+  // Keep a provider-scoped, non-secret catalog failure visible after toast
+  // expiry; a transient toast alone hides why the previous model list stayed.
+  const [modelRefreshErrors, setModelRefreshErrors] = useState<Record<string, string>>({})
   
   const [showAddProviderDialog, setShowAddProviderDialog] = useState(false)
   const [showCustomProviderForm, setShowCustomProviderForm] = useState(false)
@@ -48,6 +51,7 @@ export function Providers() {
   
   const [showAddAccountDialog, setShowAddAccountDialog] = useState(false)
   const [editingAccount, setEditingAccount] = useState<Account | null>(null)
+  const [zaiReconnectProgress, setZaiReconnectProgress] = useState<string | null>(null)
   
   const [showModelEditor, setShowModelEditor] = useState(false)
   const [modelEditorProvider, setModelEditorProvider] = useState<{ id: string; name: string } | null>(null)
@@ -98,7 +102,7 @@ export function Providers() {
         useProvidersStore.getState().setProviderStatuses(statusMap)
         useProvidersStore.getState().setAccountCounts(countMap)
       } catch (error) {
-        console.error('Failed to load providers:', error)
+        console.error('Failed to load providers:')
       } finally {
         useProvidersStore.getState().setIsLoading(false)
       }
@@ -165,6 +169,15 @@ export function Providers() {
   }
 
   const handleDeleteProvider = async (id: string) => {
+    const provider = store.providers.find(p => p.id === id)
+    // Built-ins can be disabled, never deleted. Custom deletion requires an
+    // explicit confirmation because it also deletes associated accounts.
+    if (!provider || provider.type !== 'custom' || store.builtinProviders.some(builtin => builtin.id === id)) return
+    const attachedAccounts = store.accounts.filter(account => account.providerId === id).length
+    if (!window.confirm(
+      `Permanently delete this custom provider and its ${attachedAccounts} saved account(s)? ` +
+      'This action cannot be undone. Cancel to preserve the provider and accounts.'
+    )) return
     try {
       const success = await window.electronAPI.providers.delete(id)
       if (success) {
@@ -244,21 +257,50 @@ export function Providers() {
 
   const handleUpdateModels = async (providerId: string) => {
     try {
+      if (providerId === 'glm' && !window.confirm(
+        'GLM model discovery will open the official chatglm.cn website in a temporary, '
+        + 'isolated guest browser. Its website may initialize a guest session. '
+        + 'Your saved GLM account, refresh token and Chrome cookies will not be used '
+        + 'or changed. This only lists public website model choices; it does NOT '
+        + 'verify your account entitlements or a successful model invocation. Continue?',
+      )) return
+      if (providerId === 'deepseek' && !window.confirm(
+        'DeepSeek currently publishes website chat modes (Quick/Expert), not versioned API model IDs. '
+        + 'Refreshing replaces the bundled provider model names and can affect existing local model aliases. '
+        + 'Cancel to keep the previous list, or OK to use the discovered website modes.',
+      )) return
+      setModelRefreshErrors(current => ({ ...current, [providerId]: '' }))
       toast({
         title: t('providers.updatingModels'),
-        description: t('providers.updatingModels'),
+        description: providerId === 'deepseek'
+          ? 'Checking the public DeepSeek website chat modes; no account token will be sent.'
+            : providerId === 'glm'
+              ? 'Reading the official GLM guest model picker in an isolated temporary browser. Existing account secrets are not used.'
+          : providerId === 'qwen'
+            ? 'Trying the first-party Qwen China model list. Website session acceptance is not guaranteed.'
+            : t('providers.updatingModels'),
       })
       
       const result = await window.electronAPI.providers.updateModels?.(providerId)
       
       if (result?.success) {
+        setModelRefreshErrors(current => ({ ...current, [providerId]: '' }))
         const providers = await window.electronAPI.providers.getAll()
         useProvidersStore.getState().setProviders(providers)
+        useProvidersStore.getState().setModelsLastUpdated(Date.now())
         toast({
           title: t('providers.modelsUpdated'),
-          description: t('providers.modelsUpdatedDesc'),
+          description: providerId === 'deepseek'
+            ? `Synced ${result.modelsCount || 0} selectable website chat modes (not API version names). Live inference was not tested.`
+            : providerId === 'glm'
+              ? `Synced ${result.modelsCount || 0} GLM public GUEST website models. Account access and chat invocation were NOT tested.`
+            : `Synced ${result.modelsCount || 0} web-chat models. Availability is not a successful model invocation.`,
         })
       } else {
+        setModelRefreshErrors(current => ({
+          ...current,
+          [providerId]: result?.error || t('common.error'),
+        }))
         toast({
           title: t('providers.updateModelsFailed'),
           description: result?.error || t('common.error'),
@@ -266,6 +308,7 @@ export function Providers() {
         })
       }
     } catch (error) {
+      setModelRefreshErrors(current => ({ ...current, [providerId]: t('common.error') }))
       toast({
         title: t('providers.updateModelsFailed'),
         description: t('common.error'),
@@ -287,7 +330,56 @@ export function Providers() {
     setViewMode('accounts')
   }
 
+  const handleOpenProtectedZaiAccounts = async (definition: BuiltinProviderConfig): Promise<void> => {
+    // This is a navigation/registration-only bridge, never a generic OAuth
+    // login. An existing Z.ai provider and its accounts must not be recreated.
+    if (definition.id !== 'zai') throw new Error('Invalid protected provider selection')
+    const builtin = useProvidersStore.getState().builtinProviders.find(p => p.id === 'zai')
+    if (!builtin) throw new Error('Protected Z.ai provider unavailable')
+
+    const before = await window.electronAPI.providers.getAll()
+    const existing = before.find(p => p.id === 'zai')
+    if (existing && existing.type !== 'builtin') throw new Error('Protected Z.ai provider identity conflict')
+    if (!existing) {
+      // Only an explicit owner click may register the shipped builtin entry.
+      // It creates NO Z.ai account, session, token or model mapping.
+      const registered = await window.electronAPI.providers.add({
+        id: builtin.id, name: builtin.name, type: 'builtin',
+        authType: builtin.authType, apiEndpoint: builtin.apiEndpoint,
+      })
+      if (registered?.id !== 'zai' || registered.type !== 'builtin') {
+        throw new Error('Protected Z.ai provider registration failed')
+      }
+    }
+
+    const [providers, accounts] = await Promise.all([
+      window.electronAPI.providers.getAll(),
+      window.electronAPI.accounts.getAll(),
+    ])
+    if (!providers.some(p => p.id === 'zai' && p.type === 'builtin')) {
+      throw new Error('Protected Z.ai provider unavailable after registration')
+    }
+    useProvidersStore.getState().setProviders(providers)
+    useProvidersStore.getState().setAccounts(accounts)
+    const zaiAccounts = accounts.filter(account => account.providerId === 'zai')
+    useProvidersStore.getState().updateAccountCount(
+      'zai', zaiAccounts.length, zaiAccounts.filter(account => account.status === 'active').length,
+    )
+    useProvidersStore.getState().setSelectedProviderId('zai')
+    setViewMode('accounts')
+    setShowAddProviderDialog(false)
+    toast({
+      title: 'Protected Z.ai account connection',
+      description: zaiAccounts.length
+        ? 'Select Reconnect Z.ai (keep account) for an existing account. Do not add a duplicate.'
+        : 'No saved Z.ai account. Select Add Account to sign in and add one after verification.',
+    })
+  }
+
   const handleSelectBuiltinProvider = async (provider: BuiltinProviderConfig, credentials: Record<string, string>) => {
+    // A stale legacy callback must never insert a Z.ai account or forward a
+    // captured token through the renderer. Use the protected navigation above.
+    if (provider.id === 'zai') throw new Error('Use protected Z.ai account management')
     let targetProvider = store.providers.find(p => p.id === provider.id)
     
     if (!targetProvider) {
@@ -414,6 +506,51 @@ export function Providers() {
     }
   }
 
+  const handleCreateZaiAccount = async (accountName: string): Promise<{
+    success: boolean
+    accountId?: string
+    reason?: string
+  }> => {
+    // This path is only the explicit Z.ai new-account login button. The
+    // credential, session partition and final store write stay in Electron
+    // main; the renderer knows only the selected provider and display name.
+    if (useProvidersStore.getState().selectedProviderId !== 'zai') {
+      return { success: false, reason: 'provider_unavailable' }
+    }
+    let result: { success: boolean; accountId?: string; reason?: string }
+    try {
+      result = await window.electronAPI.oauth.createZaiAccount(accountName)
+    } catch {
+      return { success: false, reason: 'local_login_error' }
+    }
+    if (result.success && result.accountId) {
+      // Never reinterpret a committed account creation as retryable failure
+      // solely because refreshing the GUI failed afterward. Do not prolong
+      // the UI's active-login/cancel state after the durable main receipt.
+      // The refresh is metadata-only and independent of the login owner.
+      void (async () => {
+        try {
+          const accounts = await window.electronAPI.accounts.getAll()
+          useProvidersStore.getState().setAccounts(accounts)
+          const providerAccounts = accounts.filter(account => account.providerId === 'zai')
+          useProvidersStore.getState().updateAccountCount(
+            'zai',
+            providerAccounts.length,
+            providerAccounts.filter(account => account.status === 'active').length,
+          )
+        } catch {
+          // A committed success stays successful. A later page refresh
+          // can safely refresh the list without creating another account.
+        }
+      })()
+      toast({
+        title: 'Z.ai account added',
+        description: 'The official web session was verified and saved. Chat inference has not yet been tested.',
+      })
+    }
+    return result
+  }
+
   const handleUpdateAccount = async (id: string, updates: Partial<Account>) => {
     try {
       const account = store.getAccountById(id)
@@ -534,6 +671,58 @@ export function Providers() {
     }
   }
 
+  const handleReconnectZaiAccount = async (id: string): Promise<void> => {
+    const existing = store.getAccountById(id)
+    if (!existing || existing.providerId !== 'zai') return
+    // The progress channel is a trusted main-process status hint. Display only
+    // these fixed messages, never a provider-supplied error, body or credential.
+    const safeProgress: Record<string, string> = {
+      'Opening login window...': 'Opening the official Z.ai sign-in page',
+      'Reconnect the existing Z.ai account in the login window': 'Waiting for Z.ai sign-in',
+      'Validating token...': 'Checking the detected sign-in credential',
+      'Token invalid, waiting for valid login...': 'Waiting for a usable sign-in credential',
+      'Session verification failed; continue logging in': 'Sign-in detected; server session verification was not accepted',
+      'Validation error, waiting for valid login...': 'Sign-in verification was interrupted',
+    }
+    setZaiReconnectProgress(safeProgress['Opening login window...'])
+    const unsubscribe = window.electronAPI.oauth.onProgress(({ message }) => {
+      if (Object.prototype.hasOwnProperty.call(safeProgress, message)) {
+        setZaiReconnectProgress(safeProgress[message])
+      }
+    })
+    try {
+      // No token/cookie enters the renderer; only an existing account ID.
+      const result = await window.electronAPI.oauth.reconnectZaiAccount(id)
+      if (!result.success || result.accountId !== id) {
+        toast({
+          title: 'Z.ai reconnection not completed',
+          description: 'Existing account was preserved. Reason: ' + (result.reason || 'LOGIN_NOT_COMPLETED'),
+          variant: 'destructive',
+        })
+        return
+      }
+      const accounts = await window.electronAPI.accounts.getAll()
+      useProvidersStore.getState().setAccounts(accounts)
+      const providerAccounts = accounts.filter(account => account.providerId === 'zai')
+      useProvidersStore.getState().updateAccountCount(
+        'zai', providerAccounts.length, providerAccounts.filter(account => account.status === 'active').length,
+      )
+      toast({
+        title: 'Z.ai account reconnected',
+        description: 'Existing account and model mappings were retained. Chat has not yet been live-tested.',
+      })
+    } catch {
+      toast({
+        title: 'Z.ai reconnection failed',
+        description: 'The existing account was preserved; please use the official Z.ai login again.',
+        variant: 'destructive',
+      })
+    } finally {
+      unsubscribe()
+      setZaiReconnectProgress(null)
+    }
+  }
+
   const handleValidateToken = async (providerId: string, credentials: Record<string, string>) => {
     return await window.electronAPI.accounts.validateToken(providerId, credentials)
   }
@@ -635,6 +824,8 @@ export function Providers() {
           }}
           onDeleteAccount={handleDeleteAccount}
           onValidateAccount={handleValidateAccount}
+          onReconnectZaiAccount={handleReconnectZaiAccount}
+          reconnectProgress={zaiReconnectProgress}
           onViewDetail={handleViewAccountDetail}
         />
 
@@ -646,6 +837,7 @@ export function Providers() {
           }}
           provider={selectedProvider}
           onAddAccount={handleAddAccount}
+          onCreateZaiAccount={handleCreateZaiAccount}
           onValidateToken={handleValidateToken}
           editingAccount={editingAccount}
           onUpdateAccount={handleUpdateAccount}
@@ -703,6 +895,13 @@ export function Providers() {
                 onCheckStatus={handleCheckProviderStatus}
                 onManageAccounts={handleManageAccounts}
                 onUpdateModels={handleUpdateModels}
+                modelRefreshError={modelRefreshErrors[provider.id]}
+                canUpdateModels={store.builtinProviders.some(
+                  builtin => builtin.id === provider.id && !!builtin.modelsApiEndpoint,
+                ) && (
+                  ['deepseek', 'kimi', 'mimo', 'qwen', 'glm'].includes(provider.id) ||
+                  (store.accountCounts[provider.id]?.active || 0) > 0
+                )}
                 onManageModels={handleManageModels}
               />
             ))}
@@ -715,6 +914,7 @@ export function Providers() {
         onOpenChange={setShowAddProviderDialog}
         builtinProviders={store.builtinProviders}
         onSelectBuiltin={handleSelectBuiltinProvider}
+        onOpenProtectedZaiAccounts={handleOpenProtectedZaiAccounts}
         onCreateCustom={handleCreateCustomProvider}
         onValidateToken={handleValidateToken}
       />

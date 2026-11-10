@@ -165,6 +165,8 @@ export interface ChatCompletionChoice {
  */
 export interface ToolCall {
   index?: number
+  /** Internal parser-only match, removed before downstream serialization. */
+  rawText?: string
   id: string
   type: 'function'
   function: {
@@ -232,6 +234,10 @@ export interface ProxyContext {
 export interface ForwardResult {
   success: boolean
   status?: number
+  /** Fixed internal phase enum only; never a raw provider exception or body. */
+  failureStage?: 'auth-preflight' | 'chat-creation' | 'chat-completion' | 'response-decoding' | 'unclassified'
+  /** Literal-only diagnostic, never a raw upstream exception or response. */
+  failureCode?: 'kimi_upstream_operation_failed' | 'qwen_ai_upstream_operation_failed' | 'provider_completion_unconfirmed'
   headers?: Record<string, string>
   body?: any
   stream?: NodeJS.ReadableStream

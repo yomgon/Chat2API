@@ -174,7 +174,7 @@ export class MiniMaxAdapter extends BaseOAuthAdapter {
       }
     }
 
-    console.log('[MiniMax OAuth] Validating token:', token.substring(0, 50) + '...')
+    console.log('[MiniMax OAuth] Validating token')
 
     try {
       // Parse token to extract realUserID and JWT
@@ -190,7 +190,7 @@ export class MiniMaxAdapter extends BaseOAuthAdapter {
         realUserID = this.extractUserIdFromToken(token) || ''
       }
 
-      console.log('[MiniMax OAuth] realUserID:', realUserID, 'jwtToken:', jwtToken.substring(0, 30) + '...')
+      console.log('[MiniMax OAuth] Prepared validation credentials')
 
       // Build request with proper signatures (same as proxy adapter)
       const unix = `${Date.now()}`
@@ -215,7 +215,7 @@ export class MiniMaxAdapter extends BaseOAuthAdapter {
       const yy = md5(`${encodeURIComponent(fullUri)}_${dataJson}${md5(unix)}ooui`)
       const signature = md5(`${timestamp}${jwtToken}${dataJson}`)
 
-      console.log('[MiniMax OAuth] Request - uuid:', realUserID, 'user_id:', realUserID)
+      console.log('[MiniMax OAuth] Sending validation request')
 
       const response = await axios.request({
         method: 'GET',
@@ -233,12 +233,11 @@ export class MiniMaxAdapter extends BaseOAuthAdapter {
         },
       })
 
-      console.log('[MiniMax OAuth] Validation response status:', response.status)
-      console.log('[MiniMax OAuth] Validation response data:', JSON.stringify(response.data))
+      console.log('[MiniMax OAuth] Validation response received')
 
       if (response.status !== 200 || response.data?.statusInfo?.code !== 0) {
         const errorMsg = response.data?.statusInfo?.message || 'Token is invalid or expired'
-        console.log('[MiniMax OAuth] Validation failed:', errorMsg)
+        console.log('[MiniMax OAuth] Validation failed')
         return {
           valid: false,
           error: errorMsg,
@@ -258,7 +257,7 @@ export class MiniMaxAdapter extends BaseOAuthAdapter {
       }
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Validation request failed'
-      console.error('[MiniMax OAuth] Validation error:', errorMessage)
+      console.error('[MiniMax OAuth] Validation request failed')
       return {
         valid: false,
         error: errorMessage,
@@ -280,7 +279,10 @@ export class MiniMaxAdapter extends BaseOAuthAdapter {
   private extractUserIdFromToken(token: string): string | undefined {
     try {
       const payload = this.parseJWT(token)
-      return payload?.user?.id as string | undefined || payload?.sub as string | undefined
+      const user = payload?.user
+      const nestedId = user && typeof user === 'object' && 'id' in user
+        && typeof user.id === 'string' ? user.id : undefined
+      return nestedId || (typeof payload?.sub === 'string' ? payload.sub : undefined)
     } catch {
       return undefined
     }

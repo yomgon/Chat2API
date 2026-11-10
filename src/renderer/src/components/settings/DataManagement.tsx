@@ -4,7 +4,10 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/com
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { useSettingsStore, LogLevel } from '@/stores/settingsStore'
+import {
+  useSettingsStore, type LogLevel, SETTINGS_STORAGE_KEY,
+  serializeSettings, sanitizeStoredSettings,
+} from '@/stores/settingsStore'
 import { useToast } from '@/hooks/use-toast'
 import { Database, Download, Upload, Trash2, RotateCcw, AlertTriangle } from 'lucide-react'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
@@ -38,7 +41,7 @@ export function DataManagement() {
   const [isResetting, setIsResetting] = useState(false)
 
   const requestLogConfig = config?.requestLogConfig ?? {
-    enabled: true,
+    enabled: false,
     maxEntries: 200,
     includeBodies: false,
     maxBodyChars: 8000,
@@ -62,7 +65,8 @@ export function DataManagement() {
       const config = {
         version: '1.1.2',
         exportedAt: new Date().toISOString(),
-        settings: localStorage.getItem('chat2api-settings'),
+        secretsIncluded: false,
+        settings: serializeSettings(useSettingsStore.getState()),
       }
       const blob = new Blob([JSON.stringify(config, null, 2)], { type: 'application/json' })
       const url = URL.createObjectURL(blob)
@@ -96,16 +100,18 @@ export function DataManagement() {
     try {
       const text = await file.text()
       const config = JSON.parse(text)
-      if (config.settings) {
-        localStorage.setItem('chat2api-settings', config.settings)
-        toast({
-          title: t('common.success'),
-          description: t('settings.importSuccess'),
-        })
-        setTimeout(() => {
-          window.location.reload()
-        }, 1500)
+      if (!config || typeof config !== 'object' || Array.isArray(config) || typeof config.settings !== 'string') {
+        throw new Error('Invalid settings backup')
       }
+      const settings = sanitizeStoredSettings(config.settings)
+      localStorage.setItem(SETTINGS_STORAGE_KEY, settings)
+      toast({
+        title: t('common.success'),
+        description: t('settings.importSuccess'),
+      })
+      setTimeout(() => {
+        window.location.reload()
+      }, 1500)
     } catch {
       toast({
         title: t('common.error'),
@@ -140,12 +146,14 @@ export function DataManagement() {
   const handleResetApp = async () => {
     setIsResetting(true)
     try {
+      if (!window.electronAPI?.store?.clearAll) {
+        throw new Error('Native local data reset is unavailable')
+      }
+      // Main process displays an explicit native confirmation dialog.
+      const confirmed = await window.electronAPI.store.clearAll()
+      if (!confirmed) return
       localStorage.clear()
       sessionStorage.clear()
-      
-      if (window.electronAPI?.store?.clearAll) {
-        await window.electronAPI.store.clearAll()
-      }
       
       toast({
         title: t('common.success'),

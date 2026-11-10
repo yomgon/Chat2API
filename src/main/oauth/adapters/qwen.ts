@@ -249,21 +249,20 @@ export class QwenAdapter extends BaseOAuthAdapter {
       )
 
       if (response.status !== 200) {
-        console.warn(`[Qwen] Failed to delete session ${sessionId}: status ${response.status}`)
+        console.warn('[Qwen] Session deletion request failed')
         return false
       }
 
-      const { success, errorMsg } = response.data
+      const { success } = response.data
       if (success === false) {
-        console.warn(`[Qwen] Failed to delete session ${sessionId}: ${errorMsg}`)
+        console.warn('[Qwen] Session deletion was rejected')
         return false
       }
 
-      console.log(`[Qwen] Session deleted successfully: ${sessionId}`)
+      console.log('[Qwen] Session deleted successfully')
       return true
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error'
-      console.warn(`[Qwen] Failed to delete session ${sessionId}: ${errorMessage}`)
+    } catch {
+      console.warn('[Qwen] Session deletion encountered an error')
       return false
     }
   }

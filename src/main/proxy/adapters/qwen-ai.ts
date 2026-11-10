@@ -6,11 +6,26 @@
 
 import axios, { AxiosResponse } from 'axios'
 import { PassThrough } from 'stream'
-import { createParser } from 'eventsource-parser'
 import { Account, Provider } from '../../store/types'
 import { hasToolUse, parseToolUse, ToolCall } from '../promptToolUse'
 
 const QWEN_AI_BASE = 'https://chat.qwen.ai'
+
+/** Fixed diagnostic provenance only. Never propagate an Axios exception,
+ * upstream URL, response body, cookie, or authorization header. */
+export class QwenAiProxyFailure extends Error {
+  readonly stage: 'auth-preflight' | 'chat-creation' | 'chat-completion'
+  readonly upstreamStatus?: number
+
+  constructor(stage: QwenAiProxyFailure['stage'], message: string, status?: unknown) {
+    super(message)
+    this.name = 'QwenAiProxyFailure'
+    this.stage = stage
+    if (typeof status === 'number' && Number.isInteger(status) && status >= 400 && status <= 599) {
+      this.upstreamStatus = status
+    }
+  }
+}
 
 const DEFAULT_HEADERS = {
   Accept: 'application/json',
@@ -85,14 +100,38 @@ export class QwenAiAdapter {
     this.account = account
   }
 
+  private getCredential(names: string[]): unknown {
+    const credentials: unknown = this.account.credentials
+    if (!isQwenRecord(credentials)) {
+      throw new QwenAiProxyFailure('auth-preflight', 'Qwen AI credentials are invalid')
+    }
+    for (const name of names) {
+      const value = credentials[name]
+      if (value !== undefined && value !== null && value !== '') return value
+    }
+    return ''
+  }
+
   private getToken(): string {
-    const credentials = this.account.credentials
-    return credentials.token || credentials.accessToken || credentials.apiKey || ''
+    const token = this.getCredential(['token', 'accessToken', 'apiKey'])
+    // Treat the token as opaque; never coerce objects, trim it or infer a JWT.
+    if (typeof token !== 'string' || !/^[\x21-\x7e]+$/.test(token)) {
+      throw new QwenAiProxyFailure('auth-preflight', 'Qwen AI token is invalid or missing')
+    }
+    return token
   }
 
   private getCookies(): string {
-    const credentials = this.account.credentials
-    return credentials.cookies || credentials.cookie || ''
+    const cookies = this.getCredential(['cookies', 'cookie'])
+    if (cookies === '') return ''
+    // A supplied Cookie must already be a raw header. Token-only accounts are
+    // valid; no cookie is inferred from a token or serialized from an object.
+    const pair = /^[!#$%&'*+\-.^_\x60|~0-9A-Za-z]+=(?:"[\x21\x23-\x2b\x2d-\x3a\x3c-\x5b\x5d-\x7e]*"|[\x21\x23-\x2b\x2d-\x3a\x3c-\x5b\x5d-\x7e]*)$/
+    if (typeof cookies !== 'string' || !/^[\x20-\x7e]+$/.test(cookies) ||
+        !cookies.split(';').every(part => pair.test(part.trim()))) {
+      throw new QwenAiProxyFailure('auth-preflight', 'Qwen AI cookie header is invalid')
+    }
+    return cookies
   }
 
   private getHeaders(chatId?: string): Record<string, string> {
@@ -109,9 +148,6 @@ export class QwenAiAdapter {
     const cookies = this.getCookies()
     if (cookies) {
       headers['Cookie'] = cookies
-    } else {
-      console.warn('[QwenAI] Warning: No cookies provided. This may cause Bad_Request error.')
-      console.warn('[QwenAI] Required cookies: cnaui, aui, sca, xlly_s, cna, token, _bl_uid, x-ap')
     }
 
     return headers
@@ -162,39 +198,52 @@ export class QwenAiAdapter {
     try {
       const response = await this.axiosInstance.post(url, payload, {
         headers: this.getHeaders(),
+        maxRedirects: 0,
+        validateStatus: () => true,
       })
 
-      console.log('[QwenAI] Create chat response:', JSON.stringify(response.data, null, 2))
+      console.log('[QwenAI] Create chat response')
 
-      if (response.data?.data?.id) {
-        console.log('[QwenAI] Created chat:', response.data.data.id)
-        return response.data.data.id
+      if (response.status !== 200 && response.status !== 201) {
+        throw new QwenAiProxyFailure('chat-creation', 'Qwen AI chat creation was rejected', response.status)
       }
 
-      throw new Error('Failed to create chat: no chat ID returned')
+      const createdId = response.data?.data?.id
+      // A remote chat ID is used as a path/query segment on the second
+      // effect. Reject malformed values before posting a completion, rather
+      // than interpolating an object, slash or token-bearing URL fragment.
+      if (typeof createdId === 'string' && /^[A-Za-z0-9_-]{1,256}$/.test(createdId)) {
+        console.log('[QwenAI] Created chat')
+        return createdId
+      }
+
+      throw new QwenAiProxyFailure('chat-creation', 'Qwen AI chat creation did not return a safe chat ID')
     } catch (error) {
-      console.error('[QwenAI] Failed to create chat:', error)
-      throw error
+      console.error('[QwenAI] Failed to create chat')
+      // Never let an untrusted Axios error escape to another service boundary.
+      if (error instanceof QwenAiProxyFailure) throw error
+      throw new QwenAiProxyFailure('chat-creation', 'Qwen AI chat creation outcome is unconfirmed')
     }
   }
 
   async deleteChat(chatId: string): Promise<boolean> {
-    const url = `${QWEN_AI_BASE}/api/v2/chats/${chatId}`
+    const url = `${QWEN_AI_BASE}/api/v2/chats/${encodeURIComponent(chatId)}`
 
     try {
       const response = await this.axiosInstance.delete(url, {
         headers: this.getHeaders(),
+        maxRedirects: 0,
       })
 
       if (response.data?.success) {
-        console.log('[QwenAI] Deleted chat:', chatId)
+        console.log('[QwenAI] Deleted chat')
         return true
       }
 
-      console.warn('[QwenAI] Failed to delete chat:', response.data)
+      console.warn('[QwenAI] Failed to delete chat')
       return false
     } catch (error) {
-      console.error('[QwenAI] Failed to delete chat:', error)
+      console.error('[QwenAI] Failed to delete chat')
       return false
     }
   }
@@ -211,6 +260,7 @@ export class QwenAiAdapter {
       
       const response = await this.axiosInstance.delete(url, {
         headers: this.getHeaders(),
+        maxRedirects: 0,
       })
 
       if (response.data?.success) {
@@ -218,10 +268,10 @@ export class QwenAiAdapter {
         return true
       }
 
-      console.warn('[QwenAI] Failed to delete all chats:', response.data)
+      console.warn('[QwenAI] Failed to delete all chats')
       return false
     } catch (error) {
-      console.error('[QwenAI] Failed to delete all chats:', error)
+      console.error('[QwenAI] Failed to delete all chats')
       return false
     }
   }
@@ -231,10 +281,9 @@ export class QwenAiAdapter {
     chatId: string
     parentId: string | null
   }> {
-    const token = this.getToken()
-    if (!token) {
-      throw new Error('Qwen AI token not configured, please add token in account settings')
-    }
+    // Validate both supplied credential shapes before creating remote state.
+    this.getToken()
+    this.getCookies()
 
     const modelId = this.mapModel(request.model)
     
@@ -256,29 +305,48 @@ export class QwenAiAdapter {
       forceThinking = (this as any)._forceThinking
     }
 
-    // Always create a new chat (single-turn mode only)
-    const chatId = await this.createChat(modelId, 'OpenAI_API_Chat')
-    console.log('[QwenAI] Created new chat:', chatId)
+    const rejectMessages = (): never => {
+      throw new QwenAiProxyFailure('chat-creation', 'Qwen AI request messages are not supported')
+    }
+    const readText = (content: unknown): string => {
+      if (typeof content === 'string') return content
+      if (!Array.isArray(content) || content.length === 0) return rejectMessages()
+      return content.map(part => {
+        if (!isQwenRecord(part) || part.type !== 'text' || typeof part.text !== 'string' ||
+            Object.keys(part).some(key => key !== 'type' && key !== 'text')) return rejectMessages()
+        return part.text
+      }).join('')
+    }
 
-    const messages = request.messages
-    
-    // Extract system message and user message
-    let systemContent = ''
-    let userContent = ''
-    
-    // Single-turn mode: extract all messages
+    // This existing wire has one fresh user message, not a history protocol.
+    // Validate every input before creating remote state; never discard earlier
+    // turns, attachments or tool metadata to make the request appear supported.
+    const messages: unknown = request.messages
+    if (!Array.isArray(messages) || messages.length === 0) return rejectMessages()
+    const systemMessages: string[] = []
+    let userContent: string | undefined
     for (const msg of messages) {
-      if (msg.role === 'system') {
-        systemContent += (systemContent ? '\n\n' : '') + msg.content
-      } else if (msg.role === 'user') {
-        userContent = msg.content
+      if (!isQwenRecord(msg) ||
+          Object.keys(msg).some(key => key !== 'role' && key !== 'content')) return rejectMessages()
+      const content = readText(msg.content)
+      if (msg.role === 'system' && userContent === undefined) {
+        systemMessages.push(content)
+      } else if (msg.role === 'user' && userContent === undefined) {
+        userContent = content
+      } else {
+        return rejectMessages()
       }
     }
-    
-    // If system prompt exists, prepend it to user content
+    if (userContent === undefined) return rejectMessages()
+
+    // Concatenate text parts exactly; keep the established system/user framing.
+    const systemContent = systemMessages.join('\n\n')
     if (systemContent) {
       userContent = `${systemContent}\n\nUser: ${userContent}`
     }
+
+    const chatId = await this.createChat(modelId, 'OpenAI_API_Chat')
+    console.log('[QwenAI] Created new chat')
 
     const fid = uuid()
     const childId = uuid()
@@ -335,24 +403,36 @@ export class QwenAiAdapter {
       timestamp: ts + 1,
     }
 
-    const url = `${QWEN_AI_BASE}/api/v2/chat/completions?chat_id=${chatId}`
+    const url = `${QWEN_AI_BASE}/api/v2/chat/completions?chat_id=${encodeURIComponent(chatId)}`
 
     console.log('[QwenAI] Sending request to /api/v2/chat/completions...')
-    console.log('[QwenAI] Request URL:', url)
-    console.log('[QwenAI] Request payload:', JSON.stringify(payload, null, 2))
-    console.log('[QwenAI] Request headers:', JSON.stringify(this.getHeaders(chatId), null, 2))
+    console.log('[QwenAI] Request URL prepared')
+    console.log('[QwenAI] Request payload prepared')
+    console.log('[QwenAI] Request headers prepared')
 
-    const response = await this.axiosInstance.post(url, payload, {
-      headers: {
-        ...this.getHeaders(chatId),
-        'x-accel-buffering': 'no',
-      },
-      responseType: 'stream',
-      timeout: 120000,
-    })
+    let response: AxiosResponse
+    try {
+      response = await this.axiosInstance.post(url, payload, {
+        headers: {
+          ...this.getHeaders(chatId),
+          'x-accel-buffering': 'no',
+        },
+        responseType: 'stream',
+        timeout: 120000,
+        maxRedirects: 0,
+        validateStatus: () => true,
+      })
+    } catch {
+      throw new QwenAiProxyFailure('chat-completion', 'Qwen AI chat completion outcome is unconfirmed')
+    }
 
-    console.log('[QwenAI] Response status:', response.status)
-    console.log('[QwenAI] Response headers:', JSON.stringify(response.headers, null, 2))
+    if (response.status !== 200) {
+      if (typeof response.data?.destroy === 'function') response.data.destroy()
+      throw new QwenAiProxyFailure('chat-completion', 'Qwen AI completion was rejected', response.status)
+    }
+
+    console.log('[QwenAI] Response received')
+    console.log('[QwenAI] Response headers received')
 
     return {
       response,
@@ -362,8 +442,35 @@ export class QwenAiAdapter {
   }
 
   static isQwenAiProvider(provider: Provider): boolean {
-    return provider.id === 'qwen-ai' || provider.apiEndpoint.includes('chat.qwen.ai')
+    if (provider.id === 'qwen-ai') return true
+    try {
+      const url = new URL(provider.apiEndpoint)
+      return url.protocol === 'https:' &&
+        url.hostname === 'chat.qwen.ai' &&
+        (url.port === '' || url.port === '443') &&
+        !url.username && !url.password
+    } catch {
+      return false
+    }
   }
+}
+
+type QwenAiFinishReason = 'stop' | 'length' | 'tool_calls'
+type QwenAiDelta = { content?: string, reasoning_content?: string }
+
+interface QwenAiCompletion {
+  content: string
+  reasoningContent: string
+  finishReason: QwenAiFinishReason
+  toolCalls: ToolCall[]
+}
+
+function isQwenRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function requireQwenValue(condition: unknown): asserts condition {
+  if (!condition) throw new Error('Qwen AI upstream completion was not confirmed')
 }
 
 export class QwenAiStreamHandler {
@@ -372,10 +479,10 @@ export class QwenAiStreamHandler {
   private created: number
   private onEnd?: (chatId: string) => void
   private responseId: string = ''
-  private content: string = ''
-  private toolCallsSent: boolean = false
+  private streamTerminalSuccess: boolean = false
 
-  constructor(model: string, onEnd?: (chatId: string) => void) {
+  constructor(model: string, onEnd?: (chatId: string) => void,
+    private readonly allowLegacyToolCalls: boolean = true) {
     this.model = model
     this.created = Math.floor(Date.now() / 1000)
     this.onEnd = onEnd
@@ -385,366 +492,308 @@ export class QwenAiStreamHandler {
     this.chatId = chatId
   }
 
-  private sendToolCalls(transStream: PassThrough): void {
-    if (this.toolCallsSent) return
-    
-    const toolCalls = parseToolUse(this.content)
-    if (toolCalls && toolCalls.length > 0) {
-      this.toolCallsSent = true
-      
-      // Send tool_calls delta
-      for (let i = 0; i < toolCalls.length; i++) {
-        const tc = toolCalls[i]
-        transStream.write(
-          `data: ${JSON.stringify({
-            id: this.responseId || this.chatId,
-            model: this.model,
-            object: 'chat.completion.chunk',
-            choices: [{
-              index: 0,
-              delta: {
-                tool_calls: [{
-                  index: i,
-                  id: tc.id,
-                  type: 'function',
-                  function: {
-                    name: tc.function.name,
-                    arguments: tc.function.arguments,
-                  },
-                }],
-              },
-              finish_reason: null,
-            }],
-            created: this.created,
-          })}\n\n`
-        )
-      }
-      
-      // Send finish with tool_calls
-      transStream.write(
-        `data: ${JSON.stringify({
-          id: this.responseId || this.chatId,
-          model: this.model,
-          object: 'chat.completion.chunk',
-          choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }],
-          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
-          created: this.created,
-        })}\n\n`
-      )
-      transStream.end('data: [DONE]\n\n')
-      if (this.onEnd && this.chatId) {
-        this.onEnd(this.chatId)
-      }
+  hasSuccessfulTerminal(): boolean {
+    return this.streamTerminalSuccess
+  }
+
+  private notifyCompleted(): void {
+    if (this.onEnd && this.chatId) {
+      try {
+        void Promise.resolve(this.onEnd(this.chatId)).catch(() => {})
+      } catch { /* never expose callback errors */ }
     }
   }
 
-  async handleStream(stream: any): Promise<PassThrough> {
-    const transStream = new PassThrough()
-
-    console.log('[QwenAI] Starting stream handler...')
-
-    let reasoningText = ''
-    let hasSentReasoning = false
+  /**
+   * Both output modes use one strict upstream contract. A provider finish is
+   * provisional until clean EOF; late errors, extra content and aborted close
+   * must not produce successful output or authorize session cleanup.
+   */
+  private consume(
+    stream: any,
+    onDelta: (delta: QwenAiDelta) => void,
+    onComplete: (completion: QwenAiCompletion) => void,
+    onFailure: (message: string) => void,
+  ): void {
+    const maxFrameBytes = 1_048_576
+    let settled = false
+    let answerFinished = false
+    let sawDone = false
+    let content = ''
+    let reasoningContent = ''
     let summaryText = ''
-    let initialChunkSent = false
+    let finishReason: QwenAiFinishReason = 'stop'
+    let pendingBytes = Buffer.alloc(0)
+    let frameLines: string[] = []
+    let frameBytes = 0
+    let firstLine = true
 
-    const sendInitialChunk = () => {
-      if (!initialChunkSent) {
-        const initialChunk = `data: ${JSON.stringify({
-          id: '',
-          model: this.model,
-          object: 'chat.completion.chunk',
-          choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }],
-          created: this.created,
-        })}\n\n`
-        transStream.write(initialChunk)
-        initialChunkSent = true
-        console.log('[QwenAI] Initial chunk written')
+    const fail = (modelError = false) => {
+      if (settled) return
+      settled = true
+      console.error('[QwenAI] Upstream completion rejected')
+      onFailure(modelError
+        ? 'Qwen AI upstream returned a model error'
+        : 'Qwen AI upstream completion was not confirmed')
+      // Settlement stops local response parsing; an unfinished Axios body is
+      // owned by this consumer and must not remain readable after failure.
+      try { if (typeof stream?.destroy === 'function' && !stream.destroyed) stream.destroy() } catch { /* local only */ }
+    }
+
+    const acceptData = (data: string) => {
+      if (data === '[DONE]') {
+        requireQwenValue(answerFinished && !sawDone)
+        sawDone = true
+        return
+      }
+      requireQwenValue(!answerFinished && !sawDone)
+      const body: unknown = JSON.parse(data)
+      requireQwenValue(isQwenRecord(body))
+      if (body.error !== undefined || body.type === 'error' ||
+          (isQwenRecord(body.data) && body.data.error !== undefined)) {
+        fail(true)
+        return
+      }
+
+      const created = body['response.created']
+      if (created !== undefined) {
+        requireQwenValue(isQwenRecord(created) && typeof created.response_id === 'string' &&
+          !!created.response_id.trim() && created.response_id.length <= 256 &&
+          !/[\x00-\x20\x7f]/.test(created.response_id))
+        requireQwenValue(!this.responseId || this.responseId === created.response_id)
+        this.responseId = created.response_id
+      }
+      if (body.choices === undefined) {
+        requireQwenValue(created !== undefined)
+        return
+      }
+      requireQwenValue(Array.isArray(body.choices) && body.choices.length === 1 &&
+        isQwenRecord(body.choices[0]))
+      requireQwenValue(body.object === undefined || body.object === 'chat.completion.chunk')
+      const choice = body.choices[0]
+      requireQwenValue(choice.index === undefined || choice.index === 0)
+      requireQwenValue(isQwenRecord(choice.delta) && choice.message === undefined)
+      const delta = choice.delta
+      if (choice.error !== undefined || delta.error !== undefined) {
+        fail(true)
+        return
+      }
+      requireQwenValue(delta.role === undefined || delta.role === 'assistant')
+      requireQwenValue(delta.content === undefined || delta.content === null ||
+        typeof delta.content === 'string')
+      requireQwenValue(delta.tool_calls === undefined)
+      const text = typeof delta.content === 'string' ? delta.content : ''
+      const phase = delta.phase
+      const status = delta.status
+      const answerPhase = phase === undefined || phase === null || phase === 'answer'
+      requireQwenValue(answerPhase || phase === 'think' || phase === 'thinking_summary')
+      requireQwenValue(status === undefined || status === null ||
+        status === 'streaming' || status === 'finished')
+
+      const reasons = [delta.finish_reason, choice.finish_reason]
+        .filter(value => value !== undefined && value !== null)
+      requireQwenValue(reasons.every(value =>
+        value === 'stop' || value === 'length' || value === 'tool_calls'))
+      requireQwenValue(reasons.length < 2 || reasons[0] === reasons[1])
+      const reason = reasons[0] as QwenAiFinishReason | undefined
+      // Preserve the already-supported choice-level terminal when phase and
+      // status are absent, without treating a contradictory streaming status
+      // or a reasoning-phase finish as an answer completion.
+      const terminal = status === 'finished' ||
+        ((phase === undefined || phase === null) &&
+          (status === undefined || status === null) && reason !== undefined)
+      requireQwenValue(reason === undefined || (answerPhase && terminal))
+
+      if (phase === 'think') {
+        if (status !== 'finished' && text) {
+          reasoningContent += text
+          onDelta({ reasoning_content: text })
+        }
+      } else if (phase === 'thinking_summary') {
+        if (delta.extra !== undefined) {
+          requireQwenValue(isQwenRecord(delta.extra))
+          const thought = delta.extra.summary_thought
+          if (thought !== undefined) {
+            requireQwenValue(isQwenRecord(thought) && Array.isArray(thought.content) &&
+              thought.content.every(value => typeof value === 'string'))
+            const summary = thought.content.join('\n')
+            requireQwenValue(summary.startsWith(summaryText))
+            const diff = summary.slice(summaryText.length)
+            summaryText = summary
+            if (diff) {
+              reasoningContent += diff
+              onDelta({ reasoning_content: diff })
+            }
+          }
+        }
+      } else {
+        content += text
+        if (text) onDelta({ content: text })
+        if (terminal) {
+          answerFinished = true
+          finishReason = reason ?? 'stop'
+        }
       }
     }
 
-    const parser = createParser({
-      onEvent: (event: any) => {
-        try {
-          console.log('[QwenAI] Parsed event:', event.event, 'data:', event.data?.substring(0, 200))
-          
-          if (event.data === '[DONE]') {
-            console.log('[QwenAI] Received [DONE] signal')
-            return
-          }
-
-          const data = JSON.parse(event.data)
-          console.log('[QwenAI] Parsed JSON data keys:', Object.keys(data))
-
-          if (data['response.created']?.response_id) {
-            this.responseId = data['response.created'].response_id
-            console.log('[QwenAI] Got response_id:', this.responseId)
-          }
-
-          if (data.choices && data.choices.length > 0) {
-            const choice = data.choices[0]
-            const delta = choice.delta || {}
-            const phase = delta.phase
-            const status = delta.status
-            const content = delta.content || ''
-
-            console.log('[QwenAI] Phase:', phase, 'Status:', status, 'Content:', content.substring(0, 50))
-
-            if (phase === 'think') {
-              if (status !== 'finished') {
-                // Stream thinking content as reasoning_content in real-time
-                reasoningText += content
-                if (!hasSentReasoning) {
-                  transStream.write(
-                    `data: ${JSON.stringify({
-                      id: this.responseId || this.chatId,
-                      model: this.model,
-                      object: 'chat.completion.chunk',
-                      choices: [{ index: 0, delta: { role: 'assistant', reasoning_content: '' }, finish_reason: null }],
-                      created: this.created,
-                    })}\n\n`
-                  )
-                  hasSentReasoning = true
-                  console.log('[QwenAI] Sent reasoning role chunk')
-                }
-                if (content) {
-                  transStream.write(
-                    `data: ${JSON.stringify({
-                      id: this.responseId || this.chatId,
-                      model: this.model,
-                      object: 'chat.completion.chunk',
-                      choices: [{ index: 0, delta: { reasoning_content: content }, finish_reason: null }],
-                      created: this.created,
-                    })}\n\n`
-                  )
-                }
-              }
-              // When status === 'finished', the think phase is done
-            } else if (phase === 'thinking_summary') {
-              const extra = delta.extra || {}
-              console.log('[QwenAI] thinking_summary extra:', JSON.stringify(extra).substring(0, 300))
-              if (extra.summary_thought?.content) {
-                const newSummary = extra.summary_thought.content.join('\n')
-                if (newSummary && newSummary.length > summaryText.length) {
-                  // Send only the incremental diff as reasoning_content
-                  const diff = newSummary.substring(summaryText.length)
-                  if (diff) {
-                    if (!hasSentReasoning) {
-                      transStream.write(
-                        `data: ${JSON.stringify({
-                          id: this.responseId || this.chatId,
-                          model: this.model,
-                          object: 'chat.completion.chunk',
-                          choices: [{ index: 0, delta: { role: 'assistant', reasoning_content: '' }, finish_reason: null }],
-                          created: this.created,
-                        })}\n\n`
-                      )
-                      hasSentReasoning = true
-                    }
-                    transStream.write(
-                      `data: ${JSON.stringify({
-                        id: this.responseId || this.chatId,
-                        model: this.model,
-                        object: 'chat.completion.chunk',
-                        choices: [{ index: 0, delta: { reasoning_content: diff }, finish_reason: null }],
-                        created: this.created,
-                      })}\n\n`
-                    )
-                  }
-                  summaryText = newSummary
-                  console.log('[QwenAI] Updated summaryText, length:', summaryText.length)
-                }
-              }
-            } else if (phase === 'answer') {
-              if (!initialChunkSent) {
-                sendInitialChunk()
-              }
-              console.log('[QwenAI] Entering answer branch, content:', content)
-              
-              // Accumulate content for tool call detection
-              this.content += content
-              
-              if (content) {
-                console.log('[QwenAI] Sending content chunk:', content)
-                const chunk = {
-                  id: this.responseId || this.chatId,
-                  model: this.model,
-                  object: 'chat.completion.chunk',
-                  choices: [{ index: 0, delta: { content }, finish_reason: null }],
-                  created: this.created,
-                }
-                transStream.write(`data: ${JSON.stringify(chunk)}\n\n`)
-                console.log('[QwenAI] Content chunk written')
-              }
-            } else if (phase === null && content) {
-              if (!initialChunkSent) {
-                sendInitialChunk()
-              }
-              // Accumulate content for tool call detection
-              this.content += content
-              
-              const chunk = {
-                id: this.responseId || this.chatId,
-                model: this.model,
-                object: 'chat.completion.chunk',
-                choices: [{ index: 0, delta: { content }, finish_reason: null }],
-                created: this.created,
-              }
-              transStream.write(`data: ${JSON.stringify(chunk)}\n\n`)
-            }
-
-            if (status === 'finished' && (phase === 'answer' || phase === null)) {
-              // Check for tool calls before sending stop
-              if (hasToolUse(this.content)) {
-                console.log('[QwenAI] Found tool_use in stream, sending tool_calls')
-                this.sendToolCalls(transStream)
-                return
-              }
-              
-              const finishReason = delta.finish_reason || 'stop'
-              const finalChunk = {
-                id: this.responseId || this.chatId,
-                model: this.model,
-                object: 'chat.completion.chunk',
-                choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
-                created: this.created,
-              }
-              transStream.write(`data: ${JSON.stringify(finalChunk)}\n\n`)
-              transStream.end('data: [DONE]\n\n')
-
-              if (this.onEnd && this.chatId) {
-                this.onEnd(this.chatId)
-              }
-            }
-          }
-        } catch (err) {
-          console.error('[QwenAI] Stream parse error:', err)
+    const acceptFrame = () => {
+      const dataLines: string[] = []
+      const fields = new Set<string>()
+      for (const line of frameLines) {
+        if (line.startsWith(':')) continue
+        const colon = line.indexOf(':')
+        const field = colon < 0 ? line : line.slice(0, colon)
+        let value = colon < 0 ? '' : line.slice(colon + 1)
+        if (value.startsWith(' ')) value = value.slice(1)
+        if (field === 'data') dataLines.push(value)
+        else {
+          requireQwenValue(!fields.has(field))
+          fields.add(field)
+          if (field === 'event') requireQwenValue(value === '' || value === 'message')
+          else if (field === 'id') requireQwenValue(!/[\x00-\x1f\x7f]/.test(value))
+          else if (field === 'retry') requireQwenValue(/^\d+$/.test(value))
+          else requireQwenValue(false)
         }
-      },
-    })
+      }
+      if (dataLines.length) acceptData(dataLines.join('\n'))
+    }
 
-    stream.on('data', (buffer: Buffer) => {
-      const text = buffer.toString()
-      console.log('[QwenAI] Raw stream data:', text.substring(0, 500))
-      parser.feed(text)
+    if (!stream || typeof stream.on !== 'function' || typeof stream.once !== 'function') {
+      fail()
+      return
+    }
+    stream.on('data', (chunk: Buffer) => {
+      if (settled) return
+      try {
+        requireQwenValue(Buffer.isBuffer(chunk))
+        let offset = 0
+        while (offset < chunk.length && !settled) {
+          const newline = chunk.indexOf(10, offset)
+          const end = newline < 0 ? chunk.length : newline + 1
+          const part = chunk.subarray(offset, end)
+          // Bound a logical frame, independently of how TCP coalesces chunks.
+          requireQwenValue(frameBytes + pendingBytes.length + part.length <= maxFrameBytes)
+          pendingBytes = Buffer.concat([pendingBytes, part])
+          offset = end
+          if (newline < 0) break
+          const decoded = pendingBytes.toString('utf8')
+          // Buffer decoding substitutes invalid UTF-8. Exact roundtrip rejects
+          // malformed bytes while preserving a genuine U+FFFD and split input.
+          requireQwenValue(Buffer.from(decoded, 'utf8').equals(pendingBytes))
+          frameBytes += pendingBytes.length
+          pendingBytes = Buffer.alloc(0)
+          let line = decoded.slice(0, -1)
+          if (line.endsWith('\r')) line = line.slice(0, -1)
+          if (firstLine && line.startsWith('\uFEFF')) line = line.slice(1)
+          firstLine = false
+          requireQwenValue(!line.includes('\r'))
+          if (line === '') {
+            acceptFrame()
+            frameLines = []
+            frameBytes = 0
+          } else {
+            frameLines.push(line)
+          }
+        }
+      } catch {
+        fail()
+      }
     })
-    stream.once('error', (err: Error) => {
-      console.error('[QwenAI] Stream error:', err)
-      transStream.end('data: [DONE]\n\n')
+    // Keep an error listener after settlement so a late transport error cannot
+    // escape as an unhandled event or change an already confirmed outcome.
+    stream.on('error', () => fail())
+    stream.once('close', () => fail())
+    stream.once('end', () => {
+      if (settled) return
+      try {
+        requireQwenValue(!pendingBytes.length && !frameLines.length &&
+          answerFinished && !!content.trim())
+        // Explicit tool_choice:none must not silently reinterpret text/XML as
+        // a tool invocation. The default remains compatible with legacy chat.
+        const tools = this.allowLegacyToolCalls && hasToolUse(content) ? parseToolUse(content) : []
+        requireQwenValue(Array.isArray(tools) && tools.length <= 128 &&
+          tools.every(call => isQwenRecord(call) && call.type === 'function' &&
+            typeof call.id === 'string' && !!call.id &&
+            isQwenRecord(call.function) && typeof call.function.name === 'string' &&
+            !!call.function.name.trim() && call.function.name.length <= 256 &&
+            typeof call.function.arguments === 'string' && !!call.function.arguments.trim()))
+        if (tools.length && finishReason !== 'length') finishReason = 'tool_calls'
+        requireQwenValue(finishReason !== 'tool_calls' || tools.length > 0)
+        settled = true
+        this.streamTerminalSuccess = true
+        onComplete({
+          content, reasoningContent, finishReason,
+          toolCalls: finishReason === 'tool_calls' ? tools : [],
+        })
+      } catch {
+        fail()
+      }
     })
-    stream.once('close', () => {
-      console.log('[QwenAI] Stream closed')
-      transStream.end('data: [DONE]\n\n')
-    })
+  }
 
-    return transStream
+  async handleStream(stream: any): Promise<PassThrough> {
+    const output = new PassThrough()
+    output.once('close', () => {
+      // Terminal success is set by consume only after genuine upstream EOF.
+      // A downstream gate/client may destroy output before that point.
+      if (!this.streamTerminalSuccess) {
+        try { if (typeof stream?.destroy === 'function' && !stream.destroyed) stream.destroy() } catch { /* local only */ }
+      }
+    })
+    let sentRole = false
+    const send = (delta: Record<string, unknown>, reason: QwenAiFinishReason | null = null) => {
+      output.write('data: ' + JSON.stringify({
+        id: this.responseId || this.chatId,
+        model: this.model,
+        object: 'chat.completion.chunk',
+        choices: [{ index: 0, delta, finish_reason: reason }],
+        created: this.created,
+      }) + '\n\n')
+    }
+    const initial = () => {
+      if (sentRole) return
+      sentRole = true
+      send({ role: 'assistant', content: '' })
+    }
+    this.consume(stream, delta => {
+      initial()
+      send(delta)
+    }, completion => {
+      initial()
+      completion.toolCalls.forEach((call, index) => {
+        send({ tool_calls: [{ index, ...call }] })
+      })
+      send({}, completion.finishReason)
+      output.end('data: [DONE]\n\n')
+      this.notifyCompleted()
+    }, () => {
+      output.end('data: ' + JSON.stringify({
+        error: { message: 'Qwen AI upstream stream did not complete', type: 'api_error' },
+      }) + '\n\n')
+    })
+    return output
   }
 
   async handleNonStream(stream: any): Promise<any> {
     return new Promise((resolve, reject) => {
-      const data = {
-        id: '',
-        model: this.model,
-        object: 'chat.completion',
-        choices: [
-          {
+      this.consume(stream, () => {}, completion => {
+        this.notifyCompleted()
+        resolve({
+          id: this.responseId || this.chatId,
+          model: this.model,
+          object: 'chat.completion',
+          choices: [{
             index: 0,
-            message: { role: 'assistant', content: '', reasoning_content: '' },
-            finish_reason: 'stop',
-          },
-        ],
-        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
-        created: this.created,
-      }
-
-      let reasoningText = ''
-      let summaryText = ''
-      let resolved = false
-
-      const resolveOnce = (value: any) => {
-        if (!resolved) {
-          resolved = true
-          resolve(value)
-        }
-      }
-
-      const rejectOnce = (reason: any) => {
-        if (!resolved) {
-          resolved = true
-          reject(reason)
-        }
-      }
-
-      const parser = createParser({
-        onEvent: (event: any) => {
-          try {
-            if (event.data === '[DONE]') return
-
-            const parsed = JSON.parse(event.data)
-
-            if (parsed['response.created']?.response_id) {
-              this.responseId = parsed['response.created'].response_id
-              data.id = this.responseId
-            }
-
-            if (parsed.choices && parsed.choices.length > 0) {
-              const delta = parsed.choices[0].delta || {}
-              const phase = delta.phase
-              const status = delta.status
-              const content = delta.content || ''
-
-              if (phase === 'think' && status !== 'finished') {
-                reasoningText += content
-              } else if (phase === 'thinking_summary') {
-                // Handle thinking_summary phase - extract summary content
-                const extra = delta.extra || {}
-                if (extra.summary_thought?.content) {
-                  const newSummary = extra.summary_thought.content.join('\n')
-                  if (newSummary && newSummary.length > summaryText.length) {
-                    summaryText = newSummary
-                  }
-                }
-              } else if (phase === 'answer') {
-                if (content) {
-                  data.choices[0].message.content += content
-                }
-                if (status === 'finished') {
-                  // Use reasoningText or summaryText for reasoning_content
-                  const finalReasoning = reasoningText || summaryText
-                  if (finalReasoning) {
-                    data.choices[0].message.reasoning_content = finalReasoning
-                  }
-
-                  if (this.onEnd && this.chatId) {
-                    this.onEnd(this.chatId)
-                  }
-
-                  resolveOnce(data)
-                }
-              } else if (phase === null && content) {
-                data.choices[0].message.content += content
-              }
-            }
-          } catch (err) {
-            console.error('[QwenAI] Non-stream parse error:', err)
-            rejectOnce(err)
-          }
-        },
-      })
-
-      stream.on('data', (buffer: Buffer) => parser.feed(buffer.toString()))
-      stream.once('error', (err: Error) => {
-        console.error('[QwenAI] Non-stream error:', err)
-        rejectOnce(err)
-      })
-      stream.once('close', () => {
-        // Use reasoningText or summaryText for reasoning_content
-        const finalReasoning = reasoningText || summaryText
-        if (finalReasoning) {
-          data.choices[0].message.reasoning_content = finalReasoning
-        }
-        resolveOnce(data)
-      })
+            message: {
+              role: 'assistant', content: completion.content,
+              reasoning_content: completion.reasoningContent,
+              ...(completion.toolCalls.length ? { tool_calls: completion.toolCalls } : {}),
+            },
+            finish_reason: completion.finishReason,
+          }],
+          created: this.created,
+        })
+      }, message => reject(new Error(message)))
     })
   }
 

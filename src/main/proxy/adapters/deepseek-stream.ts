@@ -39,7 +39,6 @@ export class DeepSeekStreamHandler {
   private currentPath: string = ''
   private searchResults: any[] = []
   private thinkingStarted: boolean = false
-  private accumulatedTokenUsage: number = 2
   private created: number
   private onEnd?: () => void
   private toolStreamParser?: ToolStreamParser
@@ -195,35 +194,67 @@ export class DeepSeekStreamHandler {
     const isFoldModel = this.isFoldModel(isThinkingModel)
     const isSearchSilentModel = this.isSearchSilentModel()
 
+    const decoder = new TextDecoder('utf-8', { fatal: true })
     let buffer = ''
+    let sawDone = false
+    let failed = false
+    const fail = () => {
+      if (failed || this.isDone) return
+      failed = true
+      // A transport failure is never an assistant response or normal [DONE].
+      transStream.end('data: {"error":{"code":"deepseek_response_incomplete","type":"api_error"}}\n\n')
+    }
 
     stream.on('data', (chunk: Buffer) => {
-      buffer += chunk.toString()
-      const lines = buffer.split('\n')
-      buffer = lines.pop() || ''
-
-      for (const line of lines) {
-        if (!line.trim() || !line.startsWith('data:')) continue
-
-        const data = line.slice(5).trim()
-        if (data === '[DONE]') {
-          this.handleDone(transStream, isFoldModel, isSearchSilentModel)
-          return
+      if (failed || this.isDone) return
+      try {
+        buffer += decoder.decode(chunk, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop() || ''
+        if (buffer.length > 1_048_576) { fail(); return }
+        for (const line of lines) {
+          if (!line.trim() || line.startsWith(':')) continue
+          if (line.startsWith('event:')) {
+            if (line.slice(6).trim() === 'error') { fail(); return }
+            continue
+          }
+          if (!line.startsWith('data:') || line.length > 1_048_576) { fail(); return }
+          const data = line.slice(5).trim()
+          if (sawDone) { fail(); return }
+          if (data === '[DONE]') {
+            // Hold the successful downstream terminal until clean source EOF.
+            sawDone = true
+            continue
+          }
+          const parsed = this.parseSSE(data)
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) ||
+              (parsed as Record<string, unknown>).error !== undefined ||
+              (parsed as Record<string, unknown>).type === 'error') {
+            fail()
+            return
+          }
+          this.processChunk(parsed, transStream, isThinkingModel, isSilentModel, isFoldModel, isSearchSilentModel)
         }
-
-        const parsed = this.parseSSE(data)
-        if (!parsed) continue
-
-        this.processChunk(parsed, transStream, isThinkingModel, isSilentModel, isFoldModel, isSearchSilentModel)
+      } catch {
+        fail()
       }
     })
 
     stream.on('end', () => {
-      this.handleDone(transStream, isFoldModel, isSearchSilentModel)
+      if (failed || this.isDone) return
+      try {
+        if (decoder.decode() || buffer.trim() || !sawDone) { fail(); return }
+        this.handleDone(transStream, isFoldModel, isSearchSilentModel)
+      } catch {
+        fail()
+      }
     })
 
-    stream.on('error', (err) => {
-      transStream.emit('error', err)
+    stream.on('error', () => {
+      fail()
+    })
+    stream.on('close', () => {
+      if (!(stream as any).readableEnded) fail()
     })
 
     return transStream
@@ -293,14 +324,6 @@ export class DeepSeekStreamHandler {
     }
 
     if (chunk.p === 'response/search_status') return
-
-    if (chunk.p === 'response' && Array.isArray(chunk.v)) {
-      chunk.v.forEach((e: any) => {
-        if (e.p === 'accumulated_token_usage' && typeof e.v === 'number') {
-          this.accumulatedTokenUsage = e.v
-        }
-      })
-    }
 
     if (
       (chunk.p === 'response/search_results' || /^response\/fragments\/-?\d+\/results$/.test(chunk.p || ''))
@@ -455,7 +478,6 @@ export class DeepSeekStreamHandler {
     let accumulatedThinkingContent = ''
     let messageId = ''
     let currentPath = ''
-    let accumulatedTokenUsage = 2
     const searchResults: any[] = []
     const isThinkingModel = this.isThinkingModel()
     const isFoldModel = this.isFoldModel(isThinkingModel)
@@ -464,20 +486,51 @@ export class DeepSeekStreamHandler {
 
     return new Promise((resolve, reject) => {
       let buffer = ''
+      const decoder = new TextDecoder('utf-8', { fatal: true })
+      let sawDone = false
+      let failed = false
+      const fail = () => {
+        if (failed) return
+        failed = true
+        reject(new Error('DeepSeek response decoding failed'))
+      }
 
       stream.on('data', (chunk: Buffer) => {
-        buffer += chunk.toString()
+        if (failed) return
+        try {
+          buffer += decoder.decode(chunk, { stream: true })
+        } catch {
+          fail()
+          return
+        }
         const lines = buffer.split('\n')
         buffer = lines.pop() || ''
+        if (buffer.length > 1_048_576) { fail(); return }
 
         for (const line of lines) {
-          if (!line.trim() || !line.startsWith('data:')) continue
+          if (!line.trim() || line.startsWith(':')) continue
+          if (line.startsWith('event:')) {
+            if (line.slice(6).trim() === 'error') { fail(); return }
+            continue
+          }
+          if (!line.startsWith('data:') || line.length > 1_048_576 || sawDone) {
+            fail()
+            return
+          }
 
           const data = line.slice(5).trim()
-          if (data === '[DONE]') return
+          if (data === '[DONE]') {
+            sawDone = true
+            continue
+          }
 
           try {
             const parsed = JSON.parse(data)
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) ||
+                parsed.error !== undefined || parsed.type === 'error') {
+              fail()
+              return
+            }
             
             if (parsed.response_message_id && !messageId) {
               messageId = parsed.response_message_id
@@ -557,9 +610,6 @@ export class DeepSeekStreamHandler {
 
             if (typeof parsed.v === 'object' && Array.isArray(parsed.v)) {
               parsed.v.forEach((e: any) => {
-                if (e.accumulated_token_usage && typeof e.v === 'number') {
-                  accumulatedTokenUsage = e.v
-                }
                 if (Array.isArray(e.v)) {
                   let cleanedValue = e.v.map((v: any) => v.content).join('').replace(/FINISHED/g, '')
                   cleanedValue = stripSearchControlMarker(cleanedValue, shouldStripSearchControlMarker)
@@ -582,14 +632,23 @@ export class DeepSeekStreamHandler {
               }
             }
           } catch {
-            // Ignore parse errors
+            fail()
+            return
           }
         }
       })
 
       stream.on('end', () => {
+        if (failed) return
+        try {
+          if (decoder.decode() || buffer.trim() || !sawDone) { fail(); return }
+        } catch {
+          fail()
+          return
+        }
         // Parse tool calls from accumulated content
-        const { content: cleanContent, toolCalls } = this.toolCallingPlan?.shouldParseResponse
+        const { content: cleanContent, toolCalls } =
+          (this.toolCallingPlan?.toolChoiceMode === 'none' || this.toolCallingPlan?.shouldParseResponse)
           ? { content: accumulatedContent, toolCalls: [] }
           : parseToolCallsFromText(accumulatedContent)
         const citations = isSearchSilentModel
@@ -612,9 +671,9 @@ export class DeepSeekStreamHandler {
 
         // Log for debugging
         if (isThinkingModel || accumulatedThinkingContent) {
-          console.log('[DeepSeek] Non-stream thinking model:', this.model)
-          console.log('[DeepSeek] Accumulated thinking content length:', accumulatedThinkingContent.length)
-          console.log('[DeepSeek] Accumulated content length:', accumulatedContent.length)
+          console.log('[DeepSeek] Non-stream thinking response received')
+          console.log('[DeepSeek] Thinking content accumulated')
+          console.log('[DeepSeek] Content accumulated')
         }
 
         resolve({
@@ -626,12 +685,14 @@ export class DeepSeekStreamHandler {
             message,
             finish_reason: toolCalls.length > 0 ? 'tool_calls' : 'stop',
           }],
-          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: accumulatedTokenUsage },
           created: this.created,
         })
       })
 
-      stream.on('error', reject)
+      stream.on('error', fail)
+      stream.on('close', () => {
+        if (!(stream as any).readableEnded) fail()
+      })
     })
   }
 }

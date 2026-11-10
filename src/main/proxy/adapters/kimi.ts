@@ -9,7 +9,7 @@ import { PassThrough } from 'stream'
 import { toolsToSystemPrompt, TOOL_WRAP_HINT, hasToolPromptInjected } from '../utils/tools'
 import { parseToolCallsFromText } from '../utils/toolParser'
 import { createBaseChunk } from '../utils/streamToolHandler'
-import { createKimiChatPayload, encodeKimiGrpcFrame } from './providerModelOptions'
+import { createKimiChatPayload, encodeKimiGrpcFrame, resolveKimiScenario } from './providerModelOptions'
 import { getProviderToolProfile } from '../toolCalling/providerProfiles'
 import { ToolStreamParser } from '../toolCalling/ToolStreamParser'
 import type { ToolCallingPlan } from '../toolCalling/types'
@@ -22,7 +22,6 @@ const FAKE_HEADERS: Record<string, string> = {
   'Accept-Language': 'zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7',
   'Cache-Control': 'no-cache',
   Pragma: 'no-cache',
-  Origin: KIMI_API_BASE,
   'Sec-Ch-Ua': '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
   'Sec-Ch-Ua-Mobile': '?0',
   'Sec-Ch-Ua-Platform': '"Windows"',
@@ -33,11 +32,32 @@ const FAKE_HEADERS: Record<string, string> = {
   Priority: 'u=1, i',
 }
 
-interface TokenInfo {
-  accessToken: string
-  refreshToken: string
-  userId: string
-  refreshTime: number
+export type KimiFailureStage = 'auth-preflight' | 'chat-completion' | 'response-decoding'
+
+/** Only fixed local provenance may cross the provider boundary. */
+export class KimiProxyFailure extends Error {
+  readonly stage: KimiFailureStage
+  readonly upstreamStatus?: number
+
+  constructor(stage: KimiFailureStage, upstreamStatus?: number) {
+    const messages: Record<KimiFailureStage, string> = {
+      'auth-preflight': 'Kimi authentication preflight failed',
+      'chat-completion': 'Kimi completion was rejected',
+      'response-decoding': 'Kimi response decoding failed',
+    }
+    super(messages[stage])
+    this.name = 'KimiProxyFailure'
+    this.stage = stage
+    if (Number.isInteger(upstreamStatus) && upstreamStatus! >= 400 && upstreamStatus! <= 599) {
+      this.upstreamStatus = upstreamStatus
+    }
+  }
+}
+
+function isKimiApiEndpoint(endpoint: unknown): boolean {
+  // The existing provider/OAuth contract is www.kimi.com. Do not infer a
+  // different login realm (including .ai) from a token, model, or HTTP 401.
+  return endpoint === KIMI_API_BASE || endpoint === `${KIMI_API_BASE}/`
 }
 
 interface KimiMessage {
@@ -47,8 +67,29 @@ interface KimiMessage {
   tool_calls?: any[]
 }
 
+function readKimiMessageText(message: KimiMessage): string {
+  if (typeof message.content === 'string') return message.content
+  if (Array.isArray(message.content)) {
+    const parts: string[] = []
+    for (const part of message.content) {
+      if (!part || typeof part !== 'object' || Array.isArray(part) ||
+          part.type !== 'text' || typeof part.text !== 'string') {
+        throw new Error('Kimi message content is not supported')
+      }
+      parts.push(part.text)
+    }
+    return parts.join('')
+  }
+  // Tool-only assistant messages have no text. Other unsupported content must
+  // fail locally rather than disappear or become an object-coerced prompt.
+  if ((message.content === null || message.content === undefined) && message.role === 'assistant' &&
+      Array.isArray(message.tool_calls) && message.tool_calls.length > 0) return ''
+  throw new Error('Kimi message content is not supported')
+}
+
 interface ChatCompletionRequest {
   model: string
+  originalModel?: string
   messages: KimiMessage[]
   stream?: boolean
   temperature?: number
@@ -59,8 +100,6 @@ interface ChatCompletionRequest {
   conversationId?: string
   parentId?: string
 }
-
-const accessTokenMap = new Map<string, TokenInfo>()
 
 function unixTimestamp(): number {
   return Math.floor(Date.now() / 1000)
@@ -83,90 +122,82 @@ export function detectTokenType(token: string): 'jwt' | 'refresh' {
 function extractUserIdFromJWT(token: string): string | undefined {
   try {
     const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64').toString())
-    return payload.sub
+    return typeof payload.sub === 'string' ? payload.sub : undefined
   } catch (e) {
     return undefined
   }
 }
 
-function checkResult(result: AxiosResponse, refreshToken: string): any {
-  if (result.status === 401) {
-    accessTokenMap.delete(refreshToken)
-    throw new Error('Token invalid or expired')
+function checkResult(result: AxiosResponse): any {
+  if (result.status !== 200) {
+    throw new Error('Kimi API request was rejected')
   }
   if (!result.data) {
     return null
   }
-  const { error_type, message } = result.data
+  const { error_type } = result.data
   if (typeof error_type !== 'string') {
     return result.data
   }
-  if (error_type === 'auth.token.invalid') {
-    accessTokenMap.delete(refreshToken)
-  }
-  throw new Error(`Kimi API error: ${message || error_type}`)
+  throw new Error('Kimi API request was rejected')
 }
 
 export class KimiAdapter {
-  private provider: Provider
-  private account: Account
-  private token: string
+  private readonly apiBase: string
+  private readonly token: string
 
   constructor(provider: Provider, account: Account) {
-    this.provider = provider
-    this.account = account
-    this.token = account.credentials.token || account.credentials.refreshToken || ''
+    // Bind the selected account before reading its credentials. Keep only
+    // immutable request values, never a mutable provider/account reference.
+    if (typeof provider?.id !== 'string' || !provider.id.trim() ||
+        typeof account?.id !== 'string' || !account.id.trim() ||
+        account.providerId !== provider.id || !isKimiApiEndpoint(provider.apiEndpoint)) {
+      throw new KimiProxyFailure('auth-preflight')
+    }
+    this.apiBase = KIMI_API_BASE
+
+    try {
+      // OAuth loginWithToken stores accessToken; keep legacy field priority.
+      const credentials = account.credentials
+      let token = ''
+      for (const field of ['token', 'refreshToken', 'accessToken']) {
+        const candidate = credentials?.[field]
+        if (candidate === undefined || candidate === '') continue
+        if (typeof candidate !== 'string' || /[\s\u0000-\u001f\u007f-\u009f]/.test(candidate)) {
+          throw new KimiProxyFailure('auth-preflight')
+        }
+        token = candidate
+        break
+      }
+      if (!token) throw new KimiProxyFailure('auth-preflight')
+      this.token = token
+    } catch {
+      throw new KimiProxyFailure('auth-preflight')
+    }
   }
 
   private async acquireToken(): Promise<{ accessToken: string; userId: string }> {
-    if (!this.token) {
-      throw new Error('Kimi Token not configured')
-    }
-
-    let result = accessTokenMap.get(this.token)
-    if (result && result.refreshTime > unixTimestamp()) {
-      console.log('[Kimi] Using cached token')
-      return { accessToken: result.accessToken, userId: result.userId }
-    }
-
-    const tokenType = detectTokenType(this.token)
-    console.log('[Kimi] Token type:', tokenType)
-
-    if (tokenType === 'jwt') {
-      const userId = extractUserIdFromJWT(this.token) || ''
-      accessTokenMap.set(this.token, {
-        accessToken: this.token,
-        refreshToken: this.token,
-        userId,
-        refreshTime: unixTimestamp() + 300,
-      })
-      console.log('[Kimi] Using JWT token, userId:', userId)
-      return { accessToken: this.token, userId }
-    }
-
-    console.log('[Kimi] Non-JWT token detected, attempting direct use...')
-    accessTokenMap.set(this.token, {
-      accessToken: this.token,
-      refreshToken: this.token,
-      userId: '',
-      refreshTime: unixTimestamp() + 300,
-    })
-    return { accessToken: this.token, userId: '' }
+    // Classification is not verification or a refresh contract. Preserve
+    // direct use without a cross-account cache, fallback host, or retry.
+    const userId = detectTokenType(this.token) === 'jwt' ? extractUserIdFromJWT(this.token) || '' : ''
+    return { accessToken: this.token, userId }
   }
 
   private messagesPrepare(messages: KimiMessage[], toolsPrompt?: string, isMultiTurn: boolean = false): string {
     const toolProfile = getProviderToolProfile('kimi')
     // Process messages including tool calls and tool responses
     const processedMessages = messages.map(msg => {
+      const text = readKimiMessageText(msg)
       // Handle tool calls in assistant message
       if (msg.role === 'assistant' && msg.tool_calls && msg.tool_calls.length > 0) {
+        const callsText = toolProfile.formatAssistantToolCalls(msg.tool_calls.map(tc => ({
+          id: tc.id,
+          name: tc.function.name,
+          arguments: tc.function.arguments,
+        })))
         return {
           ...msg,
-          content: toolProfile.formatAssistantToolCalls(msg.tool_calls.map(tc => ({
-            id: tc.id,
-            name: tc.function.name,
-            arguments: tc.function.arguments,
-          }))),
+          content: text ? `${text}\n${callsText}` : callsText,
         }
       }
       // Handle tool response message
@@ -176,30 +207,22 @@ export class KimiAdapter {
           role: 'user' as const,
           content: toolProfile.formatToolResult({
             toolCallId: msg.tool_call_id,
-            content: String(msg.content || ''),
+            content: text,
           }),
         }
       }
-      return msg
+      return { ...msg, content: text }
     })
 
-    // Extract system message first
-    let systemContent = ''
+    // Preserve every system message in order using the existing text framing.
+    let content = ''
     const otherMessages = processedMessages.filter(msg => {
       if (msg.role === 'system') {
-        const text = typeof msg.content === 'string' ? msg.content : ''
-        systemContent = text
+        if (msg.content) content += `system:${msg.content}\n`
         return false
       }
       return true
     })
-
-    let content = ''
-
-    // Prepend system message if exists
-    if (systemContent) {
-      content = `system:${systemContent}\n`
-    }
 
     // For multi-turn with existing session, only send the last user message
     if (isMultiTurn) {
@@ -238,21 +261,10 @@ export class KimiAdapter {
         return acc + `${msg.role === 'user' ? this.wrapUrlsToTags(text) : text}\n`
       }, '')
     } else {
-      const latestMessage = otherMessages[otherMessages.length - 1]
-      const hasFileOrImage = Array.isArray(latestMessage.content) &&
-        latestMessage.content.some((v: any) => typeof v === 'object' && ['file', 'image_url'].includes(v.type))
-
-      if (hasFileOrImage) {
-        otherMessages.splice(otherMessages.length - 1, 0, {
-          content: 'Focus on the latest files and messages sent by user',
-          role: 'system' as const,
-        })
-      } else {
-        otherMessages.splice(otherMessages.length - 1, 0, {
-          content: 'Focus on the latest message from user',
-          role: 'system' as const,
-        })
-      }
+      otherMessages.splice(otherMessages.length - 1, 0, {
+        content: 'Focus on the latest message from user',
+        role: 'system' as const,
+      })
 
       content += otherMessages.reduce((acc, msg) => {
         const text = typeof msg.content === 'string' ? msg.content : ''
@@ -276,6 +288,9 @@ export class KimiAdapter {
   }
 
   async chatCompletion(request: ChatCompletionRequest): Promise<{ response: AxiosResponse; conversationId: string }> {
+    // Deny web-only agent scenarios before preparing a request or contacting
+    // the provider. This adapter speaks ChatService/Chat, not the Kimi Agent RPC.
+    resolveKimiScenario(request.model)
     const { accessToken } = await this.acquireToken()
 
     const messages = [...request.messages]
@@ -315,11 +330,11 @@ export class KimiAdapter {
     let enableWebSearch = request.enableWebSearch ?? false
     
     // Auto-enable based on model name (if not explicitly set)
-    if (!enableThinking && (modelLower.includes('think') || modelLower.includes('r1'))) {
+    if (request.enableThinking === undefined && (modelLower.includes('think') || modelLower.includes('r1'))) {
       enableThinking = true
       console.log('[Kimi] Thinking mode enabled (from model name)')
     }
-    if (!enableWebSearch && modelLower.includes('search')) {
+    if (request.enableWebSearch === undefined && modelLower.includes('search')) {
       enableWebSearch = true
       console.log('[Kimi] Web search enabled (from model name)')
     }
@@ -332,32 +347,43 @@ export class KimiAdapter {
     })
     const frameBuffer = encodeKimiGrpcFrame(payload)
 
-    console.log('[Kimi] Request body length:', frameBuffer.length, 'JSON length:', frameBuffer.length - 5)
+    console.log('[Kimi] Request body prepared')
 
-    const response = await axios.post(
-      `${KIMI_API_BASE}/apiv2/kimi.gateway.chat.v1.ChatService/Chat`,
-      frameBuffer,
-      {
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          'Content-Type': 'application/connect+json',
-          ...FAKE_HEADERS,
-        },
-        timeout: 120000,
-        validateStatus: () => true,
-        responseType: 'stream',
-      }
-    )
-
-    console.log('[Kimi] Completion response status:', response.status)
-
-    if (response.status === 401) {
-      accessTokenMap.delete(this.token)
-      throw new Error('Token invalid or expired')
+    let response: AxiosResponse
+    try {
+      response = await axios.post(
+        `${this.apiBase}/apiv2/kimi.gateway.chat.v1.ChatService/Chat`,
+        frameBuffer,
+        {
+          headers: {
+            ...FAKE_HEADERS,
+            Origin: this.apiBase,
+            Authorization: `Bearer ${accessToken}`,
+            'Content-Type': 'application/connect+json',
+          },
+          timeout: 120000,
+          maxRedirects: 0,
+          validateStatus: () => true,
+          responseType: 'stream',
+        }
+      )
+    } catch {
+      // A transport failure has no confirmed HTTP status. Never retain the
+      // Axios error, which can contain Authorization and provider payloads.
+      throw new KimiProxyFailure('chat-completion')
     }
 
+    console.log('[Kimi] Completion response received')
+
     if (response.status !== 200) {
-      throw new Error(`Completion request failed: HTTP ${response.status}`)
+      // A fixed error and numeric status permit safe local diagnosis. Do not
+      // forward the provider body (which may contain account/session details).
+      try {
+        if (typeof response.data?.destroy === 'function') response.data.destroy()
+      } catch {
+        // Body cleanup must not replace the fixed provider failure.
+      }
+      throw new KimiProxyFailure('chat-completion', response.status)
     }
 
     return { response, conversationId: '' }
@@ -368,23 +394,25 @@ export class KimiAdapter {
       const { accessToken } = await this.acquireToken()
       
       const response = await axios.post(
-        `${KIMI_API_BASE}/apiv2/kimi.chat.v1.ChatService/DeleteChat`,
+        `${this.apiBase}/apiv2/kimi.chat.v1.ChatService/DeleteChat`,
         { chat_id: conversationId },
         {
           headers: {
+            ...FAKE_HEADERS,
+            Origin: this.apiBase,
             Authorization: `Bearer ${accessToken}`,
             'Content-Type': 'application/json',
-            ...FAKE_HEADERS,
           },
           timeout: 15000,
+          maxRedirects: 0,
           validateStatus: () => true,
         }
       )
 
-      console.log('[Kimi] Chat deleted:', conversationId, 'Status:', response.status)
+      console.log('[Kimi] Chat deleted')
       return response.status === 200
     } catch (error) {
-      console.error('[Kimi] Failed to delete conversation:', error)
+      console.error('[Kimi] Failed to delete conversation')
       return false
     }
   }
@@ -392,7 +420,7 @@ export class KimiAdapter {
   private async listChats(pageToken?: string): Promise<{ chatIds: string[]; nextPageToken: string }> {
     const { accessToken } = await this.acquireToken()
     const response = await axios.post(
-      `${KIMI_API_BASE}/apiv2/kimi.chat.v1.ChatService/ListChats`,
+      `${this.apiBase}/apiv2/kimi.chat.v1.ChatService/ListChats`,
       {
         page_size: 100,
         ...(pageToken ? { page_token: pageToken } : {}),
@@ -400,16 +428,18 @@ export class KimiAdapter {
       },
       {
         headers: {
+          ...FAKE_HEADERS,
+          Origin: this.apiBase,
           Authorization: `Bearer ${accessToken}`,
           'Content-Type': 'application/json',
-          ...FAKE_HEADERS,
         },
         timeout: 15000,
+        maxRedirects: 0,
         validateStatus: () => true,
       }
     )
 
-    const data = checkResult(response, this.token)
+    const data = checkResult(response)
     const chats = Array.isArray(data?.chats) ? data.chats : []
     const chatIds = chats
       .map((chat: any) => typeof chat?.id === 'string' ? chat.id : '')
@@ -428,20 +458,22 @@ export class KimiAdapter {
 
     const { accessToken } = await this.acquireToken()
     const response = await axios.post(
-      `${KIMI_API_BASE}/apiv2/kimi.chat.v1.ChatService/BatchDeleteChats`,
+      `${this.apiBase}/apiv2/kimi.chat.v1.ChatService/BatchDeleteChats`,
       { chat_ids: chatIds },
       {
         headers: {
+          ...FAKE_HEADERS,
+          Origin: this.apiBase,
           Authorization: `Bearer ${accessToken}`,
           'Content-Type': 'application/json',
-          ...FAKE_HEADERS,
         },
         timeout: 30000,
+        maxRedirects: 0,
         validateStatus: () => true,
       }
     )
 
-    checkResult(response, this.token)
+    checkResult(response)
     return response.status === 200
   }
 
@@ -466,7 +498,7 @@ export class KimiAdapter {
         return true
       }
 
-      console.log('[Kimi] Found', allChatIds.length, 'chats to delete')
+      console.log('[Kimi] Chats found for deletion')
 
       for (let i = 0; i < allChatIds.length; i += 100) {
         const batch = allChatIds.slice(i, i + 100)
@@ -479,17 +511,175 @@ export class KimiAdapter {
       console.log('[Kimi] All chats deleted successfully')
       return true
     } catch (error) {
-      console.error('[Kimi] Failed to delete all chats:', error)
+      console.error('[Kimi] Failed to delete all chats')
       return false
     }
   }
 
   static isKimiProvider(provider: Provider): boolean {
-    return provider.id === 'kimi' || provider.apiEndpoint.includes('kimi.com')
+    return provider.id === 'kimi' || isKimiApiEndpoint(provider.apiEndpoint)
   }
 }
 
 const STAGE_NAME_THINKING = 'STAGE_NAME_THINKING'
+const KIMI_MAX_CONNECT_FRAME = 1024 * 1024
+
+/** Connect streaming terminal errors use a fixed, bounded public status map. */
+function kimiConnectFailure(error: unknown): KimiProxyFailure {
+  const code = error && typeof error === 'object'
+    ? (error as { code?: unknown }).code : undefined
+  const statusByCode: Record<string, number> = {
+    unauthenticated: 401,
+    permission_denied: 403,
+    invalid_argument: 400,
+    failed_precondition: 409,
+    resource_exhausted: 429,
+    deadline_exceeded: 504,
+    unavailable: 503,
+  }
+  const status = typeof code === 'string' && Object.prototype.hasOwnProperty.call(statusByCode, code)
+    ? statusByCode[code] : 502
+  return new KimiProxyFailure('response-decoding', status)
+}
+
+function isKimiConnectRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+/** Validate only the envelope and message fields consumed by this adapter. */
+function validateKimiConnectEnvelope(data: unknown, terminal: boolean): void {
+  const invalid = () => { throw new KimiProxyFailure('response-decoding') }
+  if (!isKimiConnectRecord(data)) return invalid()
+
+  // Presence matters: null/false/0/empty-string are malformed errors, not
+  // evidence of success. Keep the existing bounded map for valid errors.
+  if (Object.prototype.hasOwnProperty.call(data, 'error')) {
+    if (!isKimiConnectRecord(data.error) || typeof data.error.code !== 'string' || !data.error.code) {
+      return invalid()
+    }
+    throw kimiConnectFailure(data.error)
+  }
+
+  if (terminal) {
+    // EndStreamResponse is not a chat message. Only its optional metadata
+    // belongs in a successful terminal; unknown shapes fail closed.
+    if (Object.keys(data).some(key => key !== 'metadata')) return invalid()
+    if (Object.prototype.hasOwnProperty.call(data, 'metadata')) {
+      if (!isKimiConnectRecord(data.metadata) || Object.values(data.metadata).some(values =>
+        !Array.isArray(values) || values.some(value => typeof value !== 'string'))) {
+        return invalid()
+      }
+    }
+    return
+  }
+
+  // These optional fields become public identifiers and cleanup targets.
+  // Validate presence before either consumer can adopt IDs or emit an answer.
+  for (const key of ['chat', 'message']) {
+    if (!Object.prototype.hasOwnProperty.call(data, key)) continue
+    const metadata = data[key]
+    if (!isKimiConnectRecord(metadata)) return invalid()
+    if (Object.prototype.hasOwnProperty.call(metadata, 'id')) {
+      const id = metadata.id
+      if (typeof id !== 'string' || !id || id.trim() !== id || /[\u0000-\u001f\u007f-\u009f]/.test(id)) {
+        return invalid()
+      }
+    }
+    if (key === 'message' && Object.prototype.hasOwnProperty.call(metadata, 'role') &&
+        metadata.role !== 'assistant') return invalid()
+  }
+
+  if (Object.prototype.hasOwnProperty.call(data, 'mask') && typeof data.mask !== 'string') {
+    return invalid()
+  }
+  if (Object.prototype.hasOwnProperty.call(data, 'block')) {
+    if (!isKimiConnectRecord(data.block)) return invalid()
+    for (const key of ['text', 'think']) {
+      if (!Object.prototype.hasOwnProperty.call(data.block, key)) continue
+      const part = data.block[key]
+      if (!isKimiConnectRecord(part) ||
+          (Object.prototype.hasOwnProperty.call(part, 'content') && typeof part.content !== 'string')) {
+        return invalid()
+      }
+    }
+  }
+}
+
+/** Decode one bounded frame at a time, independently of transport chunking. */
+class KimiConnectDecoder {
+  private header: Buffer = Buffer.alloc(5)
+  private headerBytes = 0
+  private payload: Buffer | null = null
+  private payloadBytes = 0
+  private terminalSeen = false
+  private chatId?: string
+
+  push(chunk: Buffer, onMessage: (data: any) => void): void {
+    if (!Buffer.isBuffer(chunk)) throw new KimiProxyFailure('response-decoding')
+    if (chunk.length === 0) return
+    if (this.terminalSeen) throw new KimiProxyFailure('response-decoding')
+
+    let offset = 0
+    while (offset < chunk.length) {
+      if (this.headerBytes < this.header.length) {
+        const count = Math.min(this.header.length - this.headerBytes, chunk.length - offset)
+        chunk.copy(this.header, this.headerBytes, offset, offset + count)
+        this.headerBytes += count
+        offset += count
+        if (this.headerBytes < this.header.length) return
+
+        const flag = this.header.readUInt8(0)
+        const length = this.header.readUInt32BE(1)
+        if ((flag !== 0 && flag !== 2) || length > KIMI_MAX_CONNECT_FRAME) {
+          throw new KimiProxyFailure('response-decoding')
+        }
+        // Validate the declared length before allocation. A large input chunk
+        // may contain many valid frames; retain only this frame's payload.
+        this.payload = Buffer.alloc(length)
+        this.payloadBytes = 0
+      }
+
+      const payload = this.payload!
+      const count = Math.min(payload.length - this.payloadBytes, chunk.length - offset)
+      chunk.copy(payload, this.payloadBytes, offset, offset + count)
+      this.payloadBytes += count
+      offset += count
+      if (this.payloadBytes < payload.length) return
+
+      const terminal = this.header.readUInt8(0) === 2
+      this.headerBytes = 0
+      this.payload = null
+      this.payloadBytes = 0
+
+      const text = payload.toString('utf8')
+      // Buffer decoding replaces malformed bytes. Require an exact roundtrip
+      // for fatal UTF-8 validation, while permitting a real U+FFFD character.
+      // Decode only complete payloads so split multibyte sequences stay valid.
+      if (!Buffer.from(text, 'utf8').equals(payload)) throw new KimiProxyFailure('response-decoding')
+      let data: unknown
+      try { data = JSON.parse(text) } catch { throw new KimiProxyFailure('response-decoding') }
+      validateKimiConnectEnvelope(data, terminal)
+      if (isKimiConnectRecord(data) && isKimiConnectRecord(data.chat) && typeof data.chat.id === 'string') {
+        // Local cleanup requires one unambiguous target for this response;
+        // this is not an assertion about the provider's identifier format.
+        if (this.chatId !== undefined && this.chatId !== data.chat.id) {
+          throw new KimiProxyFailure('response-decoding')
+        }
+        this.chatId = data.chat.id
+      }
+      if (terminal) {
+        if (offset !== chunk.length) throw new KimiProxyFailure('response-decoding')
+        this.terminalSeen = true
+        return
+      }
+      onMessage(data)
+    }
+  }
+
+  isComplete(): boolean {
+    return this.terminalSeen && this.headerBytes === 0 && this.payload === null
+  }
+}
 
 export class KimiStreamHandler {
   private model: string
@@ -500,8 +690,12 @@ export class KimiStreamHandler {
   private realChatId: string | null = null
   private lastMessageId: string | null = null
   private hasError: boolean = false
+  private streamFinished: boolean = false
+  private streamTerminalSuccess: boolean = false
+  private streamHasAnswer: boolean = false
   private currentPhase: 'thinking' | 'answer' | undefined = undefined
-  private reasoningBuffer: string = ''
+  private reasoningBuffer: string | null = ''
+  private answerBuffer: string | null = ''
 
   constructor(model: string, conversationId: string, enableThinking: boolean = false, toolCallingPlan?: ToolCallingPlan) {
     this.model = model
@@ -530,6 +724,10 @@ export class KimiStreamHandler {
 
   hasSessionError(): boolean {
     return this.hasError
+  }
+
+  hasSuccessfulTerminal(): boolean {
+    return this.streamTerminalSuccess && !this.hasError
   }
 
   private detectMultiStage(data: any): 'thinking' | 'answer' | undefined {
@@ -561,95 +759,128 @@ export class KimiStreamHandler {
   }
 
   private extractThinkContent(data: any): string | null {
-    return data.block?.think?.content || null
+    return typeof data.block?.think?.content === 'string' ? data.block.think.content : null
   }
 
   private extractTextContent(data: any): string | null {
-    return data.block?.text?.content || null
+    return typeof data.block?.text?.content === 'string' ? data.block.text.content : null
+  }
+
+  private streamTextDelta(content: string, replace: boolean, thinking: boolean): string {
+    const previous = thinking ? this.reasoningBuffer : this.answerBuffer
+    if (replace && (previous === null || !content.startsWith(previous))) {
+      // OpenAI SSE deltas cannot retract published text. Reject a conflicting
+      // snapshot instead of appending it and reporting a fabricated success.
+      throw new KimiProxyFailure('response-decoding')
+    }
+    const delta = replace ? content.slice(previous!.length) : content
+    // A set string cannot exceed its bounded frame payload. Once accumulated
+    // text is larger, no future set can extend it; keep a sentinel so append
+    // streaming remains supported without retaining an unbounded snapshot.
+    const snapshot = replace ? content
+      : previous !== null && previous.length + content.length <= KIMI_MAX_CONNECT_FRAME
+        ? previous + content : null
+    if (thinking) this.reasoningBuffer = snapshot
+    else this.answerBuffer = snapshot
+    return delta
   }
 
   async handleStream(stream: any): Promise<PassThrough> {
     const transStream = new PassThrough()
     const created = unixTimestamp()
-    let buffer = Buffer.alloc(0)
+    const decoder = new KimiConnectDecoder()
     let sentRole = false
 
+    const fail = () => {
+      if (this.streamFinished) return
+      this.hasError = true
+      this.streamTerminalSuccess = false
+      this.streamFinished = true
+      // Once SSE headers are written, an upstream rejection must be an error
+      // event, never a fabricated assistant answer followed by normal [DONE].
+      try {
+        transStream.write('data: ' + JSON.stringify({
+          error: { message: 'Kimi upstream stream did not complete', type: 'api_error' },
+        }) + '\n\n')
+        transStream.end()
+      } catch {
+        // Failure reporting must not throw from an upstream event callback.
+        transStream.destroy()
+      }
+      // The consumer only owns transStream. End an unfinished original Axios
+      // body as well, without treating local cancellation as remote no-effect.
+      try { if (typeof stream?.destroy === 'function' && !stream.destroyed) stream.destroy() } catch { /* local only */ }
+    }
+
+    const finish = () => {
+      if (this.streamFinished) return
+      if (!this.streamHasAnswer && !this.toolStreamParser?.hasEmittedToolCall()) {
+        fail()
+        return
+      }
+      const chatId = this.getConversationId() || this.conversationId
+      const baseChunk = createBaseChunk(chatId, this.model, created)
+      const flushChunks = this.toolStreamParser?.flush(baseChunk) ?? []
+      for (const outChunk of flushChunks) {
+        transStream.write(`data: ${JSON.stringify(outChunk)}\n\n`)
+      }
+      transStream.write('data: ' + JSON.stringify({
+        id: chatId, model: this.model, object: 'chat.completion.chunk',
+        choices: [{ index: 0, delta: {},
+          finish_reason: this.toolStreamParser?.hasEmittedToolCall() ? 'tool_calls' : 'stop' }],
+        created,
+      }) + '\n\n')
+      this.streamTerminalSuccess = true
+      transStream.end('data: [DONE]\n\n')
+      this.streamFinished = true
+    }
+
     stream.on('data', (chunk: Buffer) => {
-      buffer = Buffer.concat([buffer, chunk])
-      this.processBuffer(buffer, transStream, created, (remaining) => { buffer = remaining }, () => sentRole, (v) => { sentRole = v })
+      if (this.streamFinished) return
+      try {
+        decoder.push(chunk, data => this.handleMessage(data, transStream, created,
+          () => sentRole, (v) => { sentRole = v }))
+      } catch {
+        // JSON can contain valid syntax but invalid masks/content. Include
+        // all message consumers in this asynchronous failure boundary.
+        fail()
+      }
     })
 
-    stream.once('error', (err: Error) => {
-      console.error('[Kimi] Stream error:', err.message)
-      if (!transStream.closed) transStream.end('data: [DONE]\n\n')
+    stream.once('error', () => {
+      console.error('[Kimi] Stream error')
+      fail()
     })
 
+    stream.once('end', () => {
+      if (this.streamFinished) return
+      try {
+        // Await clean EOF so a later chunk cannot invalidate an already
+        // published success or authorize cleanup after a premature terminal.
+        if (!decoder.isComplete()) fail()
+        else finish()
+      } catch {
+        fail()
+      }
+    })
+    stream.once('aborted', fail)
     stream.once('close', () => {
-      console.log('[Kimi] Stream closed, realChatId:', this.realChatId, 'lastMessageId:', this.lastMessageId)
-      if (!transStream.closed) transStream.end('data: [DONE]\n\n')
+      console.log('[Kimi] Stream closed')
+      fail()
+    })
+
+    transStream.once('close', () => {
+      // A closed downstream gate can destroy the intermediate stream before
+      // EOF. Do not leave the provider body alive or authorize a late cleanup.
+      if (!this.streamFinished) {
+        this.hasError = true
+        this.streamTerminalSuccess = false
+        this.streamFinished = true
+        try { if (typeof stream?.destroy === 'function' && !stream.destroyed) stream.destroy() } catch { /* local only */ }
+      }
     })
 
     return transStream
-  }
-
-  private processBuffer(
-    buffer: Buffer,
-    transStream: PassThrough,
-    created: number,
-    setBuffer: (remaining: Buffer) => void,
-    getSentRole: () => boolean,
-    setSentRole: (v: boolean) => void
-  ) {
-    let offset = 0
-
-    // gRPC-Web frame format: 1 byte flag + 4 bytes length (big-endian) + payload
-    while (offset + 5 <= buffer.length) {
-      const flag = buffer.readUInt8(offset)
-      const length = buffer.readUInt32BE(offset + 1)
-
-      if (offset + 5 + length > buffer.length) {
-        break
-      }
-
-      const payload = buffer.slice(offset + 5, offset + 5 + length)
-
-      try {
-        const text = payload.toString('utf8')
-        if (text.trim()) {
-          const data = JSON.parse(text)
-          
-          // Check for error response
-          if (data.error) {
-            console.error('[Kimi] API Error:', data.error)
-            this.hasError = true
-            transStream.write(`data: ${JSON.stringify({
-              id: this.conversationId,
-              model: this.model,
-              object: 'chat.completion.chunk',
-              choices: [{ index: 0, delta: { content: `Error: ${data.error.message || JSON.stringify(data.error)}` }, finish_reason: null }],
-              created,
-            })}\n\n`)
-            transStream.write(`data: ${JSON.stringify({
-              id: this.conversationId,
-              model: this.model,
-              object: 'chat.completion.chunk',
-              choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-              created,
-            })}\n\n`)
-            transStream.end('data: [DONE]\n\n')
-            return
-          }
-          
-          this.handleMessage(data, transStream, created, getSentRole, setSentRole)
-        }
-      } catch (e) {
-        // Skip invalid JSON
-      }
-
-      offset += 5 + length
-    }
-
-    setBuffer(buffer.slice(offset))
   }
 
   private handleMessage(
@@ -663,18 +894,18 @@ export class KimiStreamHandler {
 
     if (data.chat?.id && !this.realChatId) {
       this.realChatId = data.chat.id
-      console.log('[Kimi] Extracted real chat_id from chat.id:', this.realChatId)
+      console.log('[Kimi] Chat identifier received')
     }
 
     if (data.message?.id && data.message?.role === 'assistant' && !this.lastMessageId) {
       this.lastMessageId = data.message.id
-      console.log('[Kimi] Extracted assistant message id:', this.lastMessageId)
+      console.log('[Kimi] Assistant message identifier received')
     }
 
     const multiStagePhase = this.detectMultiStage(data)
     if (multiStagePhase) {
       this.currentPhase = multiStagePhase
-      console.log('[Kimi] Detected multiStage phase:', this.currentPhase)
+      console.log('[Kimi] Response phase detected')
     }
 
     if (data.block?.text?.flags === 'thinking') {
@@ -685,49 +916,20 @@ export class KimiStreamHandler {
 
     if ((data.op === 'set' || data.op === 'append')) {
       const mask = data.mask
-      
+      let content: string | null = null
+      let thinking = false
       if (this.isThinkingMask(mask)) {
-        const thinkContent = this.extractThinkContent(data)
-        if (thinkContent) {
-          if (!getSentRole()) {
-            transStream.write(`data: ${JSON.stringify({
-              id: this.getConversationId(),
-              model: this.model,
-              object: 'chat.completion.chunk',
-              choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
-              created,
-            })}\n\n`)
-            setSentRole(true)
-          }
-          
-          this.reasoningBuffer += thinkContent
-          transStream.write(`data: ${JSON.stringify({
-            id: this.getConversationId(),
-            model: this.model,
-            object: 'chat.completion.chunk',
-            choices: [{ index: 0, delta: { reasoning_content: thinkContent }, finish_reason: null }],
-            created,
-          })}\n\n`)
-        }
+        content = this.extractThinkContent(data)
+        thinking = true
       } else if (this.isAnswerMask(mask)) {
-        const textContent = this.extractTextContent(data)
-        if (textContent) {
-          if (!getSentRole()) {
-            transStream.write(`data: ${JSON.stringify({
-              id: this.getConversationId(),
-              model: this.model,
-              object: 'chat.completion.chunk',
-              choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
-              created,
-            })}\n\n`)
-            setSentRole(true)
-          }
-          
-          this.sendChunk(transStream, textContent, created)
-        }
-      } else if (data.block?.text?.content) {
-        const content = data.block.text.content
-        
+        content = this.extractTextContent(data)
+      } else {
+        content = this.extractTextContent(data)
+        thinking = this.currentPhase === 'thinking'
+      }
+      if (content !== null) {
+        const delta = this.streamTextDelta(content, data.op === 'set', thinking)
+        if (!delta) return
         if (!getSentRole()) {
           transStream.write(`data: ${JSON.stringify({
             id: this.getConversationId(),
@@ -738,42 +940,27 @@ export class KimiStreamHandler {
           })}\n\n`)
           setSentRole(true)
         }
-        
-        if (this.currentPhase === 'thinking') {
-          this.reasoningBuffer += content
+
+        if (thinking) {
           transStream.write(`data: ${JSON.stringify({
             id: this.getConversationId(),
             model: this.model,
             object: 'chat.completion.chunk',
-            choices: [{ index: 0, delta: { reasoning_content: content }, finish_reason: null }],
+            choices: [{ index: 0, delta: { reasoning_content: delta }, finish_reason: null }],
             created,
           })}\n\n`)
         } else {
-          this.sendChunk(transStream, content, created)
+          this.sendChunk(transStream, delta, created)
         }
       }
     }
 
-    if (data.done !== undefined) {
-      const chatId = this.getConversationId() || this.conversationId
-      const baseChunk = createBaseChunk(chatId, this.model, created)
-      const flushChunks = this.toolStreamParser?.flush(baseChunk) ?? []
-      for (const outChunk of flushChunks) {
-        transStream.write(`data: ${JSON.stringify(outChunk)}\n\n`)
-      }
-
-      transStream.write(`data: ${JSON.stringify({
-        id: this.getConversationId(),
-        model: this.model,
-        object: 'chat.completion.chunk',
-        choices: [{ index: 0, delta: {}, finish_reason: this.toolStreamParser?.hasEmittedToolCall() ? 'tool_calls' : 'stop' }],
-        created,
-      })}\n\n`)
-      transStream.end('data: [DONE]\n\n')
-    }
+    // data.done is an application message, not Connect's terminal 0x02 frame.
+    // Final success requires a validated EndStreamResponse and clean EOF.
   }
 
   private sendChunk(transStream: PassThrough, content: string, created: number) {
+    if (content.trim()) this.streamHasAnswer = true
     // Process tool call interception
     // Use getConversationId() to get the real chat_id if available
     const chatId = this.getConversationId() || this.conversationId
@@ -799,152 +986,113 @@ export class KimiStreamHandler {
     const created = unixTimestamp()
     let content = ''
     let reasoningContent = ''
-    let buffer = Buffer.alloc(0)
+    const decoder = new KimiConnectDecoder()
     let currentPhase: 'thinking' | 'answer' | undefined = undefined
 
     return new Promise((resolve, reject) => {
-      stream.on('data', (chunk: Buffer) => {
-        buffer = Buffer.concat([buffer, chunk])
-
-        let offset = 0
-        while (offset + 5 <= buffer.length) {
-          const flag = buffer.readUInt8(offset)
-          const length = buffer.readUInt32BE(offset + 1)
-
-          if (offset + 5 + length > buffer.length) {
-            break
-          }
-
-          const payload = buffer.slice(offset + 5, offset + 5 + length)
-
-          try {
-            const text = payload.toString('utf8')
-            if (text.trim()) {
-              const data = JSON.parse(text)
-
-              if (data.error) {
-                reject(new Error(`Kimi API Error: ${data.error.message || JSON.stringify(data.error)}`))
-                return
-              }
-
-              if (data.chat?.id && !this.realChatId) {
-                this.realChatId = data.chat.id
-                console.log('[Kimi] Non-stream: Extracted real chat_id from chat.id:', this.realChatId)
-              }
-
-              if (data.message?.id && data.message?.role === 'assistant' && !this.lastMessageId) {
-                this.lastMessageId = data.message.id
-                console.log('[Kimi] Non-stream: Extracted assistant message id:', this.lastMessageId)
-              }
-
-              const multiStagePhase = this.detectMultiStage(data)
-              if (multiStagePhase) {
-                currentPhase = multiStagePhase
-                console.log('[Kimi] Non-stream: Detected multiStage phase:', currentPhase)
-              }
-
-              if (data.block?.text?.flags === 'thinking') {
-                currentPhase = 'thinking'
-              } else if (data.block?.text?.flags === 'answer') {
-                currentPhase = 'answer'
-              }
-
-              if ((data.op === 'set' || data.op === 'append')) {
-                const mask = data.mask
-                
-                if (this.isThinkingMask(mask)) {
-                  const thinkContent = this.extractThinkContent(data)
-                  if (thinkContent) {
-                    reasoningContent += thinkContent
-                  }
-                } else if (this.isAnswerMask(mask)) {
-                  const textContent = this.extractTextContent(data)
-                  if (textContent) {
-                    content += textContent
-                  }
-                } else if (data.block?.text?.content) {
-                  const textContent = data.block.text.content
-                  if (currentPhase === 'thinking') {
-                    reasoningContent += textContent
-                  } else {
-                    content += textContent
-                  }
-                }
-              }
-
-              if (data.done !== undefined) {
-                const { content: cleanContent, toolCalls } = this.toolCallingPlan?.shouldParseResponse
-                  ? { content, toolCalls: [] }
-                  : parseToolCallsFromText(content, 'kimi')
-
-                const message: any = {
-                  role: 'assistant',
-                  content: toolCalls.length > 0 ? null : cleanContent.trim(),
-                }
-
-                if (reasoningContent.trim()) {
-                  message.reasoning_content = reasoningContent.trim()
-                }
-
-                if (toolCalls.length > 0) {
-                  message.tool_calls = toolCalls
-                }
-
-                resolve({
-                  id: this.realChatId || this.conversationId,
-                  model: this.model,
-                  object: 'chat.completion',
-                  created,
-                  choices: [{
-                    index: 0,
-                    message,
-                    finish_reason: toolCalls.length > 0 ? 'tool_calls' : 'stop',
-                  }],
-                  usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
-                })
-              }
-            }
-          } catch (e) {
-            // Skip invalid JSON
-          }
-
-          offset += 5 + length
-        }
-
-        buffer = buffer.slice(offset)
-      })
-
-      stream.once('error', reject)
-      stream.once('close', () => {
-        const { content: cleanContent, toolCalls } = this.toolCallingPlan?.shouldParseResponse
+      let settled = false
+      const fail = (error: unknown) => {
+        if (settled) return
+        settled = true
+        this.hasError = true
+        reject(error instanceof KimiProxyFailure ? error : new KimiProxyFailure('response-decoding'))
+        try { if (typeof stream?.destroy === 'function' && !stream.destroyed) stream.destroy() } catch { /* local only */ }
+      }
+      const finish = () => {
+        if (settled) return
+        const { content: cleanContent, toolCalls } =
+          (this.toolCallingPlan?.toolChoiceMode === 'none' || this.toolCallingPlan?.shouldParseResponse)
           ? { content, toolCalls: [] }
           : parseToolCallsFromText(content, 'kimi')
-
-        const message: any = {
-          role: 'assistant',
-          content: toolCalls.length > 0 ? null : cleanContent.trim(),
+        if (!cleanContent.trim() && toolCalls.length === 0) {
+          fail(new Error('Kimi Connect stream completed without a usable assistant answer'))
+          return
         }
-
-        if (reasoningContent.trim()) {
-          message.reasoning_content = reasoningContent.trim()
-        }
-
-        if (toolCalls.length > 0) {
-          message.tool_calls = toolCalls
-        }
-
+        const message: any = { role: 'assistant', content: toolCalls.length > 0 ? null : cleanContent.trim() }
+        if (reasoningContent.trim()) message.reasoning_content = reasoningContent.trim()
+        if (toolCalls.length > 0) message.tool_calls = toolCalls
+        settled = true
         resolve({
-          id: this.conversationId,
+          id: this.realChatId || this.conversationId,
           model: this.model,
           object: 'chat.completion',
           created,
-          choices: [{
-            index: 0,
-            message,
-            finish_reason: toolCalls.length > 0 ? 'tool_calls' : 'stop',
-          }],
-          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          choices: [{ index: 0, message,
+            finish_reason: toolCalls.length > 0 ? 'tool_calls' : 'stop' }],
         })
+      }
+      stream.on('data', (chunk: Buffer) => {
+        if (settled) return
+        try {
+          decoder.push(chunk, data => {
+            if (data.chat?.id && !this.realChatId) {
+              this.realChatId = data.chat.id
+              console.log('[Kimi] Non-stream chat identifier received')
+            }
+
+            if (data.message?.id && data.message?.role === 'assistant' && !this.lastMessageId) {
+              this.lastMessageId = data.message.id
+              console.log('[Kimi] Non-stream assistant message identifier received')
+            }
+
+            const multiStagePhase = this.detectMultiStage(data)
+            if (multiStagePhase) {
+              currentPhase = multiStagePhase
+              console.log('[Kimi] Non-stream response phase detected')
+            }
+
+            if (data.block?.text?.flags === 'thinking') {
+              currentPhase = 'thinking'
+            } else if (data.block?.text?.flags === 'answer') {
+              currentPhase = 'answer'
+            }
+
+            if ((data.op === 'set' || data.op === 'append')) {
+              const mask = data.mask
+              const replace = data.op === 'set'
+              if (this.isThinkingMask(mask)) {
+                const thinkContent = this.extractThinkContent(data)
+                if (typeof thinkContent === 'string') {
+                  reasoningContent = replace ? thinkContent : reasoningContent + thinkContent
+                }
+              } else if (this.isAnswerMask(mask)) {
+                const textContent = this.extractTextContent(data)
+                if (typeof textContent === 'string') {
+                  content = replace ? textContent : content + textContent
+                }
+              } else if (typeof data.block?.text?.content === 'string') {
+                const textContent = data.block.text.content
+                if (currentPhase === 'thinking') {
+                  reasoningContent = replace ? textContent : reasoningContent + textContent
+                } else {
+                  content = replace ? textContent : content + textContent
+                }
+              }
+              if (content.length > KIMI_MAX_CONNECT_FRAME || reasoningContent.length > KIMI_MAX_CONNECT_FRAME) {
+                throw new KimiProxyFailure('response-decoding')
+              }
+            }
+          })
+        } catch (error) {
+          fail(error)
+        }
+      })
+
+      stream.once('error', () => fail(new Error('Kimi Connect transport failed; outcome unknown')))
+      stream.once('end', () => {
+        if (settled) return
+        try {
+          if (!decoder.isComplete()) fail(new KimiProxyFailure('response-decoding'))
+          else finish()
+        } catch (error) {
+          fail(error)
+        }
+      })
+      stream.once('aborted', () => fail(new KimiProxyFailure('response-decoding')))
+      stream.once('close', () => {
+        if (!settled) {
+          fail(new Error('Kimi Connect transport closed without its terminal frame'))
+        }
       })
     })
   }

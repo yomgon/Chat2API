@@ -135,26 +135,26 @@ export class KiloCodePromptAdapter extends BasePromptAdapter {
       console.log('[KiloCodeAdapter] Kilo Code prompt detected, replacing with standard format')
       const cleanedMessages = this.cleanKiloCodePrompt(messages)
       const variant = this.getPromptVariant(model, provider)
-      const toolsPrompt = this.toolsToPrompt(tools, variant)
+      const toolsPrompt = this.toolsToPrompt(tools, variant ?? undefined)
       const transformedMessages = this.injectPrompt(cleanedMessages, toolsPrompt)
 
       return {
         messages: transformedMessages,
         tools: undefined,
         injected: true,
-        variant,
+        variant: variant ?? undefined,
       }
     }
 
     const variant = this.getPromptVariant(model, provider)
-    const toolsPrompt = this.toolsToPrompt(tools, variant)
+    const toolsPrompt = this.toolsToPrompt(tools, variant ?? undefined)
     const transformedMessages = this.injectPrompt(messages, toolsPrompt)
 
     return {
       messages: transformedMessages,
       tools: undefined,
       injected: true,
-      variant,
+      variant: variant ?? undefined,
     }
   }
 

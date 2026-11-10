@@ -99,7 +99,7 @@ export function RequestLogList() {
         }
       }
     } catch (error) {
-      console.error('Failed to fetch request logs:', error)
+      console.error('Failed to fetch request logs:')
     }
   }, [statusFilter])
 
@@ -110,7 +110,7 @@ export function RequestLogList() {
         setStats(result)
       }
     } catch (error) {
-      console.error('Failed to fetch request log stats:', error)
+      console.error('Failed to fetch request log stats:')
     }
   }, [])
 
@@ -126,7 +126,7 @@ export function RequestLogList() {
   useEffect(() => {
     const interval = setInterval(() => {
       refreshLogs().catch((error) => {
-        console.error('Failed to refresh request logs:', error)
+        console.error('Failed to refresh request logs:')
       })
     }, 3000)
     return () => clearInterval(interval)

@@ -58,6 +58,8 @@ interface ProviderCardProps {
   onCheckStatus: (id: string) => void
   onManageAccounts: (id: string) => void
   onUpdateModels?: (id: string) => void
+  modelRefreshError?: string
+  canUpdateModels?: boolean
   onManageModels?: (id: string) => void
   className?: string
 }
@@ -80,16 +82,18 @@ export function ProviderCard({
   onCheckStatus,
   onManageAccounts,
   onUpdateModels,
+  modelRefreshError,
+  canUpdateModels = false,
   onManageModels,
   className,
 }: ProviderCardProps) {
   const { t } = useTranslation()
-  const isBuiltin = provider.type === 'builtin'
+  const isBuiltin = provider.type === 'builtin' || Object.prototype.hasOwnProperty.call(providerIcons, provider.id)
   const icon = providerIcons[provider.id]
   const currentStatus = provider.status || status || 'unknown'
 
   const statusTexts: Record<ProviderStatus, string> = {
-    online: t('providers.online'),
+    online: isBuiltin ? 'Website reachable' : t('providers.online'),
     offline: t('providers.offline'),
     unknown: t('providers.unknown'),
   }
@@ -173,10 +177,20 @@ export function ProviderCard({
                   {t('providers.manageModels')}
                 </DropdownMenuItem>
               )}
-              {isBuiltin && (provider as any).modelsApiEndpoint && (
+              {isBuiltin && canUpdateModels && (
                 <DropdownMenuItem onClick={() => onUpdateModels?.(provider.id)}>
                   <Download className="mr-2 h-4 w-4" />
-                  {t('providers.updateModels')}
+                  {provider.id === 'glm' ? 'Refresh public GLM guest website models'
+                    : provider.id === 'qwen' ? 'Refresh website chat models'
+                    : provider.id === 'deepseek' ? 'Refresh website chat modes'
+                      : 'Refresh models from web chat'}
+                </DropdownMenuItem>
+              )}
+              {isBuiltin && !canUpdateModels && (
+                <DropdownMenuItem disabled>
+                  {provider.id === 'glm'
+                    ? 'GLM requires a signed web session; catalog not connected'
+                    : 'No verified web catalog; edit models manually'}
                 </DropdownMenuItem>
               )}
               {!isBuiltin && (
@@ -192,14 +206,18 @@ export function ProviderCard({
                   </DropdownMenuItem>
                 </>
               )}
-              <DropdownMenuSeparator />
-              <DropdownMenuItem 
-                onClick={() => onDelete(provider.id)}
-                className="text-destructive"
-              >
-                <Trash2 className="mr-2 h-4 w-4" />
-                {t('providers.deleteProvider')}
-              </DropdownMenuItem>
+              {!isBuiltin && (
+                <>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem
+                    onClick={() => onDelete(provider.id)}
+                    className="text-destructive"
+                  >
+                    <Trash2 className="mr-2 h-4 w-4" />
+                    {t('providers.deleteProvider')}
+                  </DropdownMenuItem>
+                </>
+              )}
             </DropdownMenuContent>
           </DropdownMenu>
         </div>
@@ -210,13 +228,21 @@ export function ProviderCard({
             <div className="flex flex-col">
               <span className="text-muted-foreground text-xs">{t('providers.accounts')}</span>
               <span className="font-medium">
-                {activeAccountCount} / {accountCount} {t('providers.online').toLowerCase()}
+                {activeAccountCount} / {accountCount} {isBuiltin ? 'configured' : t('providers.online').toLowerCase()}
               </span>
+              {isBuiltin && (
+                <span className="text-muted-foreground text-xs">Login session not verified</span>
+              )}
             </div>
             <div className="flex flex-col">
               <span className="text-muted-foreground text-xs">{t('providers.models')}</span>
               <span className="font-medium">
                 {provider.supportedModels?.length || 0}
+              </span>
+              <span className="text-muted-foreground text-xs" title="Model listing is not a successful chat request">
+                {provider.modelCatalog?.source === 'provider-web'
+                  ? (provider.id === 'glm' ? 'Guest website catalog (not call-tested)' : 'Web catalog (not call-tested)')
+                  : 'Bundled list (not call-tested)'}
               </span>
             </div>
             <div className="flex flex-col">
@@ -246,6 +272,11 @@ export function ProviderCard({
             )}
           </Button>
         </div>
+        {modelRefreshError && (
+          <p role="alert" className="text-xs text-destructive mt-3 break-words">
+            Model refresh: {modelRefreshError}
+          </p>
+        )}
       </CardContent>
     </Card>
   )

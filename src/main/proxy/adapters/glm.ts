@@ -146,7 +146,7 @@ export class GLMAdapter {
       }
     )
 
-    console.log('[GLM] Token response:', JSON.stringify(response.data, null, 2))
+    console.log('[GLM] Token response received')
     const { code, status, message } = response.data || {}
     const isSuccess = code === 0 || status === 0
     if (response.status !== 200 || !isSuccess) {
@@ -202,7 +202,7 @@ export class GLMAdapter {
    * Upload file to GLM
    */
   private async uploadFile(fileUrl: string): Promise<{ source_id: string; file_url?: string }> {
-    console.log('[GLM] Uploading file:', fileUrl.substring(0, 50) + '...')
+    console.log('[GLM] Uploading file')
     
     let filename: string
     let fileData: Buffer
@@ -221,7 +221,9 @@ export class GLMAdapter {
         timeout: 60000,
       })
       fileData = Buffer.from(response.data)
-      mimeType = response.headers['content-type'] || mime.lookup(filename) || 'application/octet-stream'
+      mimeType = typeof response.headers['content-type'] === 'string'
+        ? response.headers['content-type']
+        : mime.lookup(filename) || 'application/octet-stream'
     }
 
     const formData = new FormData()
@@ -251,7 +253,7 @@ export class GLMAdapter {
       throw new Error(`File upload failed: HTTP ${response.status}`)
     }
 
-    console.log('[GLM] File uploaded successfully:', response.data.result.source_id)
+    console.log('[GLM] File uploaded successfully')
     return response.data.result
   }
 
@@ -467,7 +469,7 @@ GLM STRICT RULES:
           file_url: result.file_url || fileUrl,
         })
       } catch (error) {
-        console.error('[GLM] Failed to upload file:', error)
+        console.error('[GLM] Failed to upload file')
       }
     }
 
@@ -482,7 +484,7 @@ GLM STRICT RULES:
           height: 0,
         })
       } catch (error) {
-        console.error('[GLM] Failed to upload image:', error)
+        console.error('[GLM] Failed to upload image')
       }
     }
 
@@ -495,7 +497,7 @@ GLM STRICT RULES:
     // Use request parameters for mode control (OpenAI compatible)
     if (request.reasoning_effort) {
       chatMode = 'zero'
-      console.log('[GLM] Using reasoning mode, effort:', request.reasoning_effort)
+      console.log('[GLM] Using reasoning mode')
     }
     
     if (request.web_search) {
@@ -595,10 +597,10 @@ GLM STRICT RULES:
           validateStatus: () => true,
         }
       )
-      console.log('[GLM] Conversation deleted:', conversationId)
+      console.log('[GLM] Conversation deleted')
       return true
     } catch (error) {
-      console.error('[GLM] Failed to delete conversation:', error)
+      console.error('[GLM] Failed to delete conversation')
       return false
     }
   }
@@ -633,7 +635,7 @@ GLM STRICT RULES:
           }
         )
 
-        console.log('[GLM] Get conversation list page', page, 'response:', JSON.stringify(listResponse.data, null, 2))
+        console.log('[GLM] Conversation list page received')
 
         const { status, result } = listResponse.data || {}
         if (listResponse.status !== 200 || status !== 0) {
@@ -659,7 +661,7 @@ GLM STRICT RULES:
         return true
       }
 
-      console.log('[GLM] Found', allConversationIds.length, 'conversations to delete')
+      console.log('[GLM] Conversations found for deletion')
 
       // Step 2: Bulk delete conversations
       const sign = generateSign()
@@ -682,7 +684,7 @@ GLM STRICT RULES:
         }
       )
 
-      console.log('[GLM] Bulk delete response:', JSON.stringify(deleteResponse.data, null, 2))
+      console.log('[GLM] Bulk delete response')
 
       const deleteResult = deleteResponse.data || {}
       const success = deleteResponse.status === 200 && deleteResult.status === 0
@@ -691,7 +693,7 @@ GLM STRICT RULES:
       }
       return success
     } catch (error) {
-      console.error('[GLM] Failed to delete all chats:', error)
+      console.error('[GLM] Failed to delete all chats')
       return false
     }
   }
@@ -726,6 +728,40 @@ export class GLMStreamHandler {
     let sentContent = ''
     let sentReasoning = ''
     let sentRole = false
+    let sawFinish = false
+    let failed = false
+    const decoder = new TextDecoder('utf-8', { fatal: true })
+    let pendingWire = ''
+    const fail = () => {
+      if (failed || transStream.writableEnded) return
+      failed = true
+      transStream.end('data: {"error":{"code":"glm_response_incomplete","type":"api_error"}}\n\n')
+    }
+
+    const finalize = () => {
+      if (failed || transStream.writableEnded) return
+      if (!sawFinish) {
+        fail()
+        return
+      }
+      const baseChunk = createBaseChunk(this.conversationId, this.model, this.created)
+      const flushChunks = this.toolStreamParser?.flush(baseChunk) ?? []
+      if (!sentContent.trim() && !this.toolStreamParser?.hasEmittedToolCall()) {
+        fail()
+        return
+      }
+      for (const outChunk of flushChunks) {
+        transStream.write('data: ' + JSON.stringify(outChunk) + '\n\n')
+      }
+      const finishReason = this.toolStreamParser?.hasEmittedToolCall() ? 'tool_calls' : 'stop'
+      transStream.write('data: ' + JSON.stringify({
+        id: this.conversationId, model: this.model, object: 'chat.completion.chunk',
+        choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
+        created: this.created,
+      }) + '\n\n')
+      transStream.end('data: [DONE]\n\n')
+      this.onEnd?.()
+    }
 
     transStream.write(
       `data: ${JSON.stringify({
@@ -740,13 +776,26 @@ export class GLMStreamHandler {
     const parser = createParser({
       onEvent: (event: any) => {
         try {
+          if (failed) return
+          if (event.event === 'error') { fail(); return }
+          if (sawFinish) {
+            if (event.data === '[DONE]') return
+            fail()
+            return
+          }
           const result = JSON.parse(event.data)
+          if (!result || typeof result !== 'object' || Array.isArray(result) ||
+              result.error !== undefined || result.last_error !== undefined ||
+              ['intervene', 'error', 'failed'].includes(result.status)) {
+            fail()
+            return
+          }
 
           if (!this.conversationId && result.conversation_id) {
             this.conversationId = result.conversation_id
           }
 
-          if (result.status !== 'finish' && result.status !== 'intervene') {
+          if (result.status !== 'finish') {
             if (result.parts) {
               result.parts.forEach((part: any) => {
                 const index = cachedParts.findIndex((p) => p.logic_id === part.logic_id)
@@ -854,106 +903,81 @@ export class GLMStreamHandler {
 
             if (outputChunks.length > 0) sentRole = true
           } else {
-            // Flush any remaining tool call buffer before finishing
-            const baseChunk = createBaseChunk(this.conversationId, this.model, this.created)
-            const flushChunks = this.toolStreamParser?.flush(baseChunk) ?? []
-            for (const outChunk of flushChunks) {
-              transStream.write(`data: ${JSON.stringify(outChunk)}\n\n`)
-            }
-
-            // Determine finish_reason based on whether we had tool calls
-            const finishReason = this.toolStreamParser?.hasEmittedToolCall() ? 'tool_calls' : 'stop'
-
-            transStream.write(
-              `data: ${JSON.stringify({
-                id: this.conversationId,
-                model: this.model,
-                object: 'chat.completion.chunk',
-                choices: [
-                  {
-                    index: 0,
-                    delta:
-                      result.status === 'intervene' && result.last_error?.intervene_text
-                        ? { content: '\n\n' + result.last_error.intervene_text }
-                        : {},
-                    finish_reason: finishReason,
-                  },
-                ],
-                usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
-                created: this.created,
-              })}\n\n`
-            )
-            transStream.end('data: [DONE]\n\n')
-            this.onEnd?.()
+            sawFinish = true
+            return
           }
         } catch (err) {
-          console.error('[GLM] Stream parse error:', err)
+          console.error('[GLM] Stream parse error')
+          fail()
         }
       },
     })
 
-    const decoder = new TextDecoder('utf-8')
-    stream.on('data', (buffer: Buffer) => parser.feed(decoder.decode(buffer, { stream: true })))
-
-    // Handle stream errors - ensure proper cleanup
-    stream.once('error', (err: Error) => {
-      console.error('[GLM] Stream error:', err.message)
-      // Flush any remaining tool call buffer
-      const baseChunk = createBaseChunk(this.conversationId, this.model, this.created)
-      const flushChunks = this.toolStreamParser?.flush(baseChunk) ?? []
-      for (const outChunk of flushChunks) {
-        transStream.write(`data: ${JSON.stringify(outChunk)}\n\n`)
+    const feed = (text: string) => {
+      pendingWire += text
+      while (!failed) {
+        const delimiter = /\r?\n\r?\n/.exec(pendingWire)
+        if (!delimiter) break
+        if (delimiter.index > 1_048_576) { fail(); return }
+        pendingWire = pendingWire.slice(delimiter.index + delimiter[0].length)
       }
-      const finishReason = this.toolStreamParser?.hasEmittedToolCall() ? 'tool_calls' : 'stop'
-      transStream.write(
-        `data: ${JSON.stringify({
-          id: this.conversationId,
-          model: this.model,
-          object: 'chat.completion.chunk',
-          choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
-          created: this.created,
-        })}\n\n`
-      )
-      transStream.end('data: [DONE]\n\n')
-      this.onEnd?.()
+      if (pendingWire.length > 1_048_576) { fail(); return }
+      if (!failed) parser.feed(text)
+    }
+    stream.on('data', (buffer: Buffer) => {
+      if (failed) return
+      try { feed(decoder.decode(buffer, { stream: true })) } catch { fail() }
     })
-
-    // Handle stream close - ensure proper cleanup if not already finished
+    stream.once('end', () => {
+      if (failed) return
+      try {
+        const remaining = decoder.decode()
+        if (remaining) feed(remaining)
+        if (pendingWire.trim()) { fail(); return }
+        finalize()
+      } catch { fail() }
+    })
+    stream.once('error', () => {
+      console.error('[GLM] Stream error')
+      fail()
+    })
     stream.once('close', () => {
-      console.log('[GLM] Stream closed')
-      // Only send finish if we haven't already
-      if (!transStream.closed) {
-        const baseChunk = createBaseChunk(this.conversationId, this.model, this.created)
-        const flushChunks = this.toolStreamParser?.flush(baseChunk) ?? []
-        for (const outChunk of flushChunks) {
-          transStream.write(`data: ${JSON.stringify(outChunk)}\n\n`)
-        }
-        const finishReason = this.toolStreamParser?.hasEmittedToolCall() ? 'tool_calls' : 'stop'
-        transStream.write(
-          `data: ${JSON.stringify({
-            id: this.conversationId,
-            model: this.model,
-            object: 'chat.completion.chunk',
-            choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
-            created: this.created,
-          })}\n\n`
-        )
-        transStream.end('data: [DONE]\n\n')
-        this.onEnd?.()
-      }
+      if (!stream.readableEnded) fail()
     })
-
     return transStream
   }
 
   async handleNonStream(stream: any): Promise<any> {
     return new Promise((resolve, reject) => {
       const cachedParts: any[] = []
+      const decoder = new TextDecoder('utf-8', { fatal: true })
+      let pendingWire = ''
+      let sawFinish = false
+      let failed = false
+      let pendingResult: unknown
+      const fail = () => {
+        if (failed) return
+        failed = true
+        reject(new Error('GLM response decoding failed'))
+      }
 
       const parser = createParser({
         onEvent: (event: any) => {
           try {
+            if (failed) return
+            if (event.event === 'error') { fail(); return }
+            if (sawFinish) {
+              if (event.data === '[DONE]') return
+              fail()
+              return
+            }
             const result = JSON.parse(event.data)
+            if (!result || typeof result !== 'object' || Array.isArray(result) ||
+                result.error !== undefined || result.last_error !== undefined ||
+                ['intervene', 'error', 'failed'].includes(result.status)) {
+              fail()
+              return
+            }
 
             if (!this.conversationId && result.conversation_id) {
               this.conversationId = result.conversation_id
@@ -1035,11 +1059,12 @@ export class GLMStreamHandler {
                 if (partReasoning) fullReasoning += (fullReasoning.length > 0 ? '\n' : '') + partReasoning
               })
 
-              const { content: cleanContent, toolCalls } = this.toolCallingPlan?.shouldParseResponse
+              const { content: cleanContent, toolCalls } =
+                (this.toolCallingPlan?.toolChoiceMode === 'none' || this.toolCallingPlan?.shouldParseResponse)
                 ? { content: fullText, toolCalls: [] }
                 : parseToolCallsFromText(fullText, 'glm')
 
-              resolve({
+              pendingResult = {
                 id: this.conversationId,
                 model: this.model,
                 object: 'chat.completion',
@@ -1055,33 +1080,47 @@ export class GLMStreamHandler {
                     finish_reason: toolCalls.length > 0 ? 'tool_calls' : 'stop',
                   },
                 ],
-                usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
                 created: Math.floor(Date.now() / 1000),
-              })
+              }
+              sawFinish = true
             }
           } catch (err) {
-            reject(err)
+            fail()
           }
         },
       })
 
-      stream.on('data', (buffer: Buffer) => parser.feed(buffer.toString()))
-      stream.once('error', reject)
+      const feed = (text: string) => {
+        pendingWire += text
+        while (!failed) {
+          const delimiter = /\r?\n\r?\n/.exec(pendingWire)
+          if (!delimiter) break
+          if (delimiter.index > 1_048_576) { fail(); return }
+          pendingWire = pendingWire.slice(delimiter.index + delimiter[0].length)
+        }
+        if (pendingWire.length > 1_048_576) { fail(); return }
+        if (!failed) parser.feed(text)
+      }
+      stream.on('data', (buffer: Buffer) => {
+        if (failed) return
+        try { feed(decoder.decode(buffer, { stream: true })) } catch { fail() }
+      })
+      stream.once('end', () => {
+        if (failed) return
+        try {
+          const remaining = decoder.decode()
+          if (remaining) feed(remaining)
+          if (failed) return
+          if (pendingWire.trim() || !sawFinish || !pendingResult) {
+            fail()
+            return
+          }
+          resolve(pendingResult)
+        } catch { fail() }
+      })
+      stream.once('error', fail)
       stream.once('close', () => {
-        resolve({
-          id: this.conversationId,
-          model: this.model,
-          object: 'chat.completion',
-          choices: [
-            {
-              index: 0,
-              message: { role: 'assistant', content: '', reasoning_content: null },
-              finish_reason: 'stop',
-            },
-          ],
-          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
-          created: Math.floor(Date.now() / 1000),
-        })
+        if (!stream.readableEnded) fail()
       })
     })
   }

@@ -11,6 +11,7 @@ import { streamHandler } from '../stream'
 import { proxyStatusManager } from '../status'
 import { modelMapper } from '../modelMapper'
 import { storeManager } from '../../store/store'
+import type { ChatCompletionRequest } from '../types'
 
 const router = new Router({ prefix: '/v1' })
 
@@ -36,7 +37,7 @@ function generateRequestId(): string {
 /**
  * Convert prompt to messages format
  */
-function promptToMessages(prompt: string | string[]): Array<{ role: string; content: string }> {
+function promptToMessages(prompt: string | string[]): ChatCompletionRequest['messages'] {
   if (Array.isArray(prompt)) {
     return prompt.map((p, index) => ({
       role: index % 2 === 0 ? 'user' : 'assistant',
@@ -155,7 +156,7 @@ router.post('/completions', async (ctx: Context) => {
       ctx.status = result.status || 500
       ctx.body = {
         error: {
-          message: result.error || 'Request failed',
+          message: 'Provider request failed',
           type: 'api_error',
         },
       }
@@ -200,7 +201,7 @@ router.post('/completions', async (ctx: Context) => {
     ctx.status = 500
     ctx.body = {
       error: {
-        message: error instanceof Error ? error.message : 'Unknown error',
+        message: 'Internal proxy error',
         type: 'internal_error',
       },
     }

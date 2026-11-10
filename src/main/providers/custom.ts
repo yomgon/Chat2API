@@ -1,6 +1,13 @@
 import { storeManager } from '../store/store'
+import { getBuiltinProvider } from './builtin'
 import type { Provider, AuthType } from '../../shared/types'
 import type { CredentialField } from '../store/types'
+import {
+  assertProviderEndpointChangeAllowed,
+  assertProviderIdentityUnchanged,
+  ProviderEndpointTrustError,
+  validateProviderEndpoint,
+} from './endpointTrust'
 
 export interface CustomProviderData {
   id?: string
@@ -42,23 +49,15 @@ export class CustomProviderManager {
   }
 
   private static validateApiEndpoint(endpoint: string): CustomProviderValidation {
-    const errors: string[] = []
-    
-    if (!endpoint || endpoint.trim().length === 0) {
-      errors.push('API endpoint cannot be empty')
-    }
-    
     try {
-      new URL(endpoint)
-    } catch {
-      errors.push('Invalid API endpoint format')
+      validateProviderEndpoint(endpoint)
+      return { valid: true, errors: [] }
+    } catch (error) {
+      if (error instanceof ProviderEndpointTrustError) {
+        return { valid: false, errors: [error.message] }
+      }
+      throw error
     }
-    
-    if (!endpoint.startsWith('http://') && !endpoint.startsWith('https://')) {
-      errors.push('API endpoint must start with http:// or https://')
-    }
-    
-    return { valid: errors.length === 0, errors }
   }
 
   private static validateAuthType(authType: AuthType): CustomProviderValidation {
@@ -154,12 +153,16 @@ export class CustomProviderManager {
   }
 
   static create(data: CustomProviderData): Provider {
+    const apiEndpoint = validateProviderEndpoint(data.apiEndpoint)
     // Check if a provider with the same ID already exists
     if (data.id) {
       const existing = storeManager.getProviderById(data.id)
       if (existing) {
         return existing
       }
+      assertProviderEndpointChangeAllowed(
+        undefined, apiEndpoint, storeManager.getAccountsByProviderId(data.id, false),
+      )
     }
     
     const validation = this.validate(data)
@@ -174,7 +177,7 @@ export class CustomProviderManager {
       name: data.name.trim(),
       type: data.type || 'custom',
       authType: data.authType,
-      apiEndpoint: data.apiEndpoint.trim(),
+      apiEndpoint,
       headers: data.headers || {},
       enabled: true,
       createdAt: now,
@@ -204,18 +207,22 @@ export class CustomProviderManager {
     if (existing.type === 'builtin') {
       throw new Error('Cannot modify built-in provider')
     }
+    assertProviderIdentityUnchanged(existing, updates)
+    const validatedUpdates = 'apiEndpoint' in updates
+      ? {
+          ...updates,
+          apiEndpoint: assertProviderEndpointChangeAllowed(
+            existing.apiEndpoint, updates.apiEndpoint,
+            storeManager.getAccountsByProviderId(existing.id, false),
+            existing.headers,
+          ),
+        }
+      : { ...updates }
     
     if (updates.name && updates.name !== existing.name) {
       const nameValidation = this.validateName(updates.name)
       if (!nameValidation.valid) {
         throw new Error(nameValidation.errors.join(', '))
-      }
-    }
-    
-    if (updates.apiEndpoint) {
-      const endpointValidation = this.validateApiEndpoint(updates.apiEndpoint)
-      if (!endpointValidation.valid) {
-        throw new Error(endpointValidation.errors.join(', '))
       }
     }
     
@@ -234,7 +241,7 @@ export class CustomProviderManager {
     }
     
     const updated = storeManager.updateProvider(id, {
-      ...updates,
+      ...validatedUpdates,
       updatedAt: Date.now(),
     })
     
@@ -252,6 +259,12 @@ export class CustomProviderManager {
     
     if (!provider) {
       return false
+    }
+    // The renderer's delete IPC intentionally routes here. A built-in provider
+    // may own persistent web-login accounts and model mappings: never cascade
+    // delete it (or its accounts) through the custom-provider endpoint.
+    if (provider.type !== 'custom' || !!getBuiltinProvider(id)) {
+      throw new Error('Built-in providers cannot be deleted; disable them instead')
     }
     
     const accounts = storeManager.getAccountsByProviderId(id)

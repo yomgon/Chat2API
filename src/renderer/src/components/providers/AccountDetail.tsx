@@ -70,10 +70,10 @@ export function AccountDetail({
     const fetchTrendData = async () => {
       try {
         const trend = await window.electronAPI.logs.getAccountTrend(account.id, 7)
-        console.log('Account trend data:', trend)
+        console.log('Account trend data:')
         setTrendData(trend)
       } catch (error) {
-        console.error('Failed to fetch account trend:', error)
+        console.error('Failed to fetch account trend:')
       }
     }
     fetchTrendData()
@@ -167,7 +167,7 @@ export function AccountDetail({
       const result = await window.electronAPI.accounts.getCredits(account.id)
       setCredits(result)
     } catch (error) {
-      console.error('Failed to get credits:', error)
+      console.error('Failed to get credits:')
     } finally {
       setIsLoadingCredits(false)
     }

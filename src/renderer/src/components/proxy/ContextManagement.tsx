@@ -56,7 +56,7 @@ export function ContextManagement() {
       const contextConfig = await window.electronAPI.contextManagement.getConfig()
       setConfig(contextConfig)
     } catch (error) {
-      console.error('Failed to load context management config:', error)
+      console.error('Failed to load context management config:')
     }
   }
 

@@ -13,12 +13,7 @@ import { parseToolCallsFromText } from './toolParser'
 
 // Import types and functions from the new unified module
 import {
-  StreamState,
   createStreamState,
-  parseToolCallsStream as unifiedParseToolCallsStream,
-  flushToolCallBuffer as unifiedFlushToolCallBuffer,
-  shouldBlockOutput as unifiedShouldBlockOutput,
-  createBaseChunk as unifiedCreateBaseChunk
 } from './toolParser/index'
 
 // Re-export StreamState type for backward compatibility
@@ -281,7 +276,9 @@ export function flushToolCallBuffer(
         }]
       })
     } else if (state.contentBuffer && state.hasEmittedToolCall) {
-      console.warn('[StreamToolHandler] Discarding remaining buffer because tool calls were emitted:', state.contentBuffer.substring(0, 200) + '...')
+      // A partial tool buffer may contain a user prompt, credential or model
+      // output. Log only the fixed condition, never its content or prefix.
+      console.warn('[StreamToolHandler] Discarding remaining buffer after tool calls')
     }
   }
 

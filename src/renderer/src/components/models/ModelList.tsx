@@ -62,12 +62,11 @@ interface ModelRowProps {
   model: ModelInfo
   isSelected: boolean
   onSelect: (modelId: string) => void
-  t: (key: string, params?: Record<string, any>) => string
 }
 
 const PAGE_SIZE = 50
 
-const ModelRow = memo(({ model, isSelected, onSelect, t }: ModelRowProps) => {
+const ModelRow = memo(({ model, isSelected, onSelect }: ModelRowProps) => {
   const providerIcon = providerIcons[model.providerId]
   
   return (
@@ -116,12 +115,12 @@ const ModelRow = memo(({ model, isSelected, onSelect, t }: ModelRowProps) => {
           {model.status === 'available' ? (
             <>
               <CheckCircle2 className="h-4 w-4 text-green-500" />
-              <span className="text-sm text-green-500">{t('models.available')}</span>
+              <span className="text-sm text-green-500">Configured (not live-tested)</span>
             </>
           ) : (
             <>
               <XCircle className="h-4 w-4 text-red-500" />
-              <span className="text-sm text-red-500">{t('models.unavailable')}</span>
+              <span className="text-sm text-red-500">Not connected</span>
             </>
           )}
         </div>
@@ -155,14 +154,14 @@ export function ModelList() {
           const models = await window.electronAPI.providers.getEffectiveModels(provider.id)
           newMap[provider.id] = models
         } catch (error) {
-          console.error(`Failed to load models for provider ${provider.id}:`, error)
+          console.error('[Renderer] Operation failed')
           newMap[provider.id] = []
         }
       }
       
       setEffectiveModelsMap(newMap)
     } catch (error) {
-      console.error('Failed to load effective models:', error)
+      console.error('Failed to load effective models:')
     }
   }, [providers])
   
@@ -218,6 +217,19 @@ export function ModelList() {
     
     for (const mapping of modelMappings) {
       if (!addedModelNames.has(mapping.requestModel)) {
+        const hasConfiguredTarget = typeof mapping.actualModel === 'string' && !!mapping.actualModel &&
+          enabledProviders.some(provider => {
+            if (mapping.preferredProviderId && provider.id !== mapping.preferredProviderId) return false
+            const providerAccounts = accountMap.get(provider.id) || []
+            const hasMatchingAccount = providerAccounts.some(account =>
+              account.status === 'active' &&
+              (!mapping.preferredAccountId || account.id === mapping.preferredAccountId),
+            )
+            return hasMatchingAccount && (effectiveModelsMap[provider.id] || []).some(model =>
+              model.actualModelId === mapping.actualModel || model.displayName === mapping.actualModel,
+            )
+          })
+
         models.push({
           id: `mapping-${mapping.requestModel}`,
           name: mapping.requestModel,
@@ -227,7 +239,7 @@ export function ModelList() {
           accountName: mapping.preferredAccountId 
             ? (accounts.find(a => a.id === mapping.preferredAccountId)?.name)
             : undefined,
-          status: 'available',
+          status: hasConfiguredTarget ? 'available' : 'unavailable',
         })
       }
     }
@@ -321,7 +333,7 @@ export function ModelList() {
         description: t('models.copySuccessDesc', { count: selectedModelNames.length }),
       })
     } catch (error) {
-      console.error('Failed to copy to clipboard:', error)
+      console.error('Failed to copy to clipboard:')
       toast({
         title: t('common.error'),
         description: t('common.error'),
@@ -349,7 +361,7 @@ export function ModelList() {
         description: t('models.copySuccessDesc', { count: filteredModels.length }),
       })
     } catch (error) {
-      console.error('Failed to copy to clipboard:', error)
+      console.error('Failed to copy to clipboard:')
       toast({
         title: t('common.error'),
         description: t('common.error'),
@@ -497,7 +509,6 @@ export function ModelList() {
                       model={model}
                       isSelected={selectedModels.has(model.id)}
                       onSelect={handleSelectModel}
-                      t={t}
                     />
                   ))}
                 </TableBody>

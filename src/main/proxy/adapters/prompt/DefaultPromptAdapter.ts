@@ -9,7 +9,7 @@ import { ChatMessage, ChatCompletionTool, ToolCall } from '../../types'
 import { BasePromptAdapter, PromptVariant, TransformResult, ParseResult, ToolCallFormat } from './BasePromptAdapter'
 import { ClientType } from '../../utils/promptSignatures'
 import { parseToolCallsFromText } from '../../utils/toolParser'
-import { TOOL_PROMPT_SIGNATURES, hasGeneralToolPromptSignature } from '../../constants/signatures'
+import { GENERAL_TOOL_SIGNATURES, hasGeneralToolPromptSignature } from '../../constants/signatures'
 import { DEFAULT_VARIANT, XML_VARIANT } from '../../prompt/variants'
 
 /**
@@ -20,7 +20,7 @@ export class DefaultPromptAdapter extends BasePromptAdapter {
   name = 'default'
   clientType: ClientType = 'unknown'
   
-  detectSignatures = TOOL_PROMPT_SIGNATURES.general
+  detectSignatures = GENERAL_TOOL_SIGNATURES
 
   constructor() {
     super()
@@ -107,7 +107,7 @@ export class DefaultPromptAdapter extends BasePromptAdapter {
           },
         })
       } catch {
-        console.warn('[DefaultAdapter] Failed to parse XML tool arguments:', argsStr)
+        console.warn('[DefaultAdapter] Failed to parse XML tool arguments')
       }
     }
     
@@ -167,11 +167,11 @@ export class DefaultPromptAdapter extends BasePromptAdapter {
     }
 
     const variant = this.getVariantByFormat(format)
-    console.log(`[DefaultAdapter] Injecting ${format} format prompt, variant=${variant.id}`)
+    console.log('[DefaultAdapter] Injecting tool prompt')
     const toolsPrompt = this.toolsToPrompt(tools, variant)
-    console.log(`[DefaultAdapter] Tools prompt length: ${toolsPrompt.length}`)
+    console.log('[DefaultAdapter] Tool prompt prepared')
     const transformedMessages = this.injectPrompt(messages, toolsPrompt)
-    console.log(`[DefaultAdapter] Transformed ${transformedMessages.length} messages`)
+    console.log('[DefaultAdapter] Messages transformed')
 
     return {
       messages: transformedMessages,

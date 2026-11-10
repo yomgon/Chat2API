@@ -5,6 +5,11 @@
 
 import { storeManager } from './store'
 import { Provider, ProviderType, AuthType, BUILTIN_PROVIDERS } from './types'
+import {
+  assertProviderEndpointChangeAllowed,
+  assertProviderIdentityUnchanged,
+  validateProviderEndpoint,
+} from '../providers/endpointTrust'
 
 /**
  * Provider Manager Class
@@ -61,6 +66,7 @@ export class ProviderManager {
     name: string
     authType: AuthType
     apiEndpoint: string
+    chatPath?: string
     headers?: Record<string, string>
     description?: string
     icon?: string
@@ -76,6 +82,7 @@ export class ProviderManager {
     type?: ProviderType
     id?: string
   }): Provider {
+    const apiEndpoint = validateProviderEndpoint(data.apiEndpoint)
     const existing = storeManager.getProviders()
     
     // Check if provider with same ID already exists (built-in provider)
@@ -84,6 +91,9 @@ export class ProviderManager {
       if (existingById) {
         return existingById
       }
+      assertProviderEndpointChangeAllowed(
+        undefined, apiEndpoint, storeManager.getAccountsByProviderId(data.id, false),
+      )
     }
     
     // Check if provider with same name already exists
@@ -106,7 +116,7 @@ export class ProviderManager {
       name: data.name,
       type: data.type || 'custom',
       authType: data.authType,
-      apiEndpoint: data.apiEndpoint,
+      apiEndpoint,
       chatPath: data.chatPath,
       headers: data.headers || {},
       enabled: true,
@@ -143,6 +153,7 @@ export class ProviderManager {
       throw new Error(`Provider not found: ${id}`)
     }
     
+    assertProviderIdentityUnchanged(existing, updates)
     if (existing.type === 'builtin') {
       const restricted = ['name', 'authType', 'apiEndpoint']
       const hasRestricted = restricted.some((key) => key in updates)
@@ -152,7 +163,17 @@ export class ProviderManager {
       }
     }
     
-    const updated = storeManager.updateProvider(id, updates)
+    const validatedUpdates = 'apiEndpoint' in updates
+      ? {
+          ...updates,
+          apiEndpoint: assertProviderEndpointChangeAllowed(
+            existing.apiEndpoint, updates.apiEndpoint,
+            storeManager.getAccountsByProviderId(existing.id, false),
+            existing.headers,
+          ),
+        }
+      : { ...updates }
+    const updated = storeManager.updateProvider(id, validatedUpdates)
     
     if (updated) {
       storeManager.addLog('info', `Update provider: ${existing.name}`, {
@@ -174,6 +195,9 @@ export class ProviderManager {
     if (!provider) {
       return false
     }
+    if (provider.type !== 'custom' || BUILTIN_PROVIDERS.some(builtin => builtin.id === id)) {
+      throw new Error('Built-in providers cannot be deleted; disable them instead')
+    }
     
     // Delete all accounts associated with the provider
     const accounts = storeManager.getAccountsByProviderId(id)
@@ -186,7 +210,7 @@ export class ProviderManager {
     if (result) {
       storeManager.addLog('info', `Delete provider: ${provider.name}`, {
         providerId: id,
-        deletedAccounts: accounts.length,
+        data: { deletedAccounts: accounts.length },
       })
     }
     
@@ -251,7 +275,7 @@ export class ProviderManager {
     }))
     
     const allProviders = [...defaultBuiltin, ...customProviders]
-    storeManager.getStore()?.set('providers', allProviders)
+    storeManager.replaceProviders(allProviders)
     
     storeManager.addLog('info', 'Reset built-in provider configuration')
   }

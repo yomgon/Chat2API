@@ -35,16 +35,7 @@ const proxyAPI = {
 }
 
 const storeAPI = {
-  get: <T>(key: string): Promise<T | undefined> => 
-    ipcRenderer.invoke(IpcChannels.STORE_GET, key),
-  
-  set: <T>(key: string, value: T): Promise<void> => 
-    ipcRenderer.invoke(IpcChannels.STORE_SET, key, value),
-  
-  delete: (key: string): Promise<void> => 
-    ipcRenderer.invoke(IpcChannels.STORE_DELETE, key),
-  
-  clearAll: (): Promise<void> => 
+  clearAll: (): Promise<boolean> =>
     ipcRenderer.invoke(IpcChannels.STORE_CLEAR_ALL),
   
   onInitError: (callback: (error: { message: string | null }) => void) => {
@@ -228,6 +219,10 @@ const oauthAPI = {
   
   startInAppLogin: (providerId: string, providerType: ProviderType, timeout?: number): Promise<OAuthResult> =>
     ipcRenderer.invoke(IpcChannels.OAUTH_START_IN_APP_LOGIN, { providerId, providerType, timeout }),
+  reconnectZaiAccount: (accountId: string): Promise<{ success: boolean; accountId?: string; reason?: string }> =>
+    ipcRenderer.invoke(IpcChannels.OAUTH_RECONNECT_ZAI_ACCOUNT, accountId),
+  createZaiAccount: (accountName: string): Promise<{ success: boolean; accountId?: string; reason?: string }> =>
+    ipcRenderer.invoke(IpcChannels.OAUTH_CREATE_ZAI_ACCOUNT, accountName),
   
   cancelInAppLogin: (): Promise<void> =>
     ipcRenderer.invoke(IpcChannels.OAUTH_CANCEL_IN_APP_LOGIN),
@@ -633,44 +628,11 @@ const contextManagementAPI = {
     ipcRenderer.invoke(IpcChannels.CONTEXT_MANAGEMENT_UPDATE_CONFIG, updates),
 }
 
-function resolveLocalManagementApiBaseUrl(config: AppConfig): string {
-  const configuredHost = config.proxyHost || '127.0.0.1'
-  const host = configuredHost === '0.0.0.0' || configuredHost === '::' || configuredHost === '[::]'
-    ? '127.0.0.1'
-    : configuredHost
-
-  return `http://${host}:${config.proxyPort}/v0/management`
-}
-
 const toolCallingAPI = {
-  async getStatus() {
-    const config = await configAPI.get()
-    const secret = config.managementApi?.managementApiSecret
-    if (!secret) return null
-
-    const response = await fetch(`${resolveLocalManagementApiBaseUrl(config)}/tool-calling/status`, {
-      headers: { Authorization: `Bearer ${secret}` },
-    })
-    return response.json()
-  },
-
-  async runSmoke(input: { clientAdapterId: string }) {
-    const config = await configAPI.get()
-    const secret = config.managementApi?.managementApiSecret
-    if (!secret) {
-      return { success: false, error: { message: 'Management API secret is not configured.' } }
-    }
-
-    const response = await fetch(`${resolveLocalManagementApiBaseUrl(config)}/tool-calling/smoke`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${secret}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(input),
-    })
-    return response.json()
-  },
+  getStatus: (): Promise<unknown> =>
+    ipcRenderer.invoke(IpcChannels.TOOL_CALLING_GET_STATUS),
+  runSmoke: (input: { clientAdapterId: string }): Promise<unknown> =>
+    ipcRenderer.invoke(IpcChannels.TOOL_CALLING_RUN_SMOKE, input),
 }
 
 const trayAPI = {
@@ -701,20 +663,6 @@ const electronAPI = {
   contextManagement: contextManagementAPI,
   toolCalling: toolCallingAPI,
   tray: trayAPI,
-  
-  on: (channel: string, callback: (...args: unknown[]) => void) => {
-    const subscription = (_event: Electron.IpcRendererEvent, ...args: unknown[]) => callback(...args)
-    ipcRenderer.on(channel, subscription)
-    return () => ipcRenderer.removeListener(channel, subscription)
-  },
-  
-  send: (channel: string, ...args: unknown[]) => {
-    ipcRenderer.send(channel, ...args)
-  },
-  
-  invoke: (channel: string, ...args: unknown[]) => {
-    return ipcRenderer.invoke(channel, ...args)
-  },
 }
 
 contextBridge.exposeInMainWorld('electronAPI', electronAPI)

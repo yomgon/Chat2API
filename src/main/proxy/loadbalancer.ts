@@ -73,6 +73,13 @@ export class LoadBalancer {
       if (preferred && !this.isAccountInFailure(preferredAccountId)) {
         return preferred
       }
+      // Z.ai is a stateful consumer-web session. Never silently substitute
+      // another identity for a caller's explicitly bound Z.ai account.
+      if (preferredProviderId === 'zai') return null
+      // A deleted/unavailable pin may have belonged to a web provider that no
+      // longer appears among candidates or configured providers. An explicit
+      // identity never authorizes replacement; only unpinned requests balance.
+      return null
     }
 
     if (strategy === 'fill-first') {
@@ -113,7 +120,6 @@ export class LoadBalancer {
       console.log(`[LoadBalancer] Provider ${provider.name} (${provider.id}) has ${accounts.length} available accounts`)
 
       for (const account of accounts) {
-        console.log(`[LoadBalancer] Account ${account.name} (${account.id}) Token: ${(account.credentials.token || '').substring(0, 20)}...`)
         candidates.push({
           account,
           provider,
@@ -130,52 +136,27 @@ export class LoadBalancer {
    */
   private providerSupportsModel(provider: Provider, model: string): boolean {
     const effectiveModels = storeManager.getEffectiveModels(provider.id)
+    const mapping = storeManager.getConfig().modelMappings[model]
+    if (mapping?.preferredProviderId && mapping.preferredProviderId !== provider.id) return false
+    // Validate the actual mapped target, not merely the presence of a provider
+    // preference or a coincidentally matching public alias.
+    const target = mapping ? mapping.actualModel : model
+    if (typeof target !== 'string' || !target.trim()) return false
     if (effectiveModels.length === 0) {
       return true
     }
 
-    const normalizedModel = model.toLowerCase()
-    const supported = effectiveModels.some(m => {
+    const normalizedTarget = target.toLowerCase()
+    return effectiveModels.some(m => {
+      // Wire IDs are preserved exactly. Display aliases retain their existing
+      // case-insensitive and wildcard matching behavior.
+      if (m.actualModelId === target) return true
       const normalizedSupported = m.displayName.toLowerCase()
       if (normalizedSupported.endsWith('*')) {
-        return normalizedModel.startsWith(normalizedSupported.slice(0, -1))
+        return normalizedTarget.startsWith(normalizedSupported.slice(0, -1))
       }
-      return normalizedSupported === normalizedModel
+      return normalizedSupported === normalizedTarget
     })
-    
-    if (supported) {
-      return true
-    }
-
-    const config = storeManager.getConfig()
-    const globalMapping = config.modelMappings[model]
-    if (globalMapping) {
-      if (globalMapping.preferredProviderId) {
-        if (globalMapping.preferredProviderId === provider.id) {
-          console.log(`[LoadBalancer] Model "${model}" matched preferred provider ${provider.name}`)
-          return true
-        }
-        return false
-      }
-      
-      const actualModel = globalMapping.actualModel
-      const normalizedActualModel = actualModel.toLowerCase()
-      const actualSupported = effectiveModels.some(m => {
-        const normalizedSupported = m.displayName.toLowerCase()
-        if (normalizedSupported.endsWith('*')) {
-          return normalizedActualModel.startsWith(normalizedSupported.slice(0, -1))
-        }
-        return normalizedSupported === normalizedActualModel
-      })
-      
-      if (actualSupported) {
-        console.log(`[LoadBalancer] Model "${model}" (actualModel: "${actualModel}") supported by ${provider.name}`)
-        return true
-      }
-    }
-    
-    console.log(`[LoadBalancer] Provider ${provider.name} does not support model ${model}`)
-    return false
   }
 
   /**
@@ -198,37 +179,23 @@ export class LoadBalancer {
    */
   private mapModel(model: string, provider: Provider): string {
     console.log(`[LoadBalancer] mapModel called with model="${model}", provider="${provider.name}"`)
-    
+
+    const mapping = storeManager.getConfig().modelMappings[model]
+    const target = mapping && (!mapping.preferredProviderId || mapping.preferredProviderId === provider.id)
+      ? mapping.actualModel : model
     const effectiveModels = storeManager.getEffectiveModels(provider.id)
-    const effectiveModel = effectiveModels.find(m => 
-      m.displayName.toLowerCase() === model.toLowerCase()
+    const effectiveModel = effectiveModels.find(m =>
+      m.actualModelId === target || m.displayName.toLowerCase() === target.toLowerCase()
     )
-    
+
     if (effectiveModel) {
       console.log(`[LoadBalancer] Model mapped from "${model}" to "${effectiveModel.actualModelId}" via effective models`)
       return effectiveModel.actualModelId
     }
 
-    const config = storeManager.getConfig()
-    const mapping = config.modelMappings[model]
-
-    if (mapping && (!mapping.preferredProviderId || mapping.preferredProviderId === provider.id)) {
-      const actualModel = mapping.actualModel
-      console.log(`[LoadBalancer] Model mapped from "${model}" to "${actualModel}" via global mapping`)
-      
-      const actualEffectiveModel = effectiveModels.find(m => 
-        m.displayName.toLowerCase() === actualModel.toLowerCase()
-      )
-      if (actualEffectiveModel) {
-        console.log(`[LoadBalancer] Model further mapped from "${actualModel}" to "${actualEffectiveModel.actualModelId}" via effective models`)
-        return actualEffectiveModel.actualModelId
-      }
-      
-      return actualModel
-    }
-
-    console.log(`[LoadBalancer] No mapping found, returning original model "${model}"`)
-    return model
+    // Only the existing empty-catalog/wildcard passthrough reaches this path
+    // after providerSupportsModel has checked the same mapped target.
+    return target
   }
 
   /**

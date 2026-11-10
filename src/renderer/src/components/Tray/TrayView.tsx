@@ -89,7 +89,7 @@ export function TrayView() {
         setHost(config.proxyHost || '127.0.0.1')
       }
     } catch (error) {
-      console.error('Failed to load data:', error)
+      console.error('Failed to load data:')
     } finally {
       setIsLoading(false)
     }

@@ -32,7 +32,7 @@ export class PromptAdapterRegistry {
    */
   register(adapter: PromptAdapter): void {
     this.adapters.set(adapter.name, adapter)
-    console.log(`[PromptAdapterRegistry] Registered adapter: ${adapter.name}`)
+    console.log('[PromptAdapterRegistry] Adapter registered')
   }
 
   /**
@@ -82,7 +82,7 @@ export class PromptAdapterRegistry {
     const detectedAdapter = this.detect(messages)
     
     if (detectedAdapter) {
-      console.log(`[PromptAdapterRegistry] Using detected adapter: ${detectedAdapter.name}`)
+      console.log('[PromptAdapterRegistry] Using detected adapter')
       return detectedAdapter.transformRequest(messages, tools, model, provider)
     }
     
@@ -194,7 +194,7 @@ export class PromptAdapterRegistry {
             if (typeof part === 'string') {
               parts.push(part)
             } else if (part && typeof part === 'object' && 'text' in part) {
-              parts.push(part.text)
+              parts.push(part.text ?? '')
             }
           }
         }

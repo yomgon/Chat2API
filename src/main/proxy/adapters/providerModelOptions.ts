@@ -1,5 +1,6 @@
 export interface DeepSeekChatOptionInput {
   model: string
+  originalModel?: string
   web_search?: boolean
   reasoning_effort?: string
 }
@@ -15,11 +16,12 @@ export function resolveDeepSeekChatOptions(
   _prompt: string = ''
 ): DeepSeekChatOptions {
   const modelLower = request.model.toLowerCase()
+  const aliasLower = (request.originalModel ?? request.model).toLowerCase()
   const isProModel = modelLower.includes('deepseek-v4-pro') || modelLower.includes('expert')
-  const isSearchAlias = modelLower.includes('search')
-  const isThinkingAlias = modelLower.includes('think')
-    || modelLower.includes('r1')
-    || modelLower.includes('reasoner')
+  const isSearchAlias = aliasLower.includes('search')
+  const isThinkingAlias = aliasLower.includes('think')
+    || aliasLower.includes('r1')
+    || aliasLower.includes('reasoner')
 
   return {
     modelType: isProModel ? 'expert' : 'default',
@@ -29,10 +31,20 @@ export function resolveDeepSeekChatOptions(
   }
 }
 
-export type KimiScenario = 'SCENARIO_K2D5' | 'SCENARIO_K2D6'
+export type KimiScenario = 'SCENARIO_K2D5' | 'SCENARIO_K2D6' | 'SCENARIO_CHAT'
 
 export function resolveKimiScenario(model: string): KimiScenario {
-  return model.toLowerCase().includes('k2.6') ? 'SCENARIO_K2D6' : 'SCENARIO_K2D5'
+  const modelLower = model.toLowerCase()
+  const modelId = modelLower.trim()
+  if (modelId === 'k3-agent' || modelId === 'k28-agent-preview') {
+    throw new Error('Kimi agent models are not supported by the chat adapter.')
+  }
+
+  // Public model settings bind this exact ID to SCENARIO_CHAT.
+  // Catalog discovery alone does not verify live ChatService compatibility.
+  if (model === 'k2d6-chat') return 'SCENARIO_CHAT'
+
+  return modelLower.includes('k2.6') ? 'SCENARIO_K2D6' : 'SCENARIO_K2D5'
 }
 
 export function createKimiChatPayload(options: {

@@ -58,6 +58,8 @@ interface DeepSeekMessage {
 
 interface ChatCompletionRequest {
   model: string
+  /** Public alias only for legacy search/thinking feature suffixes. */
+  originalModel?: string
   messages: DeepSeekMessage[]
   stream?: boolean
   temperature?: number
@@ -95,7 +97,7 @@ function uuid(): string {
 
 function generateCookie(): string {
   const timestamp = Date.now()
-  return `intercom-HWWAFSESTIME=${timestamp}; HWWAFSESID=${generateRandomString(18, 'hex')}; Hm_lvt_${uuid(false)}=${Math.floor(timestamp / 1000)},${Math.floor(timestamp / 1000)},${Math.floor(timestamp / 1000)}; Hm_lpvt_${uuid(false)}=${Math.floor(timestamp / 1000)}; _frid=${uuid(false)}; _fr_ssid=${uuid(false)}; _fr_pvid=${uuid(false)}`
+  return `intercom-HWWAFSESTIME=${timestamp}; HWWAFSESID=${generateRandomString(18, 'hex')}; Hm_lvt_${uuid()}=${Math.floor(timestamp / 1000)},${Math.floor(timestamp / 1000)},${Math.floor(timestamp / 1000)}; Hm_lpvt_${uuid()}=${Math.floor(timestamp / 1000)}; _frid=${uuid()}; _fr_ssid=${uuid()}; _fr_pvid=${uuid()}`
 }
 
 function unixTimestamp(): number {
@@ -110,9 +112,9 @@ export class DeepSeekAdapter {
   constructor(provider: Provider, account: Account) {
     this.provider = provider
     this.account = account
-    console.log('[DeepSeek] Account credentials:', JSON.stringify(account.credentials, null, 2))
+    console.log('[DeepSeek] Account configured')
     this.token = account.credentials.token || account.credentials.apiKey || account.credentials.refreshToken || ''
-    console.log('[DeepSeek] Using token:', this.token.substring(0, 20) + '...')
+    console.log('[DeepSeek] Token selected')
   }
 
   private async acquireToken(): Promise<string> {
@@ -136,7 +138,7 @@ export class DeepSeekAdapter {
       validateStatus: () => true,
     })
 
-    console.log('[DeepSeek] Token response status:', result.status)
+    console.log('[DeepSeek] Token response received')
     
     if (result.status === 401 || result.status === 403) {
       throw new Error(`Token invalid or expired, please get a new Token`)
@@ -150,7 +152,7 @@ export class DeepSeekAdapter {
     const bizData = result.data?.data?.biz_data || result.data?.biz_data
     if (!bizData?.token) {
       const errorMsg = result.data?.msg || result.data?.data?.biz_msg || 'Unknown error'
-      console.log('[DeepSeek] Token response data:', JSON.stringify(result.data, null, 2))
+      console.log('[DeepSeek] Token response missing access token')
       throw new Error(`Failed to acquire token: ${errorMsg}`)
     }
 
@@ -187,7 +189,7 @@ export class DeepSeekAdapter {
       }
     )
 
-    console.log('[DeepSeek] Create session response:', JSON.stringify(result.data, null, 2))
+    console.log('[DeepSeek] Create session response')
 
     // Response structure: { code: 0, data: { biz_code: 0, biz_data: { id: "..." } } }
     const bizData = result.data?.data?.biz_data || result.data?.biz_data
@@ -217,18 +219,18 @@ export class DeepSeekAdapter {
         }
       )
 
-      console.log('[DeepSeek] Delete session response:', JSON.stringify(result.data, null, 2))
+      console.log('[DeepSeek] Delete session response')
 
       const success = result.status === 200 && result.data?.code === 0
       if (success) {
         // Clear cache
         const cacheKey = this.account.id
         sessionCache.delete(cacheKey)
-        console.log('[DeepSeek] Session deleted:', sessionId)
+        console.log('[DeepSeek] Session deleted')
       }
       return success
     } catch (error) {
-      console.error('[DeepSeek] Failed to delete session:', error)
+      console.error('[DeepSeek] Failed to delete session')
       return false
     }
   }
@@ -264,7 +266,7 @@ export class DeepSeekAdapter {
       throw new Error(`Unsupported algorithm: ${algorithm}`)
     }
     
-    console.log('[DeepSeek] Challenge parameters:', { difficulty })
+    console.log('[DeepSeek] Preparing challenge')
     
     const deepSeekHash = await getDeepSeekHash()
     const answer = deepSeekHash.calculateHash(algorithm, challengeStr, salt, difficulty, expire_at)
@@ -273,7 +275,7 @@ export class DeepSeekAdapter {
       throw new Error('Challenge calculation failed')
     }
     
-    console.log('[DeepSeek] Challenge answer found:', answer)
+    console.log('[DeepSeek] Challenge answer found')
 
     return Buffer.from(JSON.stringify({
       algorithm,
@@ -375,7 +377,7 @@ export class DeepSeekAdapter {
     const token = await this.acquireToken()
     
     const sessionId = await this.createSession()
-    console.log('[DeepSeek] Created new session:', sessionId)
+    console.log('[DeepSeek] Created new session')
     
     const challenge = await this.getChallenge('/api/v0/chat/completion')
     const challengeAnswer = await this.calculateChallengeAnswer(challenge)
@@ -393,7 +395,7 @@ export class DeepSeekAdapter {
     }
 
     if (request.reasoning_effort || thinkingEnabled) {
-      console.log('[DeepSeek] Reasoning mode enabled, effort:', request.reasoning_effort)
+      console.log('[DeepSeek] Reasoning mode enabled')
     }
 
     const response = await axios.post(
@@ -441,7 +443,7 @@ export class DeepSeekAdapter {
         }
       )
 
-      console.log('[DeepSeek] Delete all chats response:', JSON.stringify(result.data, null, 2))
+      console.log('[DeepSeek] Delete all chats response')
 
       const success = result.status === 200 && result.data?.code === 0
       if (success) {
@@ -450,7 +452,7 @@ export class DeepSeekAdapter {
       }
       return success
     } catch (error) {
-      console.error('[DeepSeek] Failed to delete all chats:', error)
+      console.error('[DeepSeek] Failed to delete all chats')
       return false
     }
   }
@@ -465,7 +467,7 @@ export class DeepSeekAdapter {
    */
   static clearSessionCache(accountId: string): void {
     sessionCache.delete(accountId)
-    console.log('[DeepSeek] Cleared session cache for account:', accountId)
+    console.log('[DeepSeek] Account session cache cleared')
   }
 }
 

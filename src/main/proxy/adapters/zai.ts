@@ -9,6 +9,7 @@ import { PassThrough } from 'stream'
 import { createParser } from 'eventsource-parser'
 import FormData from 'form-data'
 import { Account, Provider } from '../../store/types'
+import { readZaiSessionClaims, readZaiTokenIdentity } from '../../oauth/zaiSession'
 import { hasToolUse, parseToolUse, ToolCall } from '../promptToolUse'
 import { parseToolCallsFromText } from '../utils/toolParser'
 import { 
@@ -20,6 +21,7 @@ import {
 } from '../utils/streamToolHandler'
 
 const ZAI_API_BASE = 'https://chat.z.ai'
+const ZAI_AUTH_URL = 'https://chat.z.ai/api/v1/auths/'
 const X_FE_VERSION = 'prod-fe-1.1.37'
 const ZAI_USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36'
 
@@ -80,6 +82,38 @@ function cleanSearchCitationsWithBuffer(text: string, buffer: { value: string })
   return cleaned
 }
 
+/**
+ * Z.ai's web SSE has more than one way to encode assistant text. `delta_content`
+ * appends, `content` replaces the current answer, and `edit_content` replaces
+ * the suffix from a UTF-16 edit_index (matching JavaScript string indexing).
+ * Some compatible responses use OpenAI's `choices[].delta.content` instead.
+ * Keep this function pure: it handles text only and never retries a provider
+ * call or trusts an error/identity field from the event.
+ */
+export function applyZaiTextUpdate(previous: string, result: any): string | null {
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return null
+  let next: string | null = null
+  if (typeof result.edit_content === 'string') {
+    const editIndex = result.edit_index === undefined ? 0 : result.edit_index
+    if (!Number.isSafeInteger(editIndex) || editIndex < 0 || editIndex > previous.length) {
+      throw new Error('Z.ai upstream text edit index was invalid')
+    }
+    next = previous.substring(0, editIndex) + result.edit_content
+  } else if (typeof result.content === 'string') {
+    next = result.content
+  } else if (typeof result.delta_content === 'string') {
+    next = previous + result.delta_content
+  } else if (typeof result.choices?.[0]?.delta?.content === 'string') {
+    next = previous + result.choices[0].delta.content
+  } else if (typeof result.choices?.[0]?.message?.content === 'string') {
+    next = result.choices[0].message.content
+  }
+  if (next !== null && next.length > 2_000_000) {
+    throw new Error('Z.ai upstream answer exceeded the local safety limit')
+  }
+  return next
+}
+
 interface ZaiMessage {
   role: 'user' | 'assistant' | 'system'
   content: string | any[]
@@ -96,6 +130,28 @@ interface ChatCompletionRequest {
   reasoning_effort?: 'low' | 'medium' | 'high' | boolean
   chatId?: string
   parentMessageId?: string
+}
+
+/**
+ * Fixed, non-secret failure provenance for the local proxy. Never carry an
+ * Axios error, upstream response body, URL query, token or cookie across this
+ * boundary. In particular, a rejected remote create-chat HTTP 4xx must not
+ * become an unexplained local HTTP 500.
+ */
+export type ZaiFailureStage = 'auth-preflight' | 'chat-creation' | 'chat-completion'
+
+export class ZaiProxyFailure extends Error {
+  readonly stage: ZaiFailureStage
+  readonly upstreamHttpStatus?: number
+
+  constructor(stage: ZaiFailureStage, safeMessage: string, upstreamHttpStatus?: number) {
+    super(safeMessage)
+    this.name = 'ZaiProxyFailure'
+    this.stage = stage
+    if (Number.isInteger(upstreamHttpStatus) && upstreamHttpStatus! >= 400 && upstreamHttpStatus! <= 599) {
+      this.upstreamHttpStatus = upstreamHttpStatus
+    }
+  }
 }
 
 function uuid(separator: boolean = true): string {
@@ -129,10 +185,71 @@ export class ZaiAdapter {
 
   private async ensureToken(): Promise<string> {
     const token = this.getToken()
-    if (token) {
+    if (!token) throw new ZaiProxyFailure('auth-preflight', 'Z.ai token not configured; reconnect this account')
+    const claims = readZaiSessionClaims(token)
+    if (claims) {
+      if (!claims.usable) throw new ZaiProxyFailure('auth-preflight', 'Z.ai web session has expired; reconnect this account')
+      // Known-expiry metadata is not signature verification; the provider can
+      // still refuse the subsequent operation. Never refresh/replay a failure.
       return token
     }
-    throw new Error('Z.ai token not configured, please add token in account settings')
+    const identity = readZaiTokenIdentity(token)
+    if (!identity || identity.expiryKnown) {
+      throw new ZaiProxyFailure('auth-preflight', 'Z.ai credential is invalid; reconnect this account')
+    }
+    // Current consumer-web auth may issue a JWT with no exp claim. Such a
+    // token cannot be declared locally unexpired: prove the *exact identity*
+    // by one fixed first-party read-only GET BEFORE any remote chat/delete
+    // effect. No retry, fallback account, guessed refresh URL, or storage
+    // mutation. This is independent from the earlier GUI authentication.
+    try {
+      const response = await axios.get(ZAI_AUTH_URL, {
+        headers: {
+          Accept: 'application/json',
+          Authorization: `Bearer ${token}`,
+          Cookie: `token=${token}`,
+          Origin: ZAI_API_BASE,
+          Referer: `${ZAI_API_BASE}/`,
+        },
+        timeout: 12_000,
+        maxRedirects: 0,
+        maxContentLength: 64 * 1024,
+        responseType: 'json',
+        validateStatus: () => true,
+      })
+      const contentType = response.headers?.['content-type']
+      const verified = response.data
+      if (response.status !== 200 ||
+          typeof contentType !== 'string' ||
+          !/^application\/(?:[\w.+-]+\+)?json(?:\s*;|$)/i.test(contentType) ||
+          !verified || typeof verified !== 'object' || Array.isArray(verified) ||
+          verified.id !== identity.subject) {
+        throw new ZaiProxyFailure('auth-preflight',
+          'Z.ai web session was not verified; reconnect this account', response.status)
+      }
+      // A provider response may contain a rotated web token. Its own subject
+      // must match as well; otherwise this attempt is not authorized. Never
+      // replace stored credentials as a side effect of proxy forwarding.
+      let authorizedToken = token
+      if (Object.prototype.hasOwnProperty.call(verified, 'token')) {
+        const next = readZaiTokenIdentity(verified.token)
+        if (!next || next.subject !== identity.subject ||
+            (next.expiryKnown && !readZaiSessionClaims(verified.token)?.usable)) {
+          throw new ZaiProxyFailure('auth-preflight',
+            'Z.ai web session was not verified; reconnect this account')
+        }
+        // Use the token that the fixed first-party endpoint has just
+        // returned for this single authorized operation, without silently
+        // changing the account's OS-protected stored credential.
+        authorizedToken = verified.token
+      }
+      return authorizedToken
+    } catch (error) {
+      // Raw Axios errors/responses may contain Authorization, cookies and URLs.
+      // Only a fixed non-secret failure is allowed past this boundary.
+      if (error instanceof ZaiProxyFailure) throw error
+      throw new ZaiProxyFailure('auth-preflight', 'Z.ai web session was not verified; reconnect this account')
+    }
   }
 
   private extractLastUserMessage(messages: ZaiMessage[]): string {
@@ -206,10 +323,17 @@ export class ZaiAdapter {
 
   async createChat(model: string = 'glm-5', firstMessageContent: string = ''): Promise<{ chatId: string; messageId: string }> {
     const token = await this.ensureToken()
+    return this.createChatWithVerifiedToken(model, firstMessageContent, token)
+  }
+
+  // The completion flow has already verified its token. Reusing it is critical:
+  // a second auth GET could rotate the web token between chat creation and the
+  // completion POST. Public createChat remains independently authenticated.
+  private async createChatWithVerifiedToken(model: string, firstMessageContent: string, token: string): Promise<{ chatId: string; messageId: string }> {
     const timestamp = Math.floor(Date.now() / 1000)
     const messageId = uuid()
     
-    console.log('[Z.ai] Creating chat with model:', model)
+    console.log('[Z.ai] Creating chat')
     
     const requestBody = {
       chat: {
@@ -250,28 +374,40 @@ export class ZaiAdapter {
       },
     }
     
-    const response = await axios.post(
-      `${ZAI_API_BASE}/api/v1/chats/new`,
-      requestBody,
-      {
-        headers: {
-          Authorization: `Bearer ${token}`,
-          'Content-Type': 'application/json',
-          ...FAKE_HEADERS,
-          'Cookie': `token=${token}`,
-          Referer: `${ZAI_API_BASE}/`,
-        },
-        timeout: 15000,
-        validateStatus: () => true,
-      }
-    )
-
-    if (response.status !== 200 && response.status !== 201) {
-      console.error('[Z.ai] Create chat response:', response.status, response.data)
-      throw new Error(`Failed to create chat: HTTP ${response.status}`)
+    let response: AxiosResponse
+    try {
+      response = await axios.post(
+        `${ZAI_API_BASE}/api/v1/chats/new`,
+        requestBody,
+        {
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json',
+            ...FAKE_HEADERS,
+            'Cookie': `token=${token}`,
+            Referer: `${ZAI_API_BASE}/`,
+          },
+          timeout: 15000,
+          maxRedirects: 0,
+          validateStatus: () => true,
+        }
+      )
+    } catch {
+      // Axios errors can embed headers, cookies or a URL containing the token.
+      // The upstream effect may have happened; never automatically resend it.
+      throw new ZaiProxyFailure('chat-creation', 'Z.ai chat creation outcome unknown; no automatic retry')
     }
 
-    console.log('[Z.ai] Chat created:', response.data.id)
+    if (response.status !== 200 && response.status !== 201) {
+      console.error('[Z.ai] Create chat response')
+      throw new ZaiProxyFailure('chat-creation', 'Failed to create chat: upstream rejected; no automatic retry', response.status)
+    }
+    if (!response.data || typeof response.data.id !== 'string' || !response.data.id ||
+        response.data.id.length > 256) {
+      throw new ZaiProxyFailure('chat-creation', 'Z.ai chat creation response was invalid; no automatic retry')
+    }
+
+    console.log('[Z.ai] Chat created')
     return { chatId: response.data.id, messageId }
   }
 
@@ -288,14 +424,15 @@ export class ZaiAdapter {
             Referer: `${ZAI_API_BASE}/`,
           },
           timeout: 15000,
+          maxRedirects: 0,
           validateStatus: () => true,
         }
       )
 
-      console.log('[Z.ai] Chat deleted:', chatId, 'Status:', response.status)
+      console.log('[Z.ai] Chat deleted')
       return response.status === 200 || response.status === 204
     } catch (error) {
-      console.error('[Z.ai] Failed to delete chat:', error)
+      console.error('[Z.ai] Failed to delete chat')
       return false
     }
   }
@@ -315,21 +452,22 @@ export class ZaiAdapter {
             Referer: `${ZAI_API_BASE}/`,
           },
           timeout: 30000,
+          maxRedirects: 0,
           validateStatus: () => true,
         }
       )
 
-      console.log('[Z.ai] Delete all chats response:', response.status, response.data)
+      console.log('[Z.ai] Delete all chats response')
       
       if (response.status === 200 && response.data === true) {
         console.log('[Z.ai] All chats deleted successfully')
         return true
       }
       
-      console.warn('[Z.ai] Delete all chats failed:', response.status, response.data)
+      console.warn('[Z.ai] Delete all chats failed')
       return false
     } catch (error) {
-      console.error('[Z.ai] Failed to delete all chats:', error)
+      console.error('[Z.ai] Failed to delete all chats')
       return false
     }
   }
@@ -338,7 +476,7 @@ export class ZaiAdapter {
     const token = await this.ensureToken()
     const userId = this.extractUserIDFromToken(token)
     
-    console.log('[Z.ai] chatCompletion called with request.model:', request.model)
+    console.log('[Z.ai] Chat completion requested')
     
     // Z.ai API requires specific model name casing:
     // - GLM-5.1 and GLM-5-Turbo keep uppercase
@@ -360,46 +498,61 @@ export class ZaiAdapter {
     }
     const mappedModel = modelMapping[request.model] || modelMapping[request.model.toLowerCase()] || request.model
     
-    console.log('[Z.ai] Original model:', request.model, '-> Mapped model:', mappedModel)
+    console.log('[Z.ai] Model mapping resolved')
     
-    // Extract system message and merge with user message
-    let systemContent = ''
-    let processedMessages = []
-    
-    for (const msg of request.messages) {
-      if (msg.role === 'system') {
-        systemContent += (systemContent ? '\n\n' : '') + (typeof msg.content === 'string' ? msg.content : '')
+    const rejectMessages = (): never => {
+      throw new ZaiProxyFailure('chat-creation', 'Z.ai request messages are not supported')
+    }
+    const isMessageRecord = (value: unknown): value is Record<string, unknown> =>
+      value !== null && typeof value === 'object' && !Array.isArray(value)
+    const readText = (content: unknown): string => {
+      if (typeof content === 'string') return content
+      if (!Array.isArray(content) || content.length === 0) return rejectMessages()
+      return content.map(part => {
+        if (!isMessageRecord(part) || part.type !== 'text' || typeof part.text !== 'string' ||
+            Object.keys(part).some(key => key !== 'type' && key !== 'text')) return rejectMessages()
+        return part.text
+      }).join('')
+    }
+
+    // Preserve the existing user/assistant message list and its order. The
+    // established system framing can represent only a leading system prefix;
+    // unsupported content must fail before either state-changing POST.
+    const messages: unknown = request.messages
+    if (!Array.isArray(messages) || messages.length === 0) return rejectMessages()
+    const systemMessages: string[] = []
+    const processedMessages: Array<{ role: 'user' | 'assistant'; content: string }> = []
+    for (const msg of messages) {
+      if (!isMessageRecord(msg) ||
+          Object.keys(msg).some(key => key !== 'role' && key !== 'content')) return rejectMessages()
+      const content = readText(msg.content)
+      if (msg.role === 'system' && processedMessages.length === 0) {
+        systemMessages.push(content)
+      } else if (msg.role === 'user' || msg.role === 'assistant') {
+        processedMessages.push({ role: msg.role, content })
       } else {
-        processedMessages.push(msg)
+        return rejectMessages()
       }
     }
-    
-    // If system prompt exists, prepend it to the first user message
-    if (systemContent && processedMessages.length > 0) {
-      const firstUserIdx = processedMessages.findIndex(m => m.role === 'user')
-      if (firstUserIdx !== -1) {
-        const firstUserMsg = processedMessages[firstUserIdx]
-        const originalContent = typeof firstUserMsg.content === 'string' 
-          ? firstUserMsg.content 
-          : (Array.isArray(firstUserMsg.content) 
-              ? firstUserMsg.content.find((p: any) => p.type === 'text')?.text || '' 
-              : '')
-        
-        processedMessages[firstUserIdx] = {
-          ...firstUserMsg,
-          content: `${systemContent}\n\nUser: ${originalContent}`
-        }
+    if (!processedMessages.some(msg => msg.role === 'user') ||
+        (systemMessages.length > 0 && processedMessages[0].role !== 'user')) return rejectMessages()
+
+    const systemContent = systemMessages.join('\n\n')
+    if (systemContent) {
+      processedMessages[0] = {
+        ...processedMessages[0],
+        content: `${systemContent}\n\nUser: ${processedMessages[0].content}`,
       }
     }
     
     const signaturePrompt = this.extractLastUserMessage(processedMessages)
     
     // Always create a new chat (single-turn mode only)
-    const chatResult = await this.createChat(mappedModel, signaturePrompt)
+    const chatResult = await this.createChatWithVerifiedToken(mappedModel, signaturePrompt, token)
     const chatId = chatResult.chatId
     const messageId = chatResult.messageId
     const parentMessageId = null
-    console.log('[Z.ai] Created new chat:', chatId)
+    console.log('[Z.ai] Created new chat')
     
     const requestId = uuid()
     const timestamp = Date.now()
@@ -411,18 +564,12 @@ export class ZaiAdapter {
     const modelForDetection = request.originalModel || request.model
     const modelLower = modelForDetection.toLowerCase()
     
-    let enableThinking = request.reasoning_effort === false ? false : true
-    let enableWebSearch = !!request.web_search
-    
-    // Auto-enable based on model name (if not explicitly set)
-    if (!enableThinking && (modelLower.includes('think') || modelLower.includes('r1'))) {
-      enableThinking = true
-      console.log('[Z.ai] Thinking mode enabled (from model name)')
-    }
-    if (!enableWebSearch && modelLower.includes('search')) {
-      enableWebSearch = true
-      console.log('[Z.ai] Web search enabled (from model name)')
-    }
+    // Missing reasoning retains the existing enabled default. Only a missing
+    // search option may use its alias; explicit false must stay false.
+    const enableThinking = request.reasoning_effort === undefined
+      ? true : request.reasoning_effort !== false
+    const enableWebSearch = request.web_search === undefined
+      ? modelLower.includes('search') : !!request.web_search
 
     // Z.ai API uses auto_web_search for web search feature
     // web_search should always be false, use auto_web_search instead
@@ -439,7 +586,12 @@ export class ZaiAdapter {
     }
 
     const requestBody: Record<string, any> = {
-      stream: request.stream !== false,
+      // The consumer-web endpoint produces SSE. We always request upstream
+      // SSE, then transform it into the caller's requested OpenAI response
+      // type in forwardZai: non-stream callers get JSON only after a genuine
+      // assistant answer and upstream done marker. Sending stream:false here
+      // while parsing response.data as SSE rejects valid JSON with HTTP 502.
+      stream: true,
       model: mappedModel,
       messages: processedMessages,
       signature_prompt: signaturePrompt,
@@ -460,9 +612,12 @@ export class ZaiAdapter {
       id: requestId,
       current_user_message_id: messageId,
       current_user_message_parent_id: parentMessageId,
+      // Proxy calls are not equivalent to an interactive web UI session.
+      // Suppress optional background generation so one request does not ask
+      // Z.ai to do additional title/tag work without the caller requesting it.
       background_tasks: {
-        title_generation: true,
-        tags_generation: true,
+        title_generation: false,
+        tags_generation: false,
       },
     }
 
@@ -472,10 +627,10 @@ export class ZaiAdapter {
     }
 
     console.log('[Z.ai] Sending chat request...')
-    console.log('[Z.ai] Model:', request.model)
-    console.log('[Z.ai] ChatId:', chatId)
-    console.log('[Z.ai] MessageId (current_user_message_id):', messageId)
-    console.log('[Z.ai] ParentMessageId:', parentMessageId || '(none)')
+    console.log('[Z.ai] Model selected')
+    console.log('[Z.ai] Chat identifier prepared')
+    console.log('[Z.ai] Message identifier prepared')
+    console.log('[Z.ai] Parent message context prepared')
 
     const queryParams = new URLSearchParams({
       timestamp: String(timestamp),
@@ -517,52 +672,57 @@ export class ZaiAdapter {
       signature_timestamp: String(timestamp),
     })
 
-    const response = await axios.post(
-      `${ZAI_API_BASE}/api/v2/chat/completions?${queryParams.toString()}`,
-      requestBody,
-      {
-        headers: {
-          Authorization: `Bearer ${token}`,
-          'Content-Type': 'application/json',
-          ...FAKE_HEADERS,
-          'X-Signature': signature,
-          'X-FE-Version': X_FE_VERSION,
-          'Cookie': `token=${token}`,
-          Referer: `${ZAI_API_BASE}/c/${chatId}`,
-          Priority: 'u=1, i',
-        },
-        responseType: 'stream',
-        timeout: 120000,
-        validateStatus: () => true,
-      }
-    )
+    let response: AxiosResponse
+    try {
+      response = await axios.post(
+        `${ZAI_API_BASE}/api/v2/chat/completions?${queryParams.toString()}`,
+        requestBody,
+        {
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json',
+            ...FAKE_HEADERS,
+            'X-Signature': signature,
+            'X-FE-Version': X_FE_VERSION,
+            'Cookie': `token=${token}`,
+            Referer: `${ZAI_API_BASE}/c/${chatId}`,
+            Priority: 'u=1, i',
+          },
+          responseType: 'stream',
+          timeout: 120000,
+          maxRedirects: 0,
+          validateStatus: () => true,
+        }
+      )
+    } catch {
+      // The URL carries a token, so never forward the raw Axios exception.
+      // A timeout/ACK loss also makes the completion effect indeterminate.
+      throw new ZaiProxyFailure('chat-completion', 'Z.ai chat completion outcome unknown; no automatic retry')
+    }
 
-    console.log('[Z.ai] Response status:', response.status)
+    console.log('[Z.ai] Response received')
     if (response.status !== 200) {
-      console.log('[Z.ai] Request body:', JSON.stringify(requestBody, null, 2))
-      console.log('[Z.ai] Signature:', signature)
-      console.log('[Z.ai] Timestamp:', timestamp)
-      console.log('[Z.ai] RequestId:', requestId)
-      console.log('[Z.ai] UserId:', userId)
-      if (response.data && typeof response.data.on === 'function') {
-        const chunks: Buffer[] = []
-        response.data.on('data', (chunk: Buffer) => chunks.push(chunk))
-        await new Promise<void>((resolve) => {
-          response.data.on('end', () => resolve())
-          response.data.on('error', () => resolve())
-        })
-        const errorBody = Buffer.concat(chunks).toString('utf8')
-        console.log('[Z.ai] Error response body:', errorBody)
-      } else if (response.data) {
-        console.log('[Z.ai] Error response data:', JSON.stringify(response.data, null, 2))
-      }
+      console.log('[Z.ai] Chat request failed')
+      // A failed streaming request may never reach 'end'. Never hold the
+      // connection open or collect an unbounded untrusted error body. Keep
+      // only the upstream HTTP status for the caller's fail-closed result.
+      if (response.data && typeof response.data.destroy === 'function') response.data.destroy()
     }
 
     return { response, chatId, requestId }
   }
 
   static isZaiProvider(provider: Provider): boolean {
-    return provider.id === 'zai' || provider.apiEndpoint.includes('z.ai') || provider.apiEndpoint.includes('chat.z.ai')
+    if (provider.id === 'zai') return true
+    // A substring match can misroute an unrelated custom provider (and its
+    // credentials) to the fixed Z.ai web origin. Only the exact first-party
+    // chat origin qualifies as an alias; never accept a lookalike hostname.
+    try {
+      const url = new URL(provider.apiEndpoint)
+      return url.origin === ZAI_API_BASE && !url.username && !url.password
+    } catch {
+      return false
+    }
   }
 }
 
@@ -581,7 +741,8 @@ export class ZaiStreamHandler {
   private citationBuffer: { value: string } = { value: '' }
   private thinkingCitationBuffer: { value: string } = { value: '' }
 
-  constructor(model: string, onEnd?: (chatId: string) => void) {
+  constructor(model: string, onEnd?: (chatId: string) => void,
+    private readonly allowLegacyToolCalls: boolean = true) {
     this.model = model
     this.created = Math.floor(Date.now() / 1000)
     this.onEnd = onEnd
@@ -601,6 +762,16 @@ export class ZaiStreamHandler {
     
     const toolCalls = parseToolUse(this.content)
     if (toolCalls && toolCalls.length > 0) {
+      // Validate the complete representation before writing any tool delta or
+      // triggering cleanup. An empty legacy <arguments> block would otherwise
+      // produce an invalid OpenAI tool call followed by a fake normal DONE.
+      if (toolCalls.length > 128 || !toolCalls.every(call =>
+        call.type === 'function' && typeof call.id === 'string' && !!call.id.trim() &&
+        call.id.length <= 256 && typeof call.function?.name === 'string' &&
+        !!call.function.name.trim() && call.function.name.length <= 256 &&
+        typeof call.function.arguments === 'string' && !!call.function.arguments.trim() &&
+        (() => { try { JSON.parse(call.function.arguments); return true } catch { return false } })()
+      )) throw new Error('Z.ai legacy tool call completion was not valid')
       this.toolCallsSent = true
       
       // Send tool_calls delta
@@ -638,7 +809,6 @@ export class ZaiStreamHandler {
           model: this.model,
           object: 'chat.completion.chunk',
           choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }],
-          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
           created: this.created,
         })}\n\n`
       )
@@ -647,7 +817,7 @@ export class ZaiStreamHandler {
         try {
           this.onEnd(this.chatId)
         } catch (e) {
-          console.error('[Z.ai] onEnd callback error:', e)
+          console.error('[Z.ai] onEnd callback error')
         }
       }
     }
@@ -655,160 +825,103 @@ export class ZaiStreamHandler {
 
   async handleStream(stream: any): Promise<PassThrough> {
     const transStream = new PassThrough()
-
-    console.log('[Z.ai] Starting stream handler...')
-    
-    let streamEnded = false
-
-    const safeEnd = (data?: string) => {
-      if (streamEnded) return
-      streamEnded = true
-      if (data) {
-        transStream.end(data)
-      } else {
-        transStream.end()
+    let emittedSuccessfulTerminal = false
+    transStream.once('close', () => {
+      // The common gate destroys this intermediate stream, not response.data.
+      // Cancel a still-unconfirmed original body without claiming remote abort.
+      if (!emittedSuccessfulTerminal) {
+        try { if (typeof stream?.destroy === 'function' && !stream.destroyed) stream.destroy() } catch { /* local only */ }
       }
+    })
+    console.log('[Z.ai] Starting stream handler...')
+
+    // The upstream may edit or replace already emitted answer text. OpenAI
+    // SSE has no equivalent rollback operation. Therefore defer downstream
+    // content until the same strict upstream terminal check used by the
+    // non-stream adapter has assembled the final assistant answer.
+    // This preserves OpenAI-compatible SSE framing without inventing a
+    // successful completion on an upstream transport error or premature EOF.
+    const emit = (choice: Record<string, unknown>, usage?: unknown) => {
+      if (transStream.destroyed || transStream.writableEnded) return
+      transStream.write(`data: ${JSON.stringify({
+        id: this.chatId,
+        model: this.model,
+        object: 'chat.completion.chunk',
+        choices: [choice],
+        created: this.created,
+        ...(usage ? { usage } : {}),
+      })}\n\n`)
     }
 
-    const parser = createParser({
-      onEvent: (event: any) => {
+    const fail = (providerError: boolean) => {
+      if (transStream.destroyed || transStream.writableEnded) return
+      // The original upstream exception may include URL query credentials.
+      // Emit one fixed, content-free diagnostic rather than going silent.
+      console.error('[Z.ai] Stream failed')
+      transStream.write(`data: ${JSON.stringify({
+        error: {
+          message: providerError
+            ? 'Z.ai upstream returned a model error'
+            : 'Z.ai upstream stream did not complete',
+          type: 'api_error',
+        },
+      })}\n\n`)
+      // An error event MUST NOT be followed by the normal [DONE] sentinel.
+      transStream.end()
+    }
+
+    void this.handleNonStream(stream).then(result => {
+      if (transStream.destroyed || transStream.writableEnded) return
+      const answer = result?.choices?.[0]?.message?.content
+      if (typeof answer !== 'string' || !answer.trim()) {
+        fail(false)
+        return
+      }
+      this.content = answer
+
+      // Preserve explicit tool-call output support without emitting partial
+      // tool arguments or triggering an independent model/tool request.
+      // An upstream length finish means the answer was truncated. An XML-like
+      // fragment must never be promoted to a completed tool call after EOF.
+      if (this.allowLegacyToolCalls && result.choices[0].finish_reason !== 'length') {
+        this.sendToolCalls(transStream)
+      }
+      if (this.toolCallsSent) {
+        emittedSuccessfulTerminal = true
+        return
+      }
+
+      const reasoning = result?.choices?.[0]?.message?.reasoning_content
+      if (typeof reasoning === 'string' && reasoning) {
+        emit({ index: 0, delta: { role: 'assistant', reasoning_content: reasoning }, finish_reason: null })
+      }
+      emit({ index: 0, delta: { role: 'assistant', content: answer }, finish_reason: null })
+      emit({ index: 0, delta: {}, finish_reason: result.choices[0].finish_reason }, result?.usage)
+      emittedSuccessfulTerminal = true
+      transStream.end('data: [DONE]\n\n')
+      if (this.onEnd && this.chatId) {
         try {
-          if (event.data === '[DONE]') return
-
-          const data = JSON.parse(event.data)
-          
-          if (data.type !== 'chat:completion') return
-          
-          const result = data.data
-          if (!result) return
-
-          // Extract message ID from response for multi-turn support
-          if (result.id && result.role === 'assistant' && !this.lastMessageId) {
-            this.lastMessageId = result.id
-            console.log('[Z.ai] Extracted assistant message id:', this.lastMessageId)
-          }
-
-          if (result.phase === 'thinking' && result.delta_content) {
-            const cleanedContent = cleanSearchCitationsWithBuffer(result.delta_content, this.thinkingCitationBuffer)
-            if (!cleanedContent) return
-            // Output thinking content as reasoning_content
-            if (!this.sentThinkingRole) {
-              transStream.write(
-                `data: ${JSON.stringify({
-                  id: this.chatId,
-                  model: this.model,
-                  object: 'chat.completion.chunk',
-                  choices: [{ index: 0, delta: { role: 'assistant', reasoning_content: '' }, finish_reason: null }],
-                  created: this.created,
-                })}\n\n`
-              )
-              this.sentThinkingRole = true
-            }
-            transStream.write(
-              `data: ${JSON.stringify({
-                id: this.chatId,
-                model: this.model,
-                object: 'chat.completion.chunk',
-                choices: [{ index: 0, delta: { reasoning_content: cleanedContent }, finish_reason: null }],
-                created: this.created,
-              })}\n\n`
-            )
-          } else if (result.phase === 'answer' && result.delta_content) {
-            const cleanedContent = cleanSearchCitationsWithBuffer(result.delta_content, this.citationBuffer)
-            if (!cleanedContent) return
-            this.content += cleanedContent
-            
-            // Process tool call interception
-            const baseChunk = createBaseChunk(this.chatId, this.model, this.created)
-            const { chunks: outputChunks } = processStreamContent(
-              cleanedContent, 
-              this.toolCallState, 
-              baseChunk, 
-              !this.sentRole && !this.sentThinkingRole,
-              'zai'
-            )
-
-            for (const outChunk of outputChunks) {
-              transStream.write(`data: ${JSON.stringify(outChunk)}\n\n`)
-            }
-
-            if (outputChunks.length > 0) this.sentRole = true
-          } else if (result.phase === 'done' && result.done) {
-            console.log('[Z.ai] Stream finished, content length:', this.content.length)
-            
-            // Flush any remaining tool calls
-            const baseChunk = createBaseChunk(this.chatId, this.model, this.created)
-            const flushChunks = flushToolCallBuffer(this.toolCallState, baseChunk, 'zai')
-            
-            for (const outChunk of flushChunks) {
-              transStream.write(`data: ${JSON.stringify(outChunk)}\n\n`)
-            }
-            
-            // Check if we emitted tool calls
-            const finishReason = this.toolCallState.hasEmittedToolCall ? 'tool_calls' : 'stop'
-            
-            const usage = result.usage || { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 }
-            
-            transStream.write(
-              `data: ${JSON.stringify({
-                id: this.chatId,
-                model: this.model,
-                object: 'chat.completion.chunk',
-                choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
-                usage,
-                created: this.created,
-              })}\n\n`
-            )
-            safeEnd('data: [DONE]\n\n')
-            if (this.onEnd) {
-              try {
-                this.onEnd(this.chatId)
-              } catch (e) {
-                console.error('[Z.ai] onEnd callback error:', e)
-              }
-            }
-          } else if (result.error || data.error) {
-            const error = result.error || data.error
-            console.error('[Z.ai] Stream error:', error)
-            transStream.write(
-              `data: ${JSON.stringify({
-                id: this.chatId,
-                model: this.model,
-                object: 'chat.completion.chunk',
-                choices: [{ index: 0, delta: { content: `\nError: ${error.detail || JSON.stringify(error)}` }, finish_reason: 'stop' }],
-                created: this.created,
-              })}\n\n`
-            )
-            safeEnd('data: [DONE]\n\n')
-          }
-        } catch (err) {
-          console.error('[Z.ai] Stream parse error:', err)
+          this.onEnd(this.chatId)
+        } catch {
+          console.error('[Z.ai] onEnd callback error')
         }
-      },
-    })
-
-    stream.on('data', (buffer: Buffer) => {
-      if (streamEnded) return
-      parser.feed(buffer.toString())
-    })
-    stream.once('error', (err: Error) => {
-      console.error('[Z.ai] Stream error:', err)
-      safeEnd('data: [DONE]\n\n')
-    })
-    stream.once('close', () => {
-      console.log('[Z.ai] Stream closed')
-      safeEnd('data: [DONE]\n\n')
+      }
+    }).catch((error: unknown) => {
+      // Compare against a fixed in-module message only, never reveal the
+      // exception, response body, URL, cookie or authorization header.
+      const knownModelError = !!error && typeof error === 'object' &&
+        (error as { message?: unknown }).message === 'Z.ai upstream returned a model error'
+      fail(knownModelError)
     })
 
     return transStream
   }
-
   async handleNonStream(response: any): Promise<any> {
     console.log('[Z.ai] Starting non-stream handler...')
     
     return new Promise((resolve, reject) => {
       const data = {
-        id: '',
+        id: this.chatId,
         model: this.model,
         object: 'chat.completion',
         choices: [
@@ -818,15 +931,25 @@ export class ZaiStreamHandler {
             finish_reason: 'stop',
           },
         ],
-        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
         created: this.created,
+        // Optional usage is populated only if actually reported upstream.
+        ...({} as { usage?: unknown }),
       }
 
       let resolved = false
       let reasoningContent = ''
+      let deadline: ReturnType<typeof setTimeout> | null = null
       const resolveOnce = (result: any) => {
         if (resolved) return
+        // A transport close, HTTP 200, synthetic usage, or a default
+        // finish_reason must not masquerade as a completed model answer.
+        if (typeof result?.choices?.[0]?.message?.content !== 'string' ||
+            !result.choices[0].message.content.trim()) {
+          rejectOnce(new Error('Z.ai completed without a usable assistant answer'))
+          return
+        }
         resolved = true
+        if (deadline) clearTimeout(deadline)
         if (reasoningContent) {
           result.choices[0].message.reasoning_content = reasoningContent
         }
@@ -836,13 +959,17 @@ export class ZaiStreamHandler {
       const rejectOnce = (err: Error) => {
         if (resolved) return
         resolved = true
+        if (deadline) clearTimeout(deadline)
         reject(err)
+        // No retry or DELETE follows a parse failure. Reclaim only the local
+        // unread upstream transport, preserving remote-effect UNKNOWN.
+        try { if (typeof response?.destroy === 'function' && !response.destroyed) response.destroy() } catch { /* local only */ }
       }
 
-      setTimeout(() => {
+      deadline = setTimeout(() => {
         if (!resolved) {
-          console.log('[Z.ai] Non-stream timeout, resolving with current data, content length:', data.choices[0].message.content.length)
-          resolveOnce(data)
+          console.log('[Z.ai] Non-stream response timeout')
+          rejectOnce(new Error('Z.ai upstream completion timed out; outcome unconfirmed'))
         }
       }, 60000)
 
@@ -850,104 +977,231 @@ export class ZaiStreamHandler {
       const streamData = response
 
       // Check if streamData is a stream or JSON
-      console.log('[Z.ai] Non-stream: streamData type:', typeof streamData)
-      console.log('[Z.ai] Non-stream: streamData.on type:', typeof streamData?.on)
-      console.log('[Z.ai] Non-stream: streamData is function?', typeof streamData?.on === 'function')
-      if (streamData && typeof streamData.on === 'function') {
+      console.log('[Z.ai] Inspecting non-stream response')
+      console.log('[Z.ai] Inspecting non-stream transport')
+      console.log('[Z.ai] Selecting non-stream response handler')
+      if (typeof streamData === 'string' || (streamData && typeof streamData.on === 'function')) {
         console.log('[Z.ai] Non-stream: taking stream path')
-        // Stream response - use buffers for citation cleaning
-        const thinkingBuffer = { value: '' }
-        const answerBuffer = { value: '' }
+        // Assemble the complete upstream text before projecting it to JSON.
+        // Keeping raw text until done correctly handles edit_content and
+        // content replacement events, including UTF-16 edit offsets.
+        let rawThinking = ''
+        let rawAnswer = ''
+        let sawTerminal = false
+        let sawSentinel = false
+        let finishReason: 'stop' | 'length' | 'tool_calls' = 'stop'
+        let pendingFrame = ''
+        const MAX_FRAME_CHARS = 1_048_576
+        // A UTF-8 code point can span several transport buffers. Fatal decoding
+        // also prevents corrupt bytes from becoming a seemingly valid answer.
+        const decoder = new TextDecoder('utf-8', { fatal: true })
+        const invalidCompletion = () => {
+          console.error('[Z.ai] Non-stream parse error')
+          rejectOnce(new Error('Z.ai upstream response is not valid completion data'))
+        }
+        const isRecord = (value: unknown): value is Record<string, any> =>
+          value !== null && typeof value === 'object' && !Array.isArray(value)
+        const complete = () => {
+          data.choices[0].message.content = cleanSearchCitations(rawAnswer)
+          data.choices[0].finish_reason = finishReason
+          reasoningContent = cleanSearchCitations(rawThinking)
+          resolveOnce(data)
+        }
         const parser = createParser({
+          onError: () => invalidCompletion(),
           onEvent: (event: any) => {
+            // A provider terminal is provisional. The stream may still deliver
+            // a model error, malformed frame or invalid UTF-8 before clean EOF.
+            if (resolved) return
             try {
-              if (event.data === '[DONE]') return
+              if (event.event === 'error') {
+                rejectOnce(new Error('Z.ai upstream returned a model error'))
+                return
+              }
+              if (sawTerminal) {
+                // Some versions emit native done/finish followed by [DONE].
+                // Neither that marker nor any other event proves clean EOF.
+                if (event.data === '[DONE]' && !sawSentinel) {
+                  sawSentinel = true
+                  return
+                }
+                invalidCompletion()
+                return
+              }
+              if (event.data === '[DONE]') {
+                sawTerminal = true
+                sawSentinel = true
+                return
+              }
 
               const eventData = JSON.parse(event.data)
-              
-              if (eventData.type !== 'chat:completion') return
-              
-              const result = eventData.data
-              if (!result) return
+              if (!isRecord(eventData)) {
+                invalidCompletion()
+                return
+              }
+              if (eventData.error != null || (isRecord(eventData.data) && eventData.data.error != null)) {
+                rejectOnce(new Error('Z.ai upstream returned a model error'))
+                return
+              }
 
-              if (result.phase === 'thinking' && result.delta_content) {
-                reasoningContent += cleanSearchCitationsWithBuffer(result.delta_content, thinkingBuffer)
-              } else if (result.phase === 'answer' && result.delta_content) {
-                data.choices[0].message.content += cleanSearchCitationsWithBuffer(result.delta_content, answerBuffer)
-              } else if (result.phase === 'done' && result.done) {
-                console.log('[Z.ai] Non-stream finished, content length:', data.choices[0].message.content.length)
+              // Keep the two existing completion envelopes, but never promote
+              // unrelated data, primitives or a user/system role to an answer.
+              const result = eventData.type === 'chat:completion' ? eventData.data
+                : eventData.type === undefined && Array.isArray(eventData.choices) ? eventData : null
+              if (!isRecord(result) ||
+                  (result.role !== undefined && result.role !== 'assistant') ||
+                  (result.phase !== undefined && typeof result.phase !== 'string') ||
+                  (result.done !== undefined && typeof result.done !== 'boolean')) {
+                invalidCompletion()
+                return
+              }
+              for (const field of ['content', 'delta_content', 'edit_content']) {
+                if (result[field] !== undefined && typeof result[field] !== 'string') {
+                  invalidCompletion()
+                  return
+                }
+              }
+              if (result.edit_index !== undefined && typeof result.edit_content !== 'string') {
+                invalidCompletion()
+                return
+              }
+              if (result.choices !== undefined) {
+                const choice = Array.isArray(result.choices) && result.choices.length === 1
+                  ? result.choices[0] : null
+                if (!isRecord(choice) || choice.error != null ||
+                    (choice.index !== undefined && choice.index !== 0) ||
+                    (choice.finish_reason != null && !['stop', 'length', 'tool_calls'].includes(choice.finish_reason))) {
+                  invalidCompletion()
+                  return
+                }
+                for (const field of ['delta', 'message']) {
+                  const message = choice[field]
+                  if (message !== undefined && (!isRecord(message) || message.error != null ||
+                      (message.role !== undefined && message.role !== 'assistant') ||
+                      (message.content != null && typeof message.content !== 'string'))) {
+                    invalidCompletion()
+                    return
+                  }
+                }
+              }
+
+              const openAiFinished = result.phase === undefined &&
+                ['stop', 'length', 'tool_calls'].includes(result.choices?.[0]?.finish_reason)
+              if ((result.phase === 'done' && result.done === true) || openAiFinished) {
+                const finalAnswer = applyZaiTextUpdate(rawAnswer, result)
+                if (finalAnswer !== null) rawAnswer = finalAnswer
                 if (result.usage) {
                   data.usage = result.usage
                 }
-                resolveOnce(data)
-              } else if (result.error || eventData.error) {
-                const error = result.error || eventData.error
-                data.choices[0].message.content += `\nError: ${error.detail || JSON.stringify(error)}`
-                resolveOnce(data)
+                if (openAiFinished) {
+                  finishReason = result.choices[0].finish_reason
+                }
+                sawTerminal = true
+              } else if (result.phase === 'thinking') {
+                const next = applyZaiTextUpdate(rawThinking, result)
+                if (next !== null) rawThinking = next
+              } else if (result.phase === 'answer' || result.phase === undefined) {
+                const next = applyZaiTextUpdate(rawAnswer, result)
+                if (next !== null) rawAnswer = next
               }
-            } catch (err) {
-              console.error('[Z.ai] Non-stream parse error:', err)
-              rejectOnce(err instanceof Error ? err : new Error(String(err)))
+            } catch {
+              invalidCompletion()
             }
           },
         })
 
-        streamData.on('data', (buffer: Buffer) => parser.feed(buffer.toString()))
-        streamData.once('error', rejectOnce)
-        streamData.once('close', () => {
-          console.log('[Z.ai] Non-stream closed, resolving with current data, content length:', data.choices[0].message.content.length)
-          resolveOnce(data)
-        })
+        const feed = (chunk: unknown) => {
+          if (resolved) return
+          try {
+            if (typeof chunk !== 'string' && !Buffer.isBuffer(chunk)) {
+              invalidCompletion()
+              return
+            }
+            const bytes = typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : chunk
+            const text = decoder.decode(bytes, { stream: true })
+            pendingFrame += text
+            // Bound individual SSE frames, not a coalesced chunk of frames.
+            while (!resolved) {
+              const separator = /\r?\n\r?\n/.exec(pendingFrame)
+              if (!separator) break
+              if (separator.index > MAX_FRAME_CHARS) {
+                invalidCompletion()
+                return
+              }
+              pendingFrame = pendingFrame.slice(separator.index + separator[0].length)
+            }
+            if (pendingFrame.length > MAX_FRAME_CHARS) {
+              invalidCompletion()
+              return
+            }
+            parser.feed(text)
+          } catch {
+            invalidCompletion()
+          }
+        }
+        const end = () => {
+          if (resolved) return
+          try {
+            const tail = decoder.decode()
+            if (tail) {
+              pendingFrame += tail
+              parser.feed(tail)
+            }
+          } catch {
+            invalidCompletion()
+            return
+          }
+          // Neither a partial SSE event nor a dangling UTF-8 sequence may be
+          // silently discarded merely because an earlier DONE was received.
+          if (pendingFrame || !sawTerminal) {
+            rejectOnce(new Error('Z.ai transport ended before upstream completion; outcome unconfirmed'))
+            return
+          }
+          complete()
+        }
+
+        if (typeof streamData === 'string') {
+          // A buffered SSE body uses exactly the same envelope/terminal checks.
+          feed(streamData)
+          end()
+        } else {
+          streamData.on('data', feed)
+          streamData.once('end', end)
+          streamData.once('error', () => rejectOnce(new Error('Z.ai upstream stream failed')))
+          streamData.once('close', () => {
+            rejectOnce(new Error('Z.ai transport closed before upstream completion; outcome unconfirmed'))
+          })
+        }
       } else if (streamData) {
         // JSON response - parse directly
         try {
-          // Handle SSE format in JSON response
-          if (typeof streamData === 'string') {
-            let content = ''
-            let reasoning = ''
-            const thinkingBuffer = { value: '' }
-            const answerBuffer = { value: '' }
-            const lines = streamData.split('\n')
-            for (const line of lines) {
-              if (line.startsWith('data:')) {
-                const jsonStr = line.substring(5).trim()
-                if (jsonStr === '[DONE]') continue
-                try {
-                  const event = JSON.parse(jsonStr)
-                  if (event.type === 'chat:completion' && event.data) {
-                    if (event.data.phase === 'thinking' && event.data.delta_content) {
-                      reasoning += cleanSearchCitationsWithBuffer(event.data.delta_content, thinkingBuffer)
-                    } else if (event.data.phase === 'answer' && event.data.delta_content) {
-                      content += cleanSearchCitationsWithBuffer(event.data.delta_content, answerBuffer)
-                    } else if (event.data.phase === 'done' && event.data.done) {
-                      if (event.data.usage) {
-                        data.usage = event.data.usage
-                      }
-                    }
-                  }
-                } catch (e) {
-                  // Ignore parse errors for individual lines
-                }
-              }
-            }
-            data.choices[0].message.content = content
-            if (reasoning) {
-              data.choices[0].message.reasoning_content = reasoning
-            }
-          } else {
-            // Direct JSON object
-            data.choices[0].message.content = streamData.choices?.[0]?.message?.content || ''
+          const choice = Array.isArray(streamData.choices) && streamData.choices.length === 1
+            ? streamData.choices[0] : null
+          if (typeof streamData !== 'object' || Array.isArray(streamData) ||
+              streamData.error !== undefined ||
+              !choice || typeof choice !== 'object' || Array.isArray(choice) ||
+              !['stop', 'length'].includes(choice.finish_reason) ||
+              choice.error !== undefined ||
+              !choice.message || choice.message.role !== 'assistant' ||
+              choice.message.error !== undefined ||
+              typeof choice.message.content !== 'string' ||
+              !choice.message.content.trim()) {
+            rejectOnce(new Error('Z.ai upstream response is not valid completion data'))
+            return
           }
-          
-          console.log('[Z.ai] Non-stream JSON finished, content length:', data.choices[0].message.content.length)
+          data.choices[0].message.content = choice.message.content
+          data.choices[0].finish_reason = choice.finish_reason
+          if (streamData.usage && typeof streamData.usage === 'object' &&
+              !Array.isArray(streamData.usage)) data.usage = streamData.usage
+          console.log('[Z.ai] Non-stream JSON response finished')
           resolveOnce(data)
         } catch (err) {
-          console.error('[Z.ai] Non-stream JSON parse error:', err)
-          rejectOnce(err instanceof Error ? err : new Error(String(err)))
+          console.error('[Z.ai] Non-stream JSON parse error')
+          rejectOnce(new Error('Z.ai upstream response is not valid completion data'))
         }
       } else {
         console.log('[Z.ai] Non-stream: streamData is falsy, taking empty path')
-        resolveOnce(data)
+        rejectOnce(new Error('Z.ai upstream returned no completion data'))
       }
     })
   }

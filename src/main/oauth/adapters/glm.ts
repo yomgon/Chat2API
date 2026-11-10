@@ -92,7 +92,7 @@ export class GLMAdapter extends BaseOAuthAdapter {
         error: 'Please log in via browser, extract Token from Developer Tools and enter manually',
       }
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Failed to open browser'
+      const errorMessage = 'Unable to open the GLM sign-in page'
       this.emitProgress('error', errorMessage)
       
       return {
@@ -121,11 +121,32 @@ export class GLMAdapter extends BaseOAuthAdapter {
           error: 'Refresh Token is invalid or expired',
         }
       }
+
+      // A malformed HTTP-200 refresh payload must not be persisted as a
+      // successful login, and must never be coerced to an authorization header.
+      if (typeof tokens.value !== 'string' || !tokens.value.trim()) {
+        return {
+          success: false,
+          providerId,
+          providerType: 'glm',
+          error: 'GLM access token is invalid',
+        }
+      }
       
       const validation = await this.validateToken({ 
         refreshToken,
         accessToken: tokens.value,
       })
+
+      if (validation.valid !== true) {
+        this.emitProgress('error', 'GLM token validation failed')
+        return {
+          success: false,
+          providerId,
+          providerType: 'glm',
+          error: 'GLM token validation failed',
+        }
+      }
       
       this.emitProgress('success', 'Token validation successful')
       
@@ -140,8 +161,10 @@ export class GLMAdapter extends BaseOAuthAdapter {
         accountInfo: validation.accountInfo,
       }
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error'
-      this.emitProgress('error', `Token validation failed: ${errorMessage}`)
+      // Axios errors can contain Authorization headers, tokens, URLs and raw
+      // upstream bodies. Neither the GUI progress nor the result may echo it.
+      const errorMessage = 'GLM token validation failed'
+      this.emitProgress('error', errorMessage)
       
       return {
         success: false,
@@ -194,7 +217,7 @@ export class GLMAdapter extends BaseOAuthAdapter {
         }
       )
       
-      console.log('[GLM OAuth] Response:', response.status, response.data)
+      console.log('[GLM OAuth] Validation response received')
       
       if (response.status !== 200) {
         return {
@@ -227,7 +250,7 @@ export class GLMAdapter extends BaseOAuthAdapter {
       }
       
       const userInfo = await this.getUserInfo(result.access_token)
-      console.log('[GLM OAuth] User info:', userInfo)
+      console.log('[GLM OAuth] User info request completed')
       
       if (userInfo) {
         const email = userInfo.email as string | undefined
@@ -282,10 +305,9 @@ export class GLMAdapter extends BaseOAuthAdapter {
         },
       }
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Validation request failed'
       return {
         valid: false,
-        error: errorMessage,
+        error: 'GLM token validation request failed',
       }
     }
   }

@@ -64,6 +64,9 @@ export interface BuiltinProviderConfig extends Provider {
   credentialFields: CredentialField[]
   tokenCheckEndpoint?: string
   tokenCheckMethod?: 'GET' | 'POST'
+  modelsApiEndpoint?: string
+  modelsApiMethod?: 'GET' | 'POST'
+  modelsApiHeaders?: Record<string, string>
 }
 
 interface ProxyAPI {
@@ -74,10 +77,9 @@ interface ProxyAPI {
 }
 
 interface StoreAPI {
-  get: <T>(key: string) => Promise<T | undefined>
-  set: <T>(key: string, value: T) => Promise<void>
-  delete: (key: string) => Promise<void>
-  clearAll: () => Promise<void>
+  clearAll: () => Promise<boolean>
+  onInitError: (callback: (error: { message: string | null }) => void) => () => void
+  retryInit: () => Promise<{ success: boolean; error?: string }>
 }
 
 interface ProvidersAPI {
@@ -180,6 +182,8 @@ interface OAuthAPI {
   } | null>
   getStatus: () => Promise<string>
   startInAppLogin: (providerId: string, providerType: ProviderVendor, timeout?: number) => Promise<OAuthResult>
+  reconnectZaiAccount: (accountId: string) => Promise<{ success: boolean; accountId?: string; reason?: string }>
+  createZaiAccount: (accountName: string) => Promise<{ success: boolean; accountId?: string; reason?: string }>
   cancelInAppLogin: () => Promise<void>
   isInAppLoginOpen: () => Promise<boolean>
   onCallback: (callback: (result: OAuthResult) => void) => () => void
@@ -479,9 +483,6 @@ interface ElectronAPI {
   contextManagement: ContextManagementAPI
   toolCalling: ToolCallingAPI
   tray: TrayAPI
-  on: (channel: string, callback: (...args: unknown[]) => void) => () => void
-  send: (channel: string, ...args: unknown[]) => void
-  invoke: (channel: string, ...args: unknown[]) => Promise<unknown>
 }
 
 declare global {

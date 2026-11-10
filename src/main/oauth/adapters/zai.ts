@@ -3,38 +3,16 @@
  * Implements Z.ai (GLM International) API protocol
  */
 
-import axios from 'axios'
 import { BaseOAuthAdapter } from './base'
+import { readZaiSessionClaims } from '../zaiSession'
 import {
   OAuthResult,
-  OAuthOptions,
   TokenValidationResult,
-  CredentialInfo,
   AdapterConfig,
   OAuthCallbackData,
 } from '../types'
 
 const ZAI_API_BASE = 'https://chat.z.ai'
-const X_FE_VERSION = 'prod-fe-1.1.37'
-const ZAI_USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36'
-
-const FAKE_HEADERS = {
-  Accept: '*/*',
-  'Accept-Encoding': 'gzip, deflate, br, zstd',
-  'Accept-Language': 'zh-CN',
-  'Cache-Control': 'no-cache',
-  Origin: ZAI_API_BASE,
-  Pragma: 'no-cache',
-  'Sec-Ch-Ua': '"Not/A)Brand";v="99", "Chromium";v="148"',
-  'Sec-Ch-Ua-Mobile': '?0',
-  'Sec-Ch-Ua-Platform': '"macOS"',
-  'Sec-Fetch-Dest': 'empty',
-  'Sec-Fetch-Mode': 'cors',
-  'Sec-Fetch-Site': 'same-origin',
-  'User-Agent': ZAI_USER_AGENT,
-  'X-FE-Version': X_FE_VERSION,
-  'X-Region': 'domestic',
-}
 
 export class ZaiAdapter extends BaseOAuthAdapter {
   constructor(config: AdapterConfig) {
@@ -48,10 +26,11 @@ export class ZaiAdapter extends BaseOAuthAdapter {
   }
 
   /**
-   * Complete authentication with manually entered token
+   * Check a manually entered token locally. This does not authenticate it
+   * against the server; account reconnect performs the first-party identity GET.
    */
   async loginWithToken(providerId: string, token: string): Promise<OAuthResult> {
-    this.emitProgress('pending', 'Validating Token...')
+    this.emitProgress('pending', 'Checking local session metadata...')
     
     try {
       const validation = await this.validateToken({ token })
@@ -65,7 +44,7 @@ export class ZaiAdapter extends BaseOAuthAdapter {
         }
       }
       
-      this.emitProgress('success', 'Token validation successful')
+      this.emitProgress('success', 'Local session metadata accepted')
       
       return {
         success: true,
@@ -73,13 +52,12 @@ export class ZaiAdapter extends BaseOAuthAdapter {
         credentials: { token },
         accountInfo: validation.accountInfo,
       }
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Validation request failed'
+    } catch {
       return {
         success: false,
         providerId,
         providerType: 'zai',
-        error: errorMessage,
+        error: 'Z.ai session validation failed',
       }
     }
   }
@@ -92,53 +70,30 @@ export class ZaiAdapter extends BaseOAuthAdapter {
   }
 
   /**
-   * Validate token validity
+   * Check local session metadata, not the JWT signature or server authentication.
+   * Account reconnection also requires the authenticated first-party identity GET.
    */
   async validateToken(credentials: Record<string, string>): Promise<TokenValidationResult> {
-    const token = credentials.token
-    
-    if (!token) {
+    const claims = readZaiSessionClaims(credentials?.token)
+    if (!claims) {
       return {
         valid: false,
-        error: 'Token cannot be empty',
+        error: 'Invalid Z.ai session metadata',
       }
     }
-    
-    if (token.startsWith('eyJ') && token.split('.').length === 3) {
-      try {
-        const parts = token.split('.')
-        const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString())
-        
-        // Reject guest accounts
-        if (payload.email && payload.email.includes('@guest.com')) {
-          return {
-            valid: false,
-            error: 'Guest account not allowed, please login with a real account',
-          }
-        }
-        
-        if (payload && payload.id) {
-          return {
-            valid: true,
-            tokenType: 'access',
-            accountInfo: {
-              userId: payload.id,
-              email: payload.email || '',
-              name: payload.email || payload.id,
-            },
-          }
-        }
-      } catch {
-        return {
-          valid: false,
-          error: 'Invalid JWT token',
-        }
-      }
+    if (!claims.usable) {
+      return { valid: false, error: 'Z.ai session expired; reconnect the existing account' }
     }
-    
     return {
-      valid: false,
-      error: 'Token is invalid',
+      valid: true,
+      tokenType: 'access',
+      expiresAt: claims.expiresAt,
+      accountInfo: {
+        userId: claims.subject,
+        email: claims.email || '',
+        name: claims.email || claims.subject,
+        expiresAt: claims.expiresAt,
+      },
     }
   }
 }

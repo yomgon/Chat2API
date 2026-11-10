@@ -16,6 +16,37 @@ import {
 } from '../types'
 
 const KIMI_API_BASE = 'https://www.kimi.com'
+const KIMI_VALIDATION_ERROR = 'Kimi token validation failed'
+
+function validKimiToken(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 &&
+    !/[\s\u0000-\u001f\u007f-\u009f]/.test(value)
+}
+
+function selectKimiCredential(credentials: unknown): string | null {
+  if (!credentials || typeof credentials !== 'object' || Array.isArray(credentials)) return null
+  const values = credentials as Record<string, unknown>
+  // Align these known fields with the proxy's selected-account preference;
+  // retain legacy OAuth aliases only if no canonical field is configured.
+  for (const field of ['token', 'refreshToken', 'accessToken', 'access_token', 'apiKey', 'api_key']) {
+    const value = values[field]
+    if (value === undefined || value === '') continue
+    return validKimiToken(value) ? value : null
+  }
+  return null
+}
+
+function hasKimiSubscription(response: unknown): response is {
+  subscription: { userId?: string; userName?: string }
+} {
+  if (!response || typeof response !== 'object' || Array.isArray(response)) return false
+  const data = response as Record<string, unknown>
+  if (data.error !== undefined || !data.subscription || typeof data.subscription !== 'object' ||
+      Array.isArray(data.subscription)) return false
+  const sub = data.subscription as Record<string, unknown>
+  return (sub.userId === undefined || typeof sub.userId === 'string') &&
+    (sub.userName === undefined || typeof sub.userName === 'string')
+}
 
 const FAKE_HEADERS = {
   Accept: '*/*',
@@ -139,6 +170,7 @@ export class KimiAdapter extends BaseOAuthAdapter {
           ...FAKE_HEADERS,
         },
         timeout: 15000,
+        maxRedirects: 0,
         validateStatus: () => true,
       }
     )
@@ -166,8 +198,8 @@ export class KimiAdapter extends BaseOAuthAdapter {
         providerType: 'kimi',
         error: 'Please log in via browser, extract Token from Developer Tools and enter manually',
       }
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Failed to open browser'
+    } catch {
+      const errorMessage = 'Failed to open Kimi login page'
       this.emitProgress('error', errorMessage)
       
       return {
@@ -184,6 +216,11 @@ export class KimiAdapter extends BaseOAuthAdapter {
    */
   async loginWithToken(providerId: string, token: string): Promise<OAuthResult> {
     this.emitProgress('pending', 'Validating Token...')
+
+    if (!validKimiToken(token)) {
+      this.emitProgress('error', KIMI_VALIDATION_ERROR)
+      return { success: false, providerId, providerType: 'kimi', error: KIMI_VALIDATION_ERROR }
+    }
     
     const tokenType = this.detectTokenType(token)
     this.emitProgress('pending', `Detected token type: ${tokenType === 'jwt' ? 'JWT Access Token' : 'Unknown Token'}`)
@@ -205,7 +242,7 @@ export class KimiAdapter extends BaseOAuthAdapter {
       
       const userResponse = await this.callGrpcApi(token, '/apiv2/kimi.gateway.order.v1.SubscriptionService/GetSubscription', {})
       
-      if (!userResponse || !userResponse.subscription) {
+      if (!hasKimiSubscription(userResponse)) {
         return {
           success: false,
           providerId,
@@ -229,9 +266,9 @@ export class KimiAdapter extends BaseOAuthAdapter {
         credentials,
         accountInfo,
       }
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error'
-      this.emitProgress('error', `Token validation failed: ${errorMessage}`)
+    } catch {
+      const errorMessage = KIMI_VALIDATION_ERROR
+      this.emitProgress('error', errorMessage)
       
       return {
         success: false,
@@ -253,8 +290,7 @@ export class KimiAdapter extends BaseOAuthAdapter {
    * Validate token validity using gRPC API
    */
   async validateToken(credentials: Record<string, string>): Promise<TokenValidationResult> {
-    // Support multiple key variations for flexibility
-    const accessToken = credentials.accessToken || credentials.token || credentials.access_token || credentials.apiKey || credentials.api_key
+    const accessToken = selectKimiCredential(credentials)
     
     if (!accessToken) {
       return {
@@ -268,7 +304,7 @@ export class KimiAdapter extends BaseOAuthAdapter {
     try {
       const result = await this.callGrpcApi(accessToken, '/apiv2/kimi.gateway.order.v1.SubscriptionService/GetSubscription', {})
       
-      if (!result || !result.subscription) {
+      if (!hasKimiSubscription(result)) {
         return {
           valid: false,
           error: 'Token is invalid or expired',
@@ -283,12 +319,8 @@ export class KimiAdapter extends BaseOAuthAdapter {
           name: result.subscription?.userName || '',
         },
       }
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Validation request failed'
-      return {
-        valid: false,
-        error: errorMessage,
-      }
+    } catch {
+      return { valid: false, error: KIMI_VALIDATION_ERROR }
     }
   }
 
@@ -307,6 +339,7 @@ export class KimiAdapter extends BaseOAuthAdapter {
       const response = await axios.get(`${KIMI_API_BASE}/api/chat/research/usage`, {
         headers: this.getHeaders(token),
         timeout: 15000,
+        maxRedirects: 0,
         validateStatus: () => true,
       })
       

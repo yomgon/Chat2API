@@ -4,6 +4,7 @@
  */
 
 import { storeManager } from './store'
+import { redactExportConfigSecrets } from './configSecrets'
 import {
   AppConfig,
   LoadBalanceStrategy,
@@ -31,13 +32,12 @@ export class ConfigManager {
    * @returns Updated complete configuration
    */
   static update(updates: Partial<AppConfig>): AppConfig {
-    const current = this.get()
-    const newConfig = { ...current, ...updates }
-    
     const updated = storeManager.updateConfig(updates)
     
     storeManager.addLog('info', 'Update app configuration', {
-      data: { updates },
+      data: {
+        changedKeys: Object.keys(updates).filter(key => Object.prototype.hasOwnProperty.call(DEFAULT_CONFIG, key)),
+      },
     })
     
     return updated
@@ -380,7 +380,7 @@ export class ConfigManager {
    * Export configuration (for backup)
    */
   static export(): AppConfig {
-    return this.get()
+    return redactExportConfigSecrets(this.get())
   }
 
   /**

@@ -1,4 +1,4 @@
-import { Tray, Menu, nativeImage, BrowserWindow, app, MenuItem } from 'electron'
+import { Tray, Menu, nativeImage, BrowserWindow, app, MenuItem, type NativeImage } from 'electron'
 import { join } from 'path'
 import { getProxyStatus } from './ipc/handlers'
 
@@ -12,7 +12,7 @@ function getIconPath(): string {
   return join(__dirname, '../../build/icon.png')
 }
 
-function loadAppIcon(): nativeImage {
+function loadAppIcon(): NativeImage {
   const iconPath = getIconPath()
   
   try {
@@ -30,7 +30,7 @@ function loadAppIcon(): nativeImage {
   return createFallbackIcon()
 }
 
-function createFallbackIcon(): nativeImage {
+function createFallbackIcon(): NativeImage {
   const size = 22
   const canvas = Buffer.alloc(size * size * 4)
   
@@ -55,7 +55,7 @@ function createFallbackIcon(): nativeImage {
   return nativeImage.createFromBuffer(canvas, { width: size, height: size })
 }
 
-function createRunningIcon(): nativeImage {
+function createRunningIcon(): NativeImage {
   const iconPath = getIconPath()
   
   try {
@@ -73,7 +73,7 @@ function createRunningIcon(): nativeImage {
   return createFallbackRunningIcon()
 }
 
-function createFallbackRunningIcon(): nativeImage {
+function createFallbackRunningIcon(): NativeImage {
   const size = 22
   const canvas = Buffer.alloc(size * size * 4)
   

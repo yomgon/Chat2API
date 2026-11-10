@@ -28,6 +28,18 @@ export const deepseekConfig: BuiltinProviderConfig = {
   },
   enabled: true,
   description: 'DeepSeek AI assistant, supports deep thinking and web search',
+  // Public WEBSITE settings describe selectable model_type wire modes, not the
+  // separate DeepSeek developer API's versioned /models catalog.
+  modelsApiEndpoint: 'https://chat.deepseek.com/api/v0/client/settings?scope=model',
+  modelsApiHeaders: {
+    Accept: 'application/json',
+    Origin: 'https://chat.deepseek.com',
+    Referer: 'https://chat.deepseek.com/',
+    'X-App-Version': '2.0.0',
+    'X-Client-Platform': 'web',
+    'X-Client-Version': '2.0.0',
+    'X-Client-Locale': 'zh_CN',
+  },
   supportedModels: ['deepseek-v4-flash', 'deepseek-v4-pro'],
   modelMappings: {
     'deepseek-v4-flash': 'deepseek-v4-flash',

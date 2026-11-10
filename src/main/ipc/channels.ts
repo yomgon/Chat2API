@@ -54,6 +54,8 @@ export const IpcChannels = {
   OAUTH_GET_STATUS: 'oauth:getStatus',
   OAUTH_PROGRESS: 'oauth:progress',
   OAUTH_START_IN_APP_LOGIN: 'oauth:startInAppLogin',
+  OAUTH_RECONNECT_ZAI_ACCOUNT: 'oauth:reconnectZaiAccount',
+  OAUTH_CREATE_ZAI_ACCOUNT: 'oauth:createZaiAccount',
   OAUTH_CANCEL_IN_APP_LOGIN: 'oauth:cancelInAppLogin',
   OAUTH_IN_APP_LOGIN_STATUS: 'oauth:inAppLoginStatus',
 
@@ -120,6 +122,9 @@ export const IpcChannels = {
 
   CONTEXT_MANAGEMENT_GET_CONFIG: 'contextManagement:getConfig',
   CONTEXT_MANAGEMENT_UPDATE_CONFIG: 'contextManagement:updateConfig',
+
+  TOOL_CALLING_GET_STATUS: 'toolCalling:getStatus',
+  TOOL_CALLING_RUN_SMOKE: 'toolCalling:runSmoke',
 } as const
 
 export type IpcChannel = (typeof IpcChannels)[keyof typeof IpcChannels]

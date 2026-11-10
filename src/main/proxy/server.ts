@@ -12,6 +12,7 @@ import managementRoutes from './routes/management'
 import { proxyStatusManager } from './status'
 import { storeManager } from '../store/store'
 import { sessionManager } from './sessionManager'
+import { evaluateProxyKey, hasUntrustedBrowserOrigin, isLocalBindHost, isTrustedHostHeader } from './localSecurity'
 
 const SLOW_REQUEST_THRESHOLD_MS = 1500
 
@@ -39,29 +40,27 @@ export class ProxyServer {
    */
   private setupMiddleware(): void {
     this.app.use(async (ctx, next) => {
-      ctx.set('Access-Control-Allow-Origin', '*')
-      ctx.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
-      ctx.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With')
-      ctx.set('Access-Control-Max-Age', '86400')
-
-      if (ctx.method === 'OPTIONS') {
-        ctx.status = 204
+      if (!isTrustedHostHeader(ctx.get('Host'), this.port)) {
+        ctx.status = 403
+        ctx.body = { error: { message: 'Invalid local host authority', code: 'host_forbidden' } }
+        return
+      }
+      // This proxy is a native-app service. Requests originating from browser
+      // pages can abuse a loopback server even if the listener is not on LAN.
+      // API clients (curl, local SDKs) do not send the Origin header.
+      if (hasUntrustedBrowserOrigin(ctx.get('Origin'))) {
+        ctx.status = 403
+        ctx.body = { error: { message: 'Browser origins are not allowed', code: 'browser_origin_forbidden' } }
         return
       }
 
       await next()
     })
 
-    this.app.use(bodyParser({
-      jsonLimit: '50mb',
-      formLimit: '50mb',
-      textLimit: '50mb',
-    }))
-
     // API Key validation middleware
     this.app.use(async (ctx, next) => {
-      // Skip paths that don't require authentication
-      const publicPaths = ['/', '/health', '/stats']
+      // Low-detail readiness endpoints stay available to local health probes.
+      const publicPaths = ['/', '/health']
       if (publicPaths.includes(ctx.path)) {
         await next()
         return
@@ -74,56 +73,43 @@ export class ProxyServer {
       }
 
       const config = storeManager.getConfig()
-      
-      if (config.enableApiKey && config.apiKeys && config.apiKeys.length > 0) {
-        const authHeader = ctx.get('Authorization') || ''
-        const providedKey = authHeader.startsWith('Bearer ') 
-          ? authHeader.slice(7) 
-          : (ctx.query.api_key as string) || ctx.get('X-API-Key')
-        
-        if (!providedKey) {
-          ctx.status = 401
-          ctx.body = {
-            error: {
-              message: 'API key is required',
-              type: 'invalid_request_error',
-              code: 'missing_api_key',
-            },
-          }
-          return
+      const authHeader = ctx.get('Authorization')
+      const providedKey = authHeader.startsWith('Bearer ')
+        ? authHeader.slice(7).trim()
+        : ctx.get('X-API-Key').trim()
+      // URL query strings must not carry credentials: they are commonly logged.
+      const decision = evaluateProxyKey(config, providedKey)
+      if (!decision.allowed) {
+        ctx.status = decision.status
+        ctx.body = {
+          error: {
+            message: decision.code === 'api_key_not_configured'
+              ? 'Configure an enabled local proxy API key before using the API'
+              : 'API key authentication failed',
+            type: 'invalid_request_error',
+            code: decision.code,
+          },
         }
-        
-        const validKey = config.apiKeys.find(
-          k => k.key === providedKey && k.enabled
-        )
-        
-        if (!validKey) {
-          ctx.status = 401
-          ctx.body = {
-            error: {
-              message: 'Invalid API key',
-              type: 'invalid_request_error',
-              code: 'invalid_api_key',
-            },
-          }
-          return
-        }
-        
-        // Update usage statistics
-        const updatedKeys = config.apiKeys.map(k => 
-          k.id === validKey.id 
-            ? { 
-                ...k, 
-                lastUsedAt: Date.now(), 
-                usageCount: k.usageCount + 1 
-              }
+        return
+      }
+
+      if (decision.matchedKeyId) {
+        const updatedKeys = config.apiKeys.map(k =>
+          k.id === decision.matchedKeyId
+            ? { ...k, lastUsedAt: Date.now(), usageCount: k.usageCount + 1 }
             : k
         )
         storeManager.updateConfig({ apiKeys: updatedKeys })
       }
-      
       await next()
     })
+
+    // Check authorization before parsing up to 50 MiB of untrusted input.
+    this.app.use(bodyParser({
+      jsonLimit: '50mb',
+      formLimit: '50mb',
+      textLimit: '50mb',
+    }))
 
     this.app.use(async (ctx, next) => {
       const startTime = Date.now()
@@ -163,7 +149,7 @@ export class ProxyServer {
     this.router.get('/', async (ctx) => {
       ctx.body = {
         name: 'Chat2API Proxy',
-        version: '1.1.2',
+      version: '1.4.0-local.18',
         description: 'OpenAI API compatible proxy service',
         endpoints: [
           'POST /v1/chat/completions',
@@ -257,14 +243,12 @@ export class ProxyServer {
   private setupErrorHandler(): void {
     this.app.on('error', (err, ctx) => {
       const status = err.status || 500
-      const message = err.message || 'Internal Server Error'
 
-      storeManager.addLog('error', `Server error: ${message}`, {
+      storeManager.addLog('error', 'Local proxy server error', {
         data: {
           status,
           path: ctx.path,
           method: ctx.method,
-          stack: err.stack,
         },
       })
     })
@@ -278,8 +262,19 @@ export class ProxyServer {
       return false
     }
 
-    this.port = port || proxyStatusManager.getPort()
-    this.host = host || proxyStatusManager.getHost()
+    const requestedPort = port ?? proxyStatusManager.getPort()
+    const requestedHost = host ?? proxyStatusManager.getHost()
+    if (!Number.isInteger(requestedPort) || requestedPort < 1 || requestedPort > 65535) {
+      storeManager.addLog('error', 'Local proxy rejected invalid port')
+      return false
+    }
+    if (!isLocalBindHost(requestedHost)) {
+      storeManager.addLog('error', 'Local proxy rejected non-loopback bind host')
+      return false
+    }
+
+    this.port = requestedPort
+    this.host = requestedHost
     
     sessionManager.initialize()
 
@@ -299,7 +294,7 @@ export class ProxyServer {
           if (err.code === 'EADDRINUSE') {
             storeManager.addLog('error', `Port ${this.port} is already in use`)
           } else {
-            storeManager.addLog('error', `Server error: ${err.message}`)
+            storeManager.addLog('error', 'Local proxy listener error')
           }
           this.server = null
           resolve(false)
@@ -309,7 +304,7 @@ export class ProxyServer {
           this.server = null
         })
       } catch (error) {
-        storeManager.addLog('error', `Failed to start server: ${error instanceof Error ? error.message : 'Unknown error'}`)
+        storeManager.addLog('error', 'Failed to start local proxy server')
         resolve(false)
       }
     })
@@ -328,7 +323,7 @@ export class ProxyServer {
     return new Promise((resolve) => {
       this.server!.close((err) => {
         if (err) {
-          storeManager.addLog('error', `Failed to stop server: ${err.message}`)
+          storeManager.addLog('error', 'Failed to stop local proxy server')
           resolve(false)
           return
         }
@@ -347,7 +342,16 @@ export class ProxyServer {
    * Restart server
    */
   async restart(port?: number, host?: string): Promise<boolean> {
-    await this.stop()
+    const requestedHost = host ?? this.host
+    const requestedPort = port ?? this.port
+    // Reject the replacement before stopping the current listener.
+    if (!isLocalBindHost(requestedHost) || !Number.isInteger(requestedPort) ||
+        requestedPort < 1 || requestedPort > 65535) {
+      return false
+    }
+    if (this.server && !(await this.stop())) {
+      return false
+    }
     return this.start(port, host)
   }
 

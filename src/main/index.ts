@@ -1,18 +1,29 @@
 import { app, BrowserWindow } from 'electron'
 import { join } from 'path'
+import { mkdirSync } from 'fs'
+import { homedir } from 'os'
 import { createWindow, getMainWindow, loadUrl, loadFile, openDevTools } from './window/manager'
 import { createTrayManager, TrayManager } from './tray/TrayManager'
 import { registerIpcHandlers } from './ipc/handlers'
 import { UpdaterManager } from './updater'
 import { storeManager } from './store/store'
 
+// Electron requires setPath targets to exist before the 'ready' event.
+// This private fork must not reuse upstream cookies, login state or caches.
+const privateUserData = join(homedir(), '.chat2api-local-private', 'electron')
+const privateSessionData = join(privateUserData, 'session')
+mkdirSync(privateSessionData, { recursive: true })
+app.setPath('userData', privateUserData)
+app.setPath('sessionData', privateSessionData)
+
 // Prevent uncaught exceptions from crashing the app
-process.on('uncaughtException', (error) => {
-  console.error('Uncaught Exception:', error)
+process.on('uncaughtException', () => {
+  // Throwable objects may carry authorization headers or token-bearing URLs.
+  console.error('[App] Uncaught exception (details redacted)')
 })
 
-process.on('unhandledRejection', (reason) => {
-  console.error('Unhandled Rejection:', reason)
+process.on('unhandledRejection', () => {
+  console.error('[App] Unhandled rejection (details redacted)')
 })
 
 // Workaround for V8 JIT compiler crash on macOS ARM64 (Electron 33 bug)
@@ -26,12 +37,6 @@ if (process.platform === 'darwin' && process.arch === 'arm64') {
 // Automatically add --no-sandbox flag when running as root user
 if (process.getuid && process.getuid() === 0) {
   console.log('Detected running as root user, sandbox settings have been automatically handled')
-}
-
-declare module 'electron' {
-  interface App {
-    isQuitting?: boolean
-  }
 }
 
 const gotTheLock = app.requestSingleInstanceLock()
@@ -76,7 +81,7 @@ async function initializeApp(): Promise<void> {
   })
 
   app.on('before-quit', () => {
-    app.isQuitting = true
+    ;(app as typeof app & { isQuitting?: boolean }).isQuitting = true
     trayManager?.destroy()
   })
 
@@ -91,7 +96,7 @@ async function setupApp(): Promise<void> {
     height: 800,
     minWidth: 800,
     minHeight: 600,
-    title: 'Chat2API',
+    title: 'Chat2API Private Local',
     show: false,
   })
 
@@ -112,14 +117,14 @@ async function loadAppContent(mainWindow: BrowserWindow): Promise<void> {
   if (isDev) {
     try {
       await loadUrl(process.env.ELECTRON_RENDERER_URL || 'http://localhost:5173')
-    } catch (error) {
-      console.error('Failed to load development server:', error)
+    } catch {
+      console.error('[App] Unable to load development content')
     }
   } else {
     try {
       await loadFile(join(__dirname, '../renderer/index.html'))
-    } catch (error) {
-      console.error('Failed to load production files:', error)
+    } catch {
+      console.error('[App] Unable to load production content')
     }
   }
 }
@@ -141,7 +146,7 @@ export function getAppVersion(): string {
 }
 
 export function isAppQuitting(): boolean {
-  return app.isQuitting ?? false
+  return (app as typeof app & { isQuitting?: boolean }).isQuitting ?? false
 }
 
 export { getMainWindow }

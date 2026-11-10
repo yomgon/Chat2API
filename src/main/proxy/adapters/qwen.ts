@@ -63,6 +63,7 @@ interface QwenMessage {
 
 interface ChatCompletionRequest {
   model: string
+  originalModel?: string
   messages: QwenMessage[]
   tools?: any[]
   stream?: boolean
@@ -244,7 +245,7 @@ export class QwenAdapter {
     )
 
     if (response.status !== 200 || response.data?.success === false) {
-      console.warn('[Qwen] Failed to delete related file records:', response.status, response.data)
+      console.warn('[Qwen] Failed to delete related file records')
       return false
     }
 
@@ -269,13 +270,13 @@ export class QwenAdapter {
     )
 
     if (response.status !== 200) {
-      console.warn(`[Qwen] Failed to delete sessions: status ${response.status}`)
+      console.warn('[Qwen] Session deletion request failed')
       return false
     }
 
     const { success, code, msg } = response.data || {}
     if (success === false || (typeof code === 'number' && code !== 0)) {
-      console.warn(`[Qwen] Failed to delete sessions: ${msg || 'Unknown error'}`)
+      console.warn('[Qwen] Session deletion response reported failure')
       return false
     }
 
@@ -326,15 +327,12 @@ export class QwenAdapter {
       // Use thinking model if available
       if (actualModel === 'Qwen3-Max') {
         actualModel = 'Qwen3-Max-Thinking-Preview'
-        console.log('[Qwen] Using thinking model:', actualModel)
+        console.log('[Qwen] Using thinking model')
       }
     }
     
-    console.log('[Qwen] Session info:', {
-      sessionId,
-      reqId,
-    })
-    console.log('[Qwen] Using model:', actualModel)
+    console.log('[Qwen] Session prepared')
+    console.log('[Qwen] Using model')
 
     const toolProfile = getProviderToolProfile('qwen')
 
@@ -427,8 +425,8 @@ export class QwenAdapter {
       decompress: false,
     })
 
-    console.log('[Qwen] Response status:', response.status)
-    console.log('[Qwen] Response headers:', JSON.stringify(response.headers, null, 2))
+    console.log('[Qwen] Response received')
+    console.log('[Qwen] Response headers received')
 
     return { response, sessionId, reqId }
   }
@@ -441,12 +439,12 @@ export class QwenAdapter {
 
       const success = await this.deleteSessions([sessionId])
       if (success) {
-        console.log('[Qwen] Session deleted successfully:', sessionId)
+        console.log('[Qwen] Session deleted successfully')
       }
       return success
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error'
-      console.warn('[Qwen] Failed to delete session:', errorMessage)
+      console.warn('[Qwen] Failed to delete session')
       return false
     }
   }
@@ -474,7 +472,7 @@ export class QwenAdapter {
         return true
       }
 
-      console.log('[Qwen] Found', allSessionIds.length, 'sessions to delete')
+      console.log('[Qwen] Sessions found for deletion')
 
       for (let i = 0; i < allSessionIds.length; i += 100) {
         const batch = allSessionIds.slice(i, i + 100)
@@ -488,13 +486,148 @@ export class QwenAdapter {
       return true
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error'
-      console.warn('[Qwen] Failed to delete all sessions:', errorMessage)
+      console.warn('[Qwen] Failed to delete all sessions')
       return false
     }
   }
 
   static isQwenProvider(provider: Provider): boolean {
     return provider.id === 'qwen' || provider.apiEndpoint.includes('qianwen.com') || provider.apiEndpoint.includes('aliyun.com')
+  }
+}
+
+function qwenDecodingFailure(): Error {
+  return new Error('Qwen response decoding failed')
+}
+
+function isQwenRecord(value: unknown): value is Record<string, any> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+/** Validate fields consumed below before exposing any content from this event. */
+function qwenEventMessages(value: unknown): any[] {
+  if (!isQwenRecord(value)) throw qwenDecodingFailure()
+  if (Object.prototype.hasOwnProperty.call(value, 'error') ||
+      (Object.prototype.hasOwnProperty.call(value, 'error_code') && value.error_code !== 0)) {
+    throw qwenDecodingFailure()
+  }
+  if (value.communication !== undefined) {
+    if (!isQwenRecord(value.communication)) throw qwenDecodingFailure()
+    for (const key of ['sessionid', 'reqid']) {
+      if (value.communication[key] !== undefined && typeof value.communication[key] !== 'string') {
+        throw qwenDecodingFailure()
+      }
+    }
+  }
+  if (value.data !== undefined && !isQwenRecord(value.data)) throw qwenDecodingFailure()
+  const messages = value.data?.messages
+  if (messages === undefined) return []
+  if (!Array.isArray(messages)) throw qwenDecodingFailure()
+  for (const message of messages) {
+    if (!isQwenRecord(message) ||
+        (message.mime_type !== undefined && typeof message.mime_type !== 'string') ||
+        (message.status !== undefined && typeof message.status !== 'string') ||
+        (message.role !== undefined && message.role !== 'assistant')) {
+      throw qwenDecodingFailure()
+    }
+    if ((message.mime_type === 'text/plain' || message.mime_type === 'multi_load/iframe') &&
+        message.content !== undefined && typeof message.content !== 'string') {
+      throw qwenDecodingFailure()
+    }
+    if (message.meta_data !== undefined && !isQwenRecord(message.meta_data)) throw qwenDecodingFailure()
+    const loads = message.meta_data?.multi_load
+    if (loads === undefined) continue
+    if (!Array.isArray(loads)) throw qwenDecodingFailure()
+    for (const load of loads) {
+      if (!isQwenRecord(load) || (load.type !== undefined && typeof load.type !== 'string')) {
+        throw qwenDecodingFailure()
+      }
+      if ((load.type === 'deep_think' || load.type === 'multimodal_chat_think') && load.content !== undefined) {
+        if (!isQwenRecord(load.content) ||
+            (load.content.think_content !== undefined && typeof load.content.think_content !== 'string') ||
+            (load.content.content !== undefined && typeof load.content.content !== 'string')) {
+          throw qwenDecodingFailure()
+        }
+      }
+    }
+  }
+  return messages
+}
+
+/** Strict UTF-8 and complete SSE events, including event-only completion. */
+class QwenSseDecoder {
+  private decoder = new TextDecoder('utf-8', { fatal: true })
+  private line = ''
+  private skipLF = false
+  private eventType = 'message'
+  private data: string[] = []
+  private pendingEvent = false
+
+  constructor(private onEvent: (type: string, data: string | undefined) => void) {}
+
+  feed(bytes: Buffer): void {
+    if (!Buffer.isBuffer(bytes)) throw qwenDecodingFailure()
+    this.consume(this.decoder.decode(bytes, { stream: true }))
+  }
+
+  finish(): void {
+    this.consume(this.decoder.decode())
+    // EOF must not invent a line break or silently discard a partial event.
+    if (this.line || this.pendingEvent) throw qwenDecodingFailure()
+  }
+
+  private consume(text: string): void {
+    let offset = 0
+    while (offset < text.length) {
+      if (this.skipLF) {
+        this.skipLF = false
+        if (text[offset] === '\n') {
+          offset++
+          continue
+        }
+      }
+      const nextLF = text.indexOf('\n', offset)
+      const nextCR = text.indexOf('\r', offset)
+      const next = nextLF < 0 ? nextCR : nextCR < 0 ? nextLF : Math.min(nextLF, nextCR)
+      if (next < 0) {
+        this.line += text.slice(offset)
+        return
+      }
+      this.line += text.slice(offset, next)
+      const line = this.line
+      this.line = ''
+      this.skipLF = text[next] === '\r'
+      offset = next + 1
+      this.acceptLine(line)
+    }
+  }
+
+  private acceptLine(line: string): void {
+    if (!line) {
+      const type = this.eventType
+      const data = this.data.length ? this.data.join('\n') : undefined
+      const pending = this.pendingEvent
+      this.eventType = 'message'
+      this.data = []
+      this.pendingEvent = false
+      if (pending) this.onEvent(type, data)
+      return
+    }
+    if (line.startsWith(':')) return
+    const colon = line.indexOf(':')
+    const field = colon < 0 ? line : line.slice(0, colon)
+    let value = colon < 0 ? '' : line.slice(colon + 1)
+    if (value.startsWith(' ')) value = value.slice(1)
+    this.pendingEvent = true
+    if (field === 'data') this.data.push(value)
+    else if (field === 'event') this.eventType = value.trim()
+    else if (field === 'id') {
+      if (value.includes('\0')) throw qwenDecodingFailure()
+    } else if (field === 'retry') {
+      if (!/^\d+$/.test(value)) throw qwenDecodingFailure()
+    } else {
+      throw qwenDecodingFailure()
+    }
   }
 }
 
@@ -505,8 +638,6 @@ export class QwenStreamHandler {
   private onEnd?: (sessionId: string) => void
   private content: string = ''
   private responseId: string = ''
-  private stopSent: boolean = false
-  private toolCallsSent: boolean = false
   private hasError: boolean = false
   private toolStreamParser?: ToolStreamParser
   private toolCallingPlan?: ToolCallingPlan
@@ -526,646 +657,276 @@ export class QwenStreamHandler {
     return this.hasError
   }
 
-  private sendToolCalls(transStream: PassThrough): void {
-    if (this.toolCallsSent) return
-    
-    // Use the new parser that supports both bracket and XML formats
-    const { toolCalls } = parseToolCallsFromText(this.content, 'default')
-    
-    if (toolCalls && toolCalls.length > 0) {
-      this.toolCallsSent = true
-      
-      // Send tool_calls delta
-      for (let i = 0; i < toolCalls.length; i++) {
-        const tc = toolCalls[i]
-        transStream.write(
-          `data: ${JSON.stringify({
-            id: this.responseId || this.sessionId,
-            model: this.model,
-            object: 'chat.completion.chunk',
-            choices: [{
-              index: 0,
-              delta: {
-                tool_calls: [{
-                  index: i,
-                  id: tc.id,
-                  type: 'function',
-                  function: {
-                    name: tc.function.name,
-                    arguments: tc.function.arguments,
-                  },
-                }],
-              },
-              finish_reason: null,
-            }],
-            created: this.created,
-          })}\n\n`
-        )
+  private consumeResponse(
+    stream: any,
+    response: AxiosResponse | undefined,
+    onProgress: (content: string, thinking: string) => void,
+    prepareComplete: () => (() => void),
+    onFailure: () => void
+  ): void {
+    let settled = false
+    let sourceEnded = false
+    let decodedEnded = false
+    let providerFinished = false
+    let messageFinished = false
+    let decodeTimeout: ReturnType<typeof setTimeout> | undefined
+
+    const clearDecodeTimeout = () => {
+      if (decodeTimeout !== undefined) clearTimeout(decodeTimeout)
+      decodeTimeout = undefined
+    }
+
+    const fail = () => {
+      if (settled) return
+      settled = true
+      clearDecodeTimeout()
+      this.hasError = true
+      console.error('[Qwen] Response did not complete')
+      onFailure()
+    }
+    const complete = () => {
+      if (settled || !sourceEnded || !decodedEnded) return
+      let commit: () => void
+      try {
+        if (!providerFinished || !this.content.trim()) throw qwenDecodingFailure()
+        // Tool flush and serialization may throw or synchronously report a
+        // source error. Prepare every terminal byte before committing success.
+        commit = prepareComplete()
+      } catch {
+        fail()
+        return
       }
-      
-      // Send finish with tool_calls
-      transStream.write(
-        `data: ${JSON.stringify({
-          id: this.responseId || this.sessionId,
-          model: this.model,
-          object: 'chat.completion.chunk',
-          choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }],
-          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
-          created: this.created,
-        })}\n\n`
-      )
-      transStream.end('data: [DONE]\n\n')
-      this.onEnd?.(this.sessionId)
+      if (settled) return
+      settled = true
+      clearDecodeTimeout()
+      try {
+        commit()
+      } catch {
+        this.hasError = true
+        onFailure()
+        return
+      }
+      // Preserve the existing message-finish callback selection, but only
+      // after verified completion. Cleanup failure cannot change the answer.
+      if (messageFinished && this.onEnd) {
+        try {
+          Promise.resolve(this.onEnd(this.sessionId)).catch(() => {
+            console.warn('[Qwen] Completion callback failed')
+          })
+        } catch {
+          console.warn('[Qwen] Completion callback failed')
+        }
+      }
+    }
+
+    const parser = new QwenSseDecoder((type, body) => {
+      if (settled) return
+      if (type === 'error') throw qwenDecodingFailure()
+      if (body?.trim() === '[DONE]') {
+        // Preserve the existing ignored marker: only an iframe status or
+        // complete event supplies completion proof. Keep reading later events.
+        return
+      }
+      if (body !== undefined && !(type === 'complete' && !body.trim())) {
+        const value: unknown = JSON.parse(body)
+        const messages = qwenEventMessages(value)
+        const result = value as Record<string, any>
+        if (!this.sessionId && result.communication?.sessionid) this.sessionId = result.communication.sessionid
+        if (!this.responseId && result.communication?.reqid) this.responseId = result.communication.reqid
+
+        let eventThinking = ''
+        let fallbackThinking = ''
+        let hasDeepThink = false
+        let nextContent = this.content
+        let finishesMessage = false
+        for (const message of messages) {
+          for (const load of message.meta_data?.multi_load ?? []) {
+            if (load.type === 'deep_think' && load.content) {
+              hasDeepThink = true
+              const thinking = load.content.think_content || load.content.content || ''
+              if (thinking.length > eventThinking.length) eventThinking = thinking
+            } else if (load.type === 'multimodal_chat_think' && load.content) {
+              const thinking = load.content.think_content || load.content.content || ''
+              if (thinking.length > fallbackThinking.length) fallbackThinking = thinking
+            }
+          }
+          if ((message.mime_type === 'text/plain' || message.mime_type === 'multi_load/iframe') &&
+              typeof message.content === 'string') {
+            const content = message.content.replace(/\[\(deep_think\)\]/g, '')
+              .replace(/\[\(multimodal_chat_think_\d+\)\]/g, '')
+            if (providerFinished && content.trim() && content !== this.content) throw qwenDecodingFailure()
+            if (content.trim() && content.length > nextContent.length) nextContent = content
+          }
+          if (message.mime_type === 'multi_load/iframe' &&
+              (message.status === 'complete' || message.status === 'finished')) {
+            finishesMessage = true
+          }
+        }
+        if (!hasDeepThink) eventThinking = fallbackThinking
+        if (providerFinished && eventThinking && eventThinking !== this.thinkingContent) throw qwenDecodingFailure()
+        const contentDelta = nextContent.slice(this.content.length)
+        const thinkingDelta = eventThinking.length > this.thinkingContent.length
+          ? eventThinking.slice(this.thinkingContent.length) : ''
+        this.content = nextContent
+        if (thinkingDelta) this.thinkingContent = eventThinking
+        onProgress(contentDelta, thinkingDelta)
+        if (finishesMessage) {
+          providerFinished = true
+          messageFinished = true
+        }
+      }
+      if (type === 'complete') providerFinished = true
+    })
+
+    const feed = (chunk: Buffer) => {
+      if (settled) return
+      try { parser.feed(chunk) } catch { fail() }
+    }
+    const endDecoded = () => {
+      if (settled || decodedEnded) return
+      try {
+        parser.finish()
+        decodedEnded = true
+        complete()
+      } catch {
+        fail()
+      }
+    }
+    const watchErrors = (input: any, ended: () => boolean) => {
+      // Keep the error listener after settlement so a late error cannot escape.
+      input.on('error', fail)
+      input.once('aborted', fail)
+      input.once('timeout', fail)
+      input.once('close', () => { if (!ended()) fail() })
+    }
+
+    try {
+      watchErrors(stream, () => sourceEnded)
+      stream.once('end', () => {
+        sourceEnded = true
+        complete()
+      })
+      const encodingValue = response?.headers?.['content-encoding']
+      const encoding = typeof encodingValue === 'string' ? encodingValue.toLowerCase() : undefined
+      if (encoding === 'zstd') {
+        const chunks: Buffer[] = []
+        stream.on('data', (chunk: Buffer) => {
+          if (settled) return
+          if (!Buffer.isBuffer(chunk)) { fail(); return }
+          chunks.push(chunk)
+        })
+        stream.once('end', () => {
+          if (settled) return
+          try {
+            // The installed CommonJS module exports { ZstdCodec }, while the
+            // legacy ambient declaration describes its inner run function.
+            const codec = (ZstdCodec as unknown as { ZstdCodec: { run: typeof ZstdCodec.run } }).ZstdCodec
+            const compressed = Buffer.concat(chunks)
+            chunks.length = 0
+            // Network timeout no longer covers initialization after raw EOF.
+            // Bound local codec waiting by the existing 120-second budget.
+            decodeTimeout = setTimeout(fail, 120_000)
+            decodeTimeout.unref?.()
+            codec.run(zstd => {
+              if (settled) return
+              try {
+                const decompressed = new zstd.Simple().decompress(compressed)
+                if (!(decompressed instanceof Uint8Array)) throw qwenDecodingFailure()
+                feed(Buffer.from(decompressed))
+                endDecoded()
+              } catch {
+                fail()
+              }
+            })
+          } catch {
+            fail()
+          }
+        })
+        return
+      }
+
+      let decoded = stream
+      if (encoding === 'gzip') decoded = createGunzip()
+      else if (encoding === 'deflate') decoded = createInflate()
+      else if (encoding === 'br') decoded = createBrotliDecompress()
+      if (decoded !== stream) watchErrors(decoded, () => decodedEnded)
+      decoded.on('data', feed)
+      decoded.once('end', endDecoded)
+      if (decoded !== stream) stream.pipe(decoded)
+    } catch {
+      fail()
     }
   }
 
   handleStream(stream: any, response?: AxiosResponse): PassThrough {
     const transStream = new PassThrough()
-
-    console.log('[Qwen] Starting stream handler...')
-    
-    const contentEncoding = response?.headers?.['content-encoding']
-    console.log('[Qwen] Content-Encoding:', contentEncoding)
-
-    let buffer = ''
-    let streamEnded = false
-
-    const safeEnd = (data?: string) => {
-      if (streamEnded) return
-      streamEnded = true
-      if (data) {
-        transStream.end(data)
-      } else {
-        transStream.end()
+    this.consumeResponse(stream, response, (content, thinking) => {
+      if (!this.sentRole && thinking.trim()) {
+        if (!this.sentThinkingRole) {
+          transStream.write('data: ' + JSON.stringify({
+            id: this.responseId || this.sessionId, model: this.model,
+            object: 'chat.completion.chunk', created: this.created,
+            choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
+          }) + '\n\n')
+          this.sentThinkingRole = true
+        }
+        transStream.write('data: ' + JSON.stringify({
+          id: this.responseId || this.sessionId, model: this.model,
+          object: 'chat.completion.chunk', created: this.created,
+          choices: [{ index: 0, delta: { reasoning_content: thinking }, finish_reason: null }],
+        }) + '\n\n')
       }
-    }
-
-    const processBuffer = () => {
-      while (true) {
-        const doubleNewlineIndex = buffer.indexOf('\n\n')
-        if (doubleNewlineIndex === -1) break
-
-        const eventBlock = buffer.substring(0, doubleNewlineIndex)
-        buffer = buffer.substring(doubleNewlineIndex + 2)
-
-        const lines = eventBlock.split('\n')
-        let eventType = 'message'
-        let eventData = ''
-
-        for (const line of lines) {
-          if (line.startsWith('event:')) {
-            eventType = line.substring(6).trim()
-          } else if (line.startsWith('data:')) {
-            eventData = line.substring(5)
-          }
-        }
-
-        if (eventData && eventData !== '[DONE]') {
-          try {
-            const result = JSON.parse(eventData)
-            console.log('[Qwen] Parsed event:', eventType, 'data keys:', Object.keys(result))
-            if (result.data?.messages) {
-              console.log('[Qwen] Messages count:', result.data.messages.length)
-              for (const msg of result.data.messages) {
-                console.log('[Qwen] Message:', msg.mime_type, 'status:', msg.status, 'content length:', msg.content?.length || 0)
-              }
-            }
-
-            if (result.communication) {
-              if (!this.sessionId && result.communication.sessionid) {
-                this.sessionId = result.communication.sessionid
-              }
-              if (!this.responseId && result.communication.reqid) {
-                this.responseId = result.communication.reqid
-              }
-            }
-
-            if (result.data?.messages) {
-              // First pass: collect thinking content and answer content
-              // Strategy: only use deep_think type to avoid duplicate content from multimodal_chat_think
-              let eventThinkingContent = ''
-              let eventThinkingType = ''
-              const eventMessages: Array<{ msg: any, hasMultiLoad: boolean }> = []
-
-              for (const msg of result.data.messages) {
-                console.log('[Qwen] Message detail:', JSON.stringify(msg).substring(0, 500))
-
-                // Collect thinking content from meta_data.multi_load
-                const metaData = msg.meta_data || {}
-                const multiLoad = metaData.multi_load || []
-                let msgHasMultiLoad = false
-                for (const load of multiLoad) {
-                  if (load.type === 'deep_think' && load.content) {
-                    // Only use deep_think type for thinking content
-                    // multimodal_chat_think may contain slightly different content causing duplicates
-                    const newThinkingContent = load.content.think_content || load.content.content || ''
-                    if (newThinkingContent.length > eventThinkingContent.length) {
-                      eventThinkingContent = newThinkingContent
-                      eventThinkingType = load.type
-                    }
-                    msgHasMultiLoad = true
-                  } else if (load.type === 'multimodal_chat_think') {
-                    // Only fall back to multimodal_chat_think if no deep_think exists in this event
-                    if (!msgHasMultiLoad && load.content) {
-                      const newThinkingContent = load.content.think_content || load.content.content || ''
-                      if (newThinkingContent.length > eventThinkingContent.length) {
-                        eventThinkingContent = newThinkingContent
-                        eventThinkingType = load.type
-                      }
-                      msgHasMultiLoad = true
-                    }
-                  }
-                }
-                eventMessages.push({ msg, hasMultiLoad: msgHasMultiLoad })
-              }
-
-              // Process thinking content (once per event, only before answer phase starts)
-              // Once answer content has been sent (sentRole), stop emitting reasoning_content
-              if (!this.sentRole && eventThinkingContent.length > this.thinkingContent.length) {
-                const chunk = eventThinkingContent.substring(this.thinkingContent.length)
-                this.thinkingContent = eventThinkingContent
-                console.log('[Qwen] Thinking chunk, length:', chunk.length, 'content:', chunk.substring(0, 50), 'type:', eventThinkingType, 'prev:', this.thinkingContent.length - chunk.length, '->', this.thinkingContent.length)
-
-                if (chunk.trim()) {
-                  // Send reasoning_content delta
-                  if (!this.sentThinkingRole) {
-                    transStream.write(`data: ${JSON.stringify({
-                      id: this.responseId || this.sessionId,
-                      model: this.model,
-                      object: 'chat.completion.chunk',
-                      choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
-                      created: this.created,
-                    })}\n\n`)
-                    this.sentThinkingRole = true
-                  }
-
-                  transStream.write(`data: ${JSON.stringify({
-                    id: this.responseId || this.sessionId,
-                    model: this.model,
-                    object: 'chat.completion.chunk',
-                    choices: [{ index: 0, delta: { reasoning_content: chunk }, finish_reason: null }],
-                    created: this.created,
-                  })}\n\n`)
-                }
-              }
-
-              // Second pass: process answer content and completion status
-              for (const { msg } of eventMessages) {
-                
-                // Filter out [(deep_think)] and [(multimodal_chat_think_*)] markers from content
-                if ((msg.mime_type === 'text/plain' || msg.mime_type === 'multi_load/iframe') && msg.content) {
-                  // Skip content that is just the deep_think marker
-                  let newContent = msg.content
-                  if (newContent === '[(deep_think)]' || newContent.trim() === '[(deep_think)]') {
-                    console.log('[Qwen] Skipping deep_think marker')
-                    continue
-                  }
-                  // Remove any deep_think and multimodal_chat_think markers from content
-                  newContent = newContent.replace(/\[\(deep_think\)\]/g, '')
-                  newContent = newContent.replace(/\[\(multimodal_chat_think_\d+\)\]/g, '')
-                  
-                  if (!newContent.trim()) {
-                    console.log('[Qwen] Skipping empty content after filtering')
-                    continue
-                  }
-                  
-                  console.log('[Qwen] newContent.length:', newContent.length, 'this.content.length:', this.content.length)
-                  if (newContent.length > this.content.length) {
-                    const chunk = newContent.substring(this.content.length)
-                    this.content = newContent
-                    console.log('[Qwen] Writing chunk, length:', chunk.length)
-
-                    // Process tool call interception
-                    const baseChunk = createBaseChunk(this.responseId || this.sessionId, this.model, this.created)
-                    const outputChunks = this.toolStreamParser?.push(chunk, baseChunk, !this.sentRole) ?? [{
-                      ...baseChunk,
-                      choices: [{ index: 0, delta: { ...(!this.sentRole ? { role: 'assistant' } : {}), content: chunk }, finish_reason: null }],
-                    }]
-
-                    for (const outChunk of outputChunks) {
-                      transStream.write(`data: ${JSON.stringify(outChunk)}\n\n`)
-                    }
-
-                    if (outputChunks.length > 0) this.sentRole = true
-                    console.log('[Qwen] Chunk written to stream')
-                  } else {
-                    console.log('[Qwen] Skipping - no new content')
-                  }
-                }
-
-                if (msg.status === 'complete' || msg.status === 'finished') {
-                  // 只有当 multi_load/iframe 消息完成时才发送 stop
-                  if (msg.mime_type === 'multi_load/iframe' && !this.stopSent) {
-                    this.stopSent = true
-                    console.log('[Qwen] Sending stop for multi_load/iframe, content so far:', this.content.length)
-                    
-                    // Flush any remaining tool calls
-                    const baseChunk = createBaseChunk(this.responseId || this.sessionId, this.model, this.created)
-                    const flushChunks = this.toolStreamParser?.flush(baseChunk) ?? []
-                    
-                    for (const outChunk of flushChunks) {
-                      transStream.write(`data: ${JSON.stringify(outChunk)}\n\n`)
-                    }
-                    
-                    // Check if we emitted tool calls
-                    const finishReason = this.toolStreamParser?.hasEmittedToolCall() ? 'tool_calls' : 'stop'
-                    
-                    transStream.write(
-                      `data: ${JSON.stringify({
-                        id: this.responseId || this.sessionId,
-                        model: this.model,
-                        object: 'chat.completion.chunk',
-                        choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
-                        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
-                        created: this.created,
-                      })}\n\n`
-                    )
-                    safeEnd('data: [DONE]\n\n')
-                    this.onEnd?.(this.sessionId)
-                  }
-                }
-              }
-            }
-
-            if (result.error_code && result.error_code !== 0) {
-              console.error('[Qwen] API error:', result.error_code, result.error_msg)
-              this.hasError = true
-              transStream.write(
-                `data: ${JSON.stringify({
-                  id: this.responseId || this.sessionId,
-                  model: this.model,
-                  object: 'chat.completion.chunk',
-                  choices: [{ index: 0, delta: { content: `\n[Error: ${result.error_msg || result.error_code}]` }, finish_reason: 'stop' }],
-                  created: this.created,
-                })}\n\n`
-              )
-              safeEnd('data: [DONE]\n\n')
-            }
-          } catch (err) {
-            console.error('[Qwen] Parse error:', err, 'Data:', eventData.substring(0, 200))
-          }
-        }
-
-        if (eventType === 'complete') {
-          console.log('[Qwen] Received complete event')
-          if (!streamEnded && !this.stopSent) {
-            this.stopSent = true
-            
-            // Flush any remaining tool calls
-            const baseChunk = createBaseChunk(this.responseId || this.sessionId, this.model, this.created)
-            const flushChunks = this.toolStreamParser?.flush(baseChunk) ?? []
-            
-            for (const outChunk of flushChunks) {
-              transStream.write(`data: ${JSON.stringify(outChunk)}\n\n`)
-            }
-            
-            // Check if we emitted tool calls
-            const finishReason = this.toolStreamParser?.hasEmittedToolCall() ? 'tool_calls' : 'stop'
-            
-            transStream.write(
-              `data: ${JSON.stringify({
-                id: this.responseId || this.sessionId,
-                model: this.model,
-                object: 'chat.completion.chunk',
-                choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
-                usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
-                created: this.created,
-              })}\n\n`
-            )
-            safeEnd('data: [DONE]\n\n')
-          }
-        }
+      if (content) {
+        const base = createBaseChunk(this.responseId || this.sessionId, this.model, this.created)
+        const chunks = this.toolStreamParser?.push(content, base, !this.sentRole) ?? [{
+          ...base, choices: [{ index: 0,
+            delta: { ...(!this.sentRole ? { role: 'assistant' } : {}), content }, finish_reason: null }],
+        }]
+        for (const chunk of chunks) transStream.write('data: ' + JSON.stringify(chunk) + '\n\n')
+        if (chunks.length) this.sentRole = true
       }
-    }
-
-    let decompressStream: any = stream
-    
-    if (contentEncoding === 'gzip') {
-      console.log('[Qwen] Decompressing gzip stream...')
-      decompressStream = stream.pipe(createGunzip())
-    } else if (contentEncoding === 'deflate') {
-      console.log('[Qwen] Decompressing deflate stream...')
-      decompressStream = stream.pipe(createInflate())
-    } else if (contentEncoding === 'br') {
-      console.log('[Qwen] Decompressing brotli stream...')
-      decompressStream = stream.pipe(createBrotliDecompress())
-    } else if (contentEncoding === 'zstd') {
-      console.log('[Qwen] Decompressing zstd stream...')
-      const chunks: Buffer[] = []
-      stream.on('data', (chunk: Buffer) => chunks.push(chunk))
-      stream.once('end', () => {
-        if (streamEnded) return
-        try {
-          const compressedData = Buffer.concat(chunks)
-          ZstdCodec.run((zstd) => {
-            const simple = new zstd.Simple()
-            const decompressed = simple.decompress(compressedData)
-            const decompressedStr = Buffer.from(decompressed).toString('utf8')
-            buffer = decompressedStr
-            processBuffer()
-            safeEnd('data: [DONE]\n\n')
-          })
-        } catch (err) {
-          console.error('[Qwen] Zstd decompression error:', err)
-          safeEnd('data: [DONE]\n\n')
-        }
-      })
-      stream.once('error', (err: Error) => {
-        console.error('[Qwen] Stream error:', err)
-        safeEnd('data: [DONE]\n\n')
-      })
-      return transStream
-    }
-
-    decompressStream.on('data', (bufferChunk: Buffer) => {
-      if (streamEnded) return
-      buffer += bufferChunk.toString()
-      processBuffer()
+    }, () => {
+      const base = createBaseChunk(this.responseId || this.sessionId, this.model, this.created)
+      const chunks = this.toolStreamParser?.flush(base) ?? []
+      const frames = chunks.map(chunk => 'data: ' + JSON.stringify(chunk) + '\n\n')
+      frames.push('data: ' + JSON.stringify({
+        ...base,
+        choices: [{ index: 0, delta: {},
+          finish_reason: this.toolStreamParser?.hasEmittedToolCall() ? 'tool_calls' : 'stop' }],
+      }) + '\n\n')
+      return () => {
+        for (const frame of frames) transStream.write(frame)
+        transStream.end('data: [DONE]\n\n')
+      }
+    }, () => {
+      try {
+        transStream.end('data: ' + JSON.stringify({
+          error: { message: 'Qwen upstream stream did not complete', type: 'api_error' },
+        }) + '\n\n')
+      } catch {
+        transStream.destroy()
+      }
     })
-    decompressStream.once('error', (err: Error) => {
-      console.error('[Qwen] Stream error:', err)
-      safeEnd('data: [DONE]\n\n')
-    })
-    decompressStream.once('close', () => {
-      console.log('[Qwen] Stream closed')
-      if (streamEnded) return
-      processBuffer()
-      safeEnd('data: [DONE]\n\n')
-    })
-
     return transStream
   }
 
   async handleNonStream(stream: any, response?: AxiosResponse): Promise<any> {
-    console.log('[Qwen] Starting non-stream handler...')
-
     return new Promise((resolve, reject) => {
-      const data: {
-        id: string
-        model: string
-        object: string
-        choices: Array<{
-          index: number
-          message: { role: string; content: string | null; reasoning_content?: string; tool_calls?: any[] }
-          finish_reason: string
-        }>
-        usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number }
-        created: number
-      } = {
-        id: '',
-        model: this.model,
-        object: 'chat.completion',
-        choices: [
-          {
-            index: 0,
-            message: { role: 'assistant', content: '' },
-            finish_reason: 'stop',
-          },
-        ],
-        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
-        created: this.created,
-      }
-
-      let contentAccumulator = ''
-      let thinkingAccumulator = ''
-      let buffer = ''
-      let resolved = false
-
-      const finalizeWithData = (content: string) => {
-        const { content: cleanContent, toolCalls } = this.toolCallingPlan?.shouldParseResponse
-          ? { content, toolCalls: [] }
-          : parseToolCallsFromText(content, 'qwen')
-        if (toolCalls.length > 0) {
-          data.choices[0].message.content = null
-          data.choices[0].message.tool_calls = toolCalls
-          data.choices[0].finish_reason = 'tool_calls'
-        } else {
-          data.choices[0].message.content = cleanContent.trim()
+      this.consumeResponse(stream, response, () => {}, () => {
+        const { content, toolCalls } =
+          (this.toolCallingPlan?.toolChoiceMode === 'none' || this.toolCallingPlan?.shouldParseResponse)
+          ? { content: this.content, toolCalls: [] }
+          : parseToolCallsFromText(this.content, 'qwen')
+        if (!content.trim() && toolCalls.length === 0) throw qwenDecodingFailure()
+        const message: any = { role: 'assistant', content: toolCalls.length ? null : content.trim() }
+        if (this.thinkingContent) message.reasoning_content = this.thinkingContent
+        if (toolCalls.length) message.tool_calls = toolCalls
+        const result = {
+          id: this.sessionId, model: this.model, object: 'chat.completion', created: this.created,
+          choices: [{ index: 0, message, finish_reason: toolCalls.length ? 'tool_calls' : 'stop' }],
         }
-      }
-
-      const processBuffer = () => {
-        while (true) {
-          const doubleNewlineIndex = buffer.indexOf('\n\n')
-          if (doubleNewlineIndex === -1) break
-
-          const eventBlock = buffer.substring(0, doubleNewlineIndex)
-          buffer = buffer.substring(doubleNewlineIndex + 2)
-
-          const lines = eventBlock.split('\n')
-          let eventType = 'message'
-          let eventData = ''
-
-          for (const line of lines) {
-            if (line.startsWith('event:')) {
-              eventType = line.substring(6).trim()
-            } else if (line.startsWith('data:')) {
-              eventData = line.substring(5)
-            }
-          }
-
-          if (eventData && eventData !== '[DONE]') {
-            try {
-              const result = JSON.parse(eventData)
-              console.log('[Qwen] Non-stream parsed event:', eventType, 'data keys:', Object.keys(result))
-
-              if (result.communication) {
-                if (!data.id && result.communication.sessionid) {
-                  data.id = result.communication.sessionid
-                  this.sessionId = result.communication.sessionid
-                }
-              }
-
-              if (result.data?.messages) {
-                for (const msg of result.data.messages) {
-                  // Handle thinking content from meta_data.multi_load
-                  // Strategy: prefer deep_think, fall back to multimodal_chat_think only if no deep_think
-                  const metaData = msg.meta_data || {}
-                  const multiLoad = metaData.multi_load || []
-                  let hasDeepThink = false
-                  for (const load of multiLoad) {
-                    if (load.type === 'deep_think' && load.content) {
-                      const thinkContent = load.content.think_content || load.content.content || ''
-                      if (thinkContent && thinkContent.length > thinkingAccumulator.length) {
-                        thinkingAccumulator = thinkContent
-                        console.log('[Qwen] Non-stream: Thinking content length:', thinkingAccumulator.length, 'type: deep_think')
-                      }
-                      hasDeepThink = true
-                    }
-                  }
-                  // Fall back to multimodal_chat_think only if no deep_think found
-                  if (!hasDeepThink) {
-                    for (const load of multiLoad) {
-                      if (load.type === 'multimodal_chat_think' && load.content) {
-                        const thinkContent = load.content.think_content || load.content.content || ''
-                        if (thinkContent && thinkContent.length > thinkingAccumulator.length) {
-                          thinkingAccumulator = thinkContent
-                          console.log('[Qwen] Non-stream: Thinking content length:', thinkingAccumulator.length, 'type: multimodal_chat_think (fallback)')
-                        }
-                      }
-                    }
-                  }
-                  
-                  // Handle multi_load/iframe content (actual response content)
-                  if (msg.mime_type === 'multi_load/iframe' && msg.content) {
-                    // Filter out deep_think and multimodal_chat_think markers
-                    let filteredContent = msg.content
-                    if (filteredContent === '[(deep_think)]' || filteredContent.trim() === '[(deep_think)]') {
-                      console.log('[Qwen] Non-stream: Skipping deep_think marker')
-                      continue
-                    }
-                    // Filter out all think markers: [(deep_think)], [(multimodal_chat_think_*)]
-                    filteredContent = filteredContent.replace(/\[\(deep_think\)\]/g, '')
-                    filteredContent = filteredContent.replace(/\[\(multimodal_chat_think_\d+\)\]/g, '')
-                    if (filteredContent.length > contentAccumulator.length) {
-                      contentAccumulator = filteredContent
-                      console.log('[Qwen] Non-stream multi_load/iframe content length:', contentAccumulator.length)
-                    }
-                  }
-                  
-                  // Also handle text/plain content
-                  if (msg.mime_type === 'text/plain' && msg.content) {
-                    // Filter out deep_think and multimodal_chat_think markers
-                    let filteredContent = msg.content.replace(/\[\(deep_think\)\]/g, '')
-                    filteredContent = filteredContent.replace(/\[\(multimodal_chat_think_\d+\)\]/g, '')
-                    if (filteredContent.length > contentAccumulator.length) {
-                      contentAccumulator = filteredContent
-                    }
-                  }
-
-                  if (msg.status === 'complete' || msg.status === 'finished') {
-                    if (msg.mime_type === 'multi_load/iframe') {
-                      console.log('[Qwen] Non-stream finished, content length:', contentAccumulator.length)
-                      this.content = contentAccumulator
-                      
-                      // Parse tool calls from content
-                      const { content: cleanContent, toolCalls } = this.toolCallingPlan?.shouldParseResponse
-                        ? { content: contentAccumulator, toolCalls: [] }
-                        : parseToolCallsFromText(contentAccumulator, 'qwen')
-                      
-                      if (toolCalls.length > 0) {
-                        data.choices[0].message.content = null
-                        ;(data.choices[0].message as any).tool_calls = toolCalls
-                        data.choices[0].finish_reason = 'tool_calls'
-                      } else {
-                        data.choices[0].message.content = cleanContent.trim()
-                      }
-                      
-                      // Add reasoning_content if available
-                      if (thinkingAccumulator) {
-                        data.choices[0].message.reasoning_content = thinkingAccumulator
-                      }
-                      
-                      this.onEnd?.(this.sessionId)
-                      resolved = true
-                      resolve(data)
-                      return
-                    }
-                  }
-                }
-              }
-            } catch (err) {
-              console.error('[Qwen] Non-stream parse error:', err)
-            }
-          }
-
-          if (eventType === 'complete' && !resolved) {
-            console.log('[Qwen] Non-stream complete event, content length:', contentAccumulator.length)
-            this.content = contentAccumulator
-            finalizeWithData(contentAccumulator)
-            // Add reasoning_content if available
-            if (thinkingAccumulator) {
-              data.choices[0].message.reasoning_content = thinkingAccumulator
-            }
-            resolved = true
-            resolve(data)
-            return
-          }
-        }
-      }
-
-      let decompressStream: any = stream
-      
-      const contentEncoding = response?.headers?.['content-encoding']?.toLowerCase()
-      if (contentEncoding === 'gzip') {
-        console.log('[Qwen] Decompressing gzip stream...')
-        decompressStream = stream.pipe(createGunzip())
-      } else if (contentEncoding === 'deflate') {
-        console.log('[Qwen] Decompressing deflate stream...')
-        decompressStream = stream.pipe(createInflate())
-      } else if (contentEncoding === 'br') {
-        console.log('[Qwen] Decompressing brotli stream...')
-        decompressStream = stream.pipe(createBrotliDecompress())
-      } else if (contentEncoding === 'zstd') {
-        console.log('[Qwen] Decompressing zstd stream...')
-        const chunks: Buffer[] = []
-        stream.on('data', (chunk: Buffer) => chunks.push(chunk))
-        stream.once('end', () => {
-          try {
-            const compressedData = Buffer.concat(chunks)
-            ZstdCodec.run((zstd) => {
-              const simple = new zstd.Simple()
-              const decompressed = simple.decompress(compressedData)
-              const decompressedStr = Buffer.from(decompressed).toString('utf8')
-              buffer = decompressedStr
-              processBuffer()
-              console.log('[Qwen] Zstd non-stream finished, content length:', contentAccumulator.length)
-              this.content = contentAccumulator
-              finalizeWithData(contentAccumulator)
-              // Add reasoning_content if available
-              if (thinkingAccumulator) {
-                data.choices[0].message.reasoning_content = thinkingAccumulator
-              }
-              resolve(data)
-            })
-          } catch (err) {
-            console.error('[Qwen] Zstd decompression error:', err)
-            reject(err)
-          }
-        })
-        stream.once('error', (err: Error) => {
-          console.error('[Qwen] Non-stream error:', err)
-          reject(err)
-        })
-        return
-      }
-
-      decompressStream.on('data', (chunk: Buffer) => {
-        if (resolved) return
-        buffer += chunk.toString()
-        processBuffer()
-      })
-      decompressStream.once('error', (err: Error) => {
-        if (resolved) return
-        console.error('[Qwen] Non-stream error:', err)
-        reject(err)
-      })
-      decompressStream.once('close', () => {
-        console.log('[Qwen] Non-stream closed, content length:', contentAccumulator.length)
-        if (!resolved) {
-          processBuffer()
-          this.content = contentAccumulator
-          finalizeWithData(contentAccumulator)
-          // Add reasoning_content if available
-          if (thinkingAccumulator) {
-            data.choices[0].message.reasoning_content = thinkingAccumulator
-          }
-          resolve(data)
-        }
-      })
-      decompressStream.once('end', () => {
-        console.log('[Qwen] Non-stream ended, content length:', contentAccumulator.length)
-        if (!resolved) {
-          processBuffer()
-          this.content = contentAccumulator
-          finalizeWithData(contentAccumulator)
-          // Add reasoning_content if available
-          if (thinkingAccumulator) {
-            data.choices[0].message.reasoning_content = thinkingAccumulator
-          }
-          resolve(data)
-        }
-      })
+        return () => resolve(result)
+      }, () => reject(qwenDecodingFailure()))
     })
   }
 

@@ -16,7 +16,15 @@ import {
   CredentialInfo,
   AdapterConfig,
   OAuthProgressEvent,
-} from './types'
+} from '../types'
+
+function escapeCallbackText(value: string): string {
+  return value.replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
 
 /**
  * OAuth adapter abstract base class
@@ -133,7 +141,11 @@ export abstract class BaseOAuthAdapter {
       errorDescription: url.searchParams.get('error_description') || undefined,
     }
 
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+    res.writeHead(200, {
+      'Content-Type': 'text/html; charset=utf-8',
+      'X-Content-Type-Options': 'nosniff',
+      'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'",
+    })
     res.end(`
       <!DOCTYPE html>
       <html>
@@ -165,15 +177,12 @@ export abstract class BaseOAuthAdapter {
       <body>
         <div class="container">
           ${data.error 
-            ? `<h1 class="error">❌ Login Failed</h1><p>${data.errorDescription || data.error}</p>`
+            ? `<h1 class="error">❌ Login Failed</h1><p>${escapeCallbackText(data.errorDescription || data.error)}</p>`
             : `<h1 class="success">✅ Login Successful</h1><p>Processing, please wait...</p>`
           }
           <p style="font-size: 12px; opacity: 0.7;">This window can be closed</p>
         </div>
         <script>
-          if (window.electronAPI) {
-            window.electronAPI.send('oauth:callback', ${JSON.stringify(data)});
-          }
           setTimeout(() => window.close(), 2000);
         </script>
       </body>

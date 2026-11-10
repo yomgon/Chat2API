@@ -7,10 +7,9 @@ import Router from '@koa/router'
 import type { Context } from 'koa'
 import { managementAuthMiddleware } from '../../middleware/managementAuth'
 import ConfigManager from '../../../store/config'
+import type { AppConfig } from '../../../store/types'
 import type {
   ManagementApiResponse,
-  AppConfig,
-  ConfigUpdateRequest,
 } from '../../../../shared/types'
 
 const router = new Router({ prefix: '/v0/management/config' })
@@ -107,7 +106,7 @@ router.get('/', async (ctx: Context) => {
 
 router.put('/', async (ctx: Context) => {
   try {
-    const updates = ctx.request.body as ConfigUpdateRequest
+    const updates = ctx.request.body as Partial<AppConfig>
 
     if (!updates || typeof updates !== 'object') {
       ctx.status = 400

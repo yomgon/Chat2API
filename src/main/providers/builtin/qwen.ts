@@ -15,6 +15,15 @@ export const qwenConfig: BuiltinProviderConfig = {
   },
   enabled: true,
   description: 'Qwen AI assistant by Alibaba Cloud (www.qianwen.com)',
+  // The current first-party www.qianwen.com web bundle reads this model list
+  // from its CHAT_NA backend. Requires a valid website session; response
+  // schema/individual model authorization still needs live account validation.
+  modelsApiEndpoint: 'https://chat2-api.qianwen.com/api/v1/model/list',
+  modelsApiHeaders: {
+    Accept: 'application/json',
+    Origin: 'https://www.qianwen.com',
+    Referer: 'https://www.qianwen.com/',
+  },
   supportedModels: [
     'Qwen3.6',
     'Qwen3.7-Max',

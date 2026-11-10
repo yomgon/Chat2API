@@ -36,7 +36,7 @@ export function SessionManagement() {
       const sessionConfig = await window.electronAPI.session.getConfig()
       setConfig(sessionConfig)
     } catch (error) {
-      console.error('Failed to load session config:', error)
+      console.error('Failed to load session config:')
     }
   }
 

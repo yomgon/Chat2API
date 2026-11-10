@@ -7,22 +7,24 @@ export function sanitizeRequestLogEntry(
 ): Omit<RequestLogEntry, 'id'> {
   const sanitized: Omit<RequestLogEntry, 'id'> = {
     ...entry,
-    userInput: truncateText(entry.userInput, 500),
+    userInput: config.includeBodies
+      ? sanitizeRequestLogBody(entry.userInput, config)
+      : undefined,
     errorStack: undefined,
   }
 
   if (!config.includeBodies) {
     sanitized.requestBody = undefined
     sanitized.responseBody = undefined
-    sanitized.responsePreview = truncateText(entry.responsePreview, 1000)
-    sanitized.errorMessage = truncateText(entry.errorMessage, 1000)
+    sanitized.responsePreview = undefined
+    sanitized.errorMessage = sanitizeRequestLogError(entry.errorMessage, config)
     return sanitized
   }
 
   sanitized.requestBody = sanitizeRequestLogBody(entry.requestBody, config)
   sanitized.responseBody = sanitizeRequestLogBody(entry.responseBody, config)
-  sanitized.responsePreview = truncateText(entry.responsePreview, 1000)
-  sanitized.errorMessage = truncateText(entry.errorMessage, 1000)
+  sanitized.responsePreview = sanitizeRequestLogBody(entry.responsePreview, config)
+  sanitized.errorMessage = sanitizeRequestLogError(entry.errorMessage, config)
 
   return sanitized
 }
@@ -33,22 +35,24 @@ export function sanitizeRequestLogUpdates(
 ): Partial<RequestLogEntry> {
   const sanitized: Partial<RequestLogEntry> = {
     ...updates,
-    userInput: truncateText(updates.userInput, 500),
+    userInput: config.includeBodies
+      ? sanitizeRequestLogBody(updates.userInput, config)
+      : undefined,
     errorStack: undefined,
   }
 
   if (!config.includeBodies) {
     sanitized.requestBody = undefined
     sanitized.responseBody = undefined
-    sanitized.responsePreview = truncateText(updates.responsePreview, 1000)
-    sanitized.errorMessage = truncateText(updates.errorMessage, 1000)
+    sanitized.responsePreview = undefined
+    sanitized.errorMessage = sanitizeRequestLogError(updates.errorMessage, config)
     return sanitized
   }
 
   sanitized.requestBody = sanitizeRequestLogBody(updates.requestBody, config)
   sanitized.responseBody = sanitizeRequestLogBody(updates.responseBody, config)
-  sanitized.responsePreview = truncateText(updates.responsePreview, 1000)
-  sanitized.errorMessage = truncateText(updates.errorMessage, 1000)
+  sanitized.responsePreview = sanitizeRequestLogBody(updates.responsePreview, config)
+  sanitized.errorMessage = sanitizeRequestLogError(updates.errorMessage, config)
 
   return sanitized
 }
@@ -76,6 +80,11 @@ function sanitizeRequestLogBody(value: string | undefined, config: RequestLogCon
   return truncateText(redacted, config.maxBodyChars)
 }
 
+function sanitizeRequestLogError(value: string | undefined, config: RequestLogConfig): string | undefined {
+  if (!value) return value
+  return truncateText(redactSensitiveText(value), Math.min(config.maxBodyChars, 1000))
+}
+
 function truncateText(value: string | undefined, maxChars: number): string | undefined {
   if (!value) return value
   if (maxChars <= 0) return undefined
@@ -84,7 +93,7 @@ function truncateText(value: string | undefined, maxChars: number): string | und
 }
 
 function redactSensitiveText(value: string): string {
-  return value.replace(
+  return value.replace(/\b(Bearer\s+)[A-Za-z0-9._~+/=-]+/gi, '$1[REDACTED]').replace(
     /(\"?(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|cookie|set-cookie|password|token)\"?\s*[:=]\s*)\"?[^\",}\]\s]+\"?/gi,
     '$1"[REDACTED]"',
   )

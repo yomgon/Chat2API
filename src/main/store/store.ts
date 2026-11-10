@@ -42,6 +42,7 @@ import { normalizeRequestLogConfig } from '../requestLogs/types'
 import { normalizeToolCallingConfig } from '../../shared/toolCalling'
 import { AppLogManager } from '../appLogs/manager'
 import type { AppLogFilter } from '../appLogs/types'
+import { encodeConfigSecrets, decodeConfigSecrets, redactExportConfigSecrets } from './configSecrets'
 
 // Dynamically import electron-store (ESM module)
 let Store: any = null
@@ -51,11 +52,50 @@ let Store: any = null
  */
 type StoreType = any
 
+const CREDENTIAL_ENCRYPTION_PREFIX = 'safeStorage:v1:'
+const COOKIE_ENCRYPTION_PREFIX = 'safeStorage:cookies:v1:'
+const PROVIDER_HEADER_ENCRYPTION_PREFIX = 'safeStorage:provider-header:v1:'
+
+/**
+ * An explicitly synced web-chat catalog is allowed to survive startup only
+ * when its vendor has a shipped, fixed discovery endpoint and the cached
+ * names/IDs are structurally safe. Ordinary built-in lists still follow the
+ * bundled defaults. Never infer account entitlement from this metadata.
+ */
+function hasValidWebModelCatalog(
+  provider: Provider,
+  builtin: { modelsApiEndpoint?: string },
+): boolean {
+  const marker = provider.modelCatalog
+  const names = provider.supportedModels
+  const mapping = provider.modelMappings
+  if (!builtin.modelsApiEndpoint || marker?.source !== 'provider-web'
+    || !Number.isSafeInteger(marker.syncedAt) || marker.syncedAt <= 0
+    || marker.syncedAt > Date.now() + 300_000
+    || !Array.isArray(names) || names.length < 1 || names.length > 200
+    || !mapping || typeof mapping !== 'object' || Array.isArray(mapping)) {
+    return false
+  }
+
+  const keys = Object.keys(mapping)
+  if (keys.length !== names.length || new Set(names).size !== names.length) return false
+  const unsafeName = /[\u0000-\u001f\u007f]/
+  const modelId = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,159}$/
+  const forbidden = new Set(['__proto__', 'constructor', 'prototype'])
+  return names.every(name =>
+    typeof name === 'string' && name.length > 0 && name.length <= 160
+    && !unsafeName.test(name) && !forbidden.has(name)
+    && Object.prototype.hasOwnProperty.call(mapping, name)
+    && typeof mapping[name] === 'string' && modelId.test(mapping[name])
+    && !forbidden.has(mapping[name]),
+  )
+}
+
 /**
  * Storage Manager Class
  * Responsible for data persistence and encryption
  */
-class StoreManager {
+export class StoreManager {
   private store: StoreType | null = null
   private isInitialized: boolean = false
   private mainWindow: BrowserWindow | null = null
@@ -105,6 +145,13 @@ class StoreManager {
         defaults: this.getDefaultData(),
         encryptionKey: this.getEncryptionKey(),
       })
+      // Before any other startup writer touches config, verify existing OS
+      // ciphertext and migrate recognized legacy keys to protected storage.
+      const secureConfig = this.readStoredConfig()
+      this.writeStoredConfig(secureConfig)
+      // Stored custom headers may contain API keys in arbitrary header names.
+      // Migrate them before normal startup to avoid leaving raw values on disk.
+      this.writeStoredProviders(this.readStoredProviders())
 
       await this.initializeAppLogManager(storagePath)
       await this.initializeRequestLogManager(storagePath)
@@ -112,80 +159,49 @@ class StoreManager {
       await this.initializeDefaultProviders()
       this.isInitialized = true
       this.initializationError = null
-    } catch (error) {
-      console.error('[Store] Failed to initialize storage:', error)
-      this.initializationError = error instanceof Error ? error : new Error(String(error))
-      
-      // Try to recover by backing up corrupted data and reinitializing
-      try {
-        await this.recoverFromCorruptedData(storagePath)
-        this.store = new Store({
-          name: 'data',
-          cwd: storagePath,
-          defaults: this.getDefaultData(),
-          encryptionKey: this.getEncryptionKey(),
-        })
-        await this.initializeAppLogManager(storagePath)
-        await this.initializeRequestLogManager(storagePath)
-        this.initializeDefaultModelMappings()
-        this.isInitialized = true
-        this.initializationError = null
-        console.log('[Store] Successfully recovered from corrupted data')
-      } catch (recoveryError) {
-        console.error('[Store] Failed to recover from corrupted data:', recoveryError)
-        throw this.initializationError
-      }
-    }
-  }
-
-  /**
-   * Recover from corrupted data file
-   * Backup the corrupted file and create a new one
-   */
-  private async recoverFromCorruptedData(storagePath: string): Promise<void> {
-    const { renameSync, existsSync } = await import('fs')
-    const { join } = await import('path')
-    
-    const dataPath = join(storagePath, 'data.json')
-    const backupPath = join(storagePath, `data.corrupted.${Date.now()}.json`)
-    
-    if (existsSync(dataPath)) {
-      console.log('[Store] Backing up corrupted data file to:', backupPath)
-      try {
-        renameSync(dataPath, backupPath)
-        console.log('[Store] Corrupted data file backed up successfully')
-      } catch (backupError) {
-        console.error('[Store] Failed to backup corrupted data:', backupError)
-        throw backupError
-      }
+    } catch {
+      // A locked OS key store or an I/O failure is not evidence of corrupt data.
+      // Leave existing files in place instead of resetting accounts automatically.
+      this.store = null
+      this.initializationError = new Error('Secure storage initialization failed. Existing data was not reset.')
+      console.error('[Store] Secure storage initialization failed; automatic reset is disabled')
+      throw this.initializationError
     }
   }
 
   /**
    * Get Storage Path
-   * Storage path: ~/.chat2api/
+   * This fork must not read or overwrite the upstream application's data.
    */
   private getStoragePath(): string {
-    return join(homedir(), '.chat2api')
+    return join(homedir(), '.chat2api-local-private')
   }
 
   /**
    * Get Encryption Key
-   * Returns a fixed encryption key for electron-store
-   * Note: electron-store uses this key to encrypt/decrypt the data file,
-   * so it must be stable across app restarts
+   * Keep the outer electron-store format compatible. This fixed key is only
+   * obfuscation; account secrets are protected separately by OS safeStorage.
    */
-  private getEncryptionKey(): string | undefined {
+  private getEncryptionKey(): string {
+    this.requireSecureStorage()
+    return 'chat2api-fixed-encryption-key-v1'
+  }
+
+  private requireSecureStorage(): void {
     try {
-      if (safeStorage.isEncryptionAvailable()) {
-        // Use a fixed key - electron-store will use this to encrypt/decrypt data
-        // The key itself is not stored in the data file, only used for encryption
-        return 'chat2api-fixed-encryption-key-v1'
+      if (!safeStorage.isEncryptionAvailable()) {
+        throw new Error('unavailable')
       }
-    } catch (error) {
-      console.warn('Encryption unavailable, using unencrypted storage:', error)
+      // This API is Linux-only. Windows/macOS rely on isEncryptionAvailable().
+      if (process.platform === 'linux') {
+        const backend = safeStorage.getSelectedStorageBackend()
+        if (!backend || backend === 'basic_text' || backend === 'unknown') {
+          throw new Error('unavailable')
+        }
+      }
+    } catch {
+      throw new Error('Secure credential storage is unavailable. Unlock the OS key store and try again.')
     }
-    return undefined
   }
 
   /**
@@ -249,6 +265,9 @@ class StoreManager {
 
     return {
       ...rawConfig,
+      // Malformed persisted flags must never disable local API authentication.
+      enableApiKey: rawConfig.enableApiKey === false ? false : true,
+      apiKeys: Array.isArray(rawConfig.apiKeys) ? rawConfig.apiKeys : [],
       modelMappings: normalizeModelMappingsWithDefaults(rawConfig.modelMappings),
       defaultModelMappingsSeeded: config.defaultModelMappingsSeeded,
       requestLogConfig: normalizeRequestLogConfig(
@@ -259,21 +278,34 @@ class StoreManager {
     }
   }
 
+  /** Always keep decrypted secrets in process memory only. */
+  private readStoredConfig(): AppConfig {
+    const raw = this.normalizeConfig(this.store?.get('config') || DEFAULT_CONFIG)
+    return decodeConfigSecrets(raw, value => this.decryptData(value))
+  }
+
+  /** Single durable writer for the entire AppConfig including OS-protected keys. */
+  private writeStoredConfig(config: AppConfig): AppConfig {
+    const normalized = this.normalizeConfig(config)
+    const stored = encodeConfigSecrets(normalized, value => this.encryptData(value))
+    this.store!.set('config', stored)
+    return normalized
+  }
+
   private initializeDefaultModelMappings(): void {
-    const rawConfig = this.store?.get('config') || DEFAULT_CONFIG
-    const config = this.normalizeConfig(rawConfig)
+    const config = this.readStoredConfig()
     if (config.defaultModelMappingsSeeded) {
-      this.store?.set('config', config)
+      this.writeStoredConfig(config)
       return
     }
-    this.store?.set('config', this.normalizeConfig({
+    this.writeStoredConfig({
       ...config,
       modelMappings: {
         ...createDefaultModelMappings(),
         ...(config.modelMappings || {}),
       },
       defaultModelMappingsSeeded: true,
-    }))
+    })
   }
 
   /**
@@ -281,7 +313,7 @@ class StoreManager {
    * Clear provider list, users create providers by adding accounts
    */
   private async initializeDefaultProviders(): Promise<void> {
-    const providers = this.store?.get('providers') || []
+    const providers = this.readStoredProviders()
     const builtinIds = BUILTIN_PROVIDERS.map(p => p.id)
     
     const validProviders = providers.filter((p: Provider) => {
@@ -308,12 +340,15 @@ class StoreManager {
             }
           }
 
-          return { 
-            ...p, 
+          const keepSyncedModels = hasValidWebModelCatalog(p, builtinConfig)
+          const { modelCatalog, ...providerWithoutCatalog } = p
+          return {
+            ...providerWithoutCatalog,
             apiEndpoint: builtinConfig.apiEndpoint,
             chatPath: builtinConfig.chatPath,
-            supportedModels: builtinConfig.supportedModels,
-            modelMappings: builtinConfig.modelMappings,
+            supportedModels: keepSyncedModels ? [...(p.supportedModels || [])] : builtinConfig.supportedModels,
+            modelMappings: keepSyncedModels ? { ...(p.modelMappings || {}) } : builtinConfig.modelMappings,
+            ...(keepSyncedModels ? { modelCatalog } : {}),
             headers: builtinConfig.headers,
             credentialFields: builtinConfig.credentialFields,
             description: builtinConfig.description,
@@ -326,7 +361,7 @@ class StoreManager {
     if (userModelOverridesChanged) {
       this.store?.set('userModelOverrides', userModelOverrides)
     }
-    this.store?.set('providers', updatedProviders)
+    this.writeStoredProviders(updatedProviders)
   }
 
   /**
@@ -334,7 +369,7 @@ class StoreManager {
    */
   ensureProviderExists(providerId: string): void {
     this.ensureInitialized()
-    const providers = this.store!.get('providers') || []
+    const providers = this.readStoredProviders()
     const exists = providers.some((p: Provider) => p.id === providerId)
     
     if (!exists) {
@@ -356,8 +391,7 @@ class StoreManager {
           supportedModels: builtinConfig.supportedModels,
           modelMappings: builtinConfig.modelMappings,
         }
-        providers.push(newProvider)
-        this.store!.set('providers', providers)
+        this.writeStoredProviders([...providers, newProvider])
         console.log('[Store] Created missing provider:', providerId)
       }
     }
@@ -410,24 +444,23 @@ class StoreManager {
    * @returns Encrypted string
    */
   encryptData(data: string): string {
-    try {
-      console.log('[Store] encryptData input length:', data.length, 'content:', data.substring(0, 20) + '...')
-      if (safeStorage.isEncryptionAvailable()) {
-        // Create new Buffer to store encryption result
-        const encrypted = Buffer.from(safeStorage.encryptString(data))
-        const result = encrypted.toString('base64')
-        console.log('[Store] encryptData output length:', result.length, 'content:', result.substring(0, 20) + '...')
-        // Verify encryption is correct
-        const decrypted = safeStorage.decryptString(encrypted)
-        console.log('[Store] encryptData verify decryption:', decrypted.substring(0, 20) + '...', 'match:', decrypted === data)
-        return result
-      } else {
-        console.log('[Store] Encryption unavailable, returning original data')
-      }
-    } catch (error) {
-      console.error('Failed to encrypt data:', error)
+    if (typeof data !== 'string') {
+      throw new Error('Credential values must be strings')
     }
-    return data
+    this.requireSecureStorage()
+    // Optional empty credential fields contain no secret and need no ciphertext.
+    if (data === '') return ''
+
+    try {
+      const encrypted = safeStorage.encryptString(data)
+      if (!Buffer.isBuffer(encrypted) || encrypted.length === 0 || safeStorage.decryptString(encrypted) !== data) {
+        throw new Error('verification failed')
+      }
+      return CREDENTIAL_ENCRYPTION_PREFIX + encrypted.toString('base64')
+    } catch {
+      // Do not attach the original error: providers/backends can echo secrets.
+      throw new Error('Credential encryption failed. No credential changes were saved.')
+    }
   }
 
   /**
@@ -436,15 +469,82 @@ class StoreManager {
    * @returns Decrypted string
    */
   decryptData(encryptedData: string): string {
-    try {
-      if (safeStorage.isEncryptionAvailable()) {
-        const buffer = Buffer.from(encryptedData, 'base64')
-        return safeStorage.decryptString(buffer)
-      }
-    } catch (error) {
-      console.error('Failed to decrypt data:', error)
+    if (typeof encryptedData !== 'string') {
+      throw new Error('Stored credential is invalid. Sign in again to replace it.')
     }
-    return encryptedData
+    if (encryptedData === '') return ''
+
+    const tagged = encryptedData.startsWith('safeStorage:')
+    if (/^safeStorage/i.test(encryptedData) && !encryptedData.startsWith(CREDENTIAL_ENCRYPTION_PREFIX)) {
+      throw new Error('Stored credential format is unsupported. Sign in again to replace it.')
+    }
+
+    const encoded = tagged ? encryptedData.slice(CREDENTIAL_ENCRYPTION_PREFIX.length) : encryptedData
+    const buffer = Buffer.from(encoded, 'base64')
+    const canonicalBase64 = encoded.length > 0 && buffer.toString('base64') === encoded
+    // Old versions mixed bare Base64 ciphertext and plaintext. Base64-like data
+    // is ambiguous, including unpadded/base64url or damaged OS ciphertext. Never
+    // turn a failed decrypt of those values into an upstream credential.
+    const base64Like = /^[A-Za-z0-9+/_=\s-]+$/.test(encoded)
+    const osCiphertext = /^v\d\d/.test(buffer.subarray(0, 3).toString('ascii')) ||
+      buffer.subarray(0, 4).equals(Buffer.from([1, 0, 0, 0]))
+
+    if (!tagged && !canonicalBase64 && !base64Like && !osCiphertext && this.isLegacyPlaintextCredential(encryptedData)) {
+      // Only recognizable JWT/JWE or cookie syntax is accepted as old plaintext.
+      // Ambiguous opaque tokens need reentry. Account writes re-encrypt all fields.
+      return encryptedData
+    }
+    if (!canonicalBase64) {
+      throw new Error('Stored credential is invalid or ambiguous. Sign in again to replace it.')
+    }
+
+    this.requireSecureStorage()
+    try {
+      return safeStorage.decryptString(buffer)
+    } catch {
+      throw new Error('Stored credential could not be decrypted. Sign in again to replace it.')
+    }
+  }
+
+  private isLegacyPlaintextCredential(value: string): boolean {
+    const parts = value.split('.')
+    const isBase64Url = (part: string): boolean => /^[A-Za-z0-9_-]+$/.test(part) &&
+      Buffer.from(part, 'base64url').toString('base64url') === part
+
+    if ((parts.length === 3 || parts.length === 5) && isBase64Url(parts[0])) {
+      try {
+        const header = JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8'))
+        if (header && typeof header === 'object' && !Array.isArray(header) && typeof header.alg === 'string') {
+          if (parts.length === 3 && parts.slice(1).every(isBase64Url)) {
+            const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'))
+            if (payload && typeof payload === 'object' && !Array.isArray(payload)) return true
+          }
+          if (parts.length === 5 && typeof header.enc === 'string' &&
+            (parts[1] === '' || isBase64Url(parts[1])) && parts.slice(2).every(isBase64Url)) return true
+        }
+      } catch {
+        // Format recognition is only for migration; it does not validate a token.
+      }
+    }
+
+    if (/[\r\n]/.test(value)) return false
+    const cookiePairs = value.split(';').map(part => part.trim())
+    if (cookiePairs[cookiePairs.length - 1] === '') cookiePairs.pop()
+    return cookiePairs.length > 0 && cookiePairs.every(pair =>
+      /^[!#$%&'*+.^_\x60|~0-9A-Za-z-]+=[^\s;]*$/.test(pair)
+    )
+  }
+
+  private copyCookieMap(value: unknown): Record<string, string> {
+    if (!value || typeof value !== 'object' || Array.isArray(value) ||
+      (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null)) {
+      throw new Error('Cookie credentials must be an object of string values')
+    }
+    const entries = Object.entries(value)
+    if (entries.some(([, cookie]) => typeof cookie !== 'string')) {
+      throw new Error('Cookie credentials must be an object of string values')
+    }
+    return Object.fromEntries(entries)
   }
 
   /**
@@ -452,14 +552,19 @@ class StoreManager {
    * @param credentials Credentials object
    * @returns Encrypted credentials object
    */
-  encryptCredentials(credentials: Record<string, string>): Record<string, string> {
-    const encrypted: Record<string, string> = {}
-    
-    for (const [key, value] of Object.entries(credentials)) {
-      encrypted[key] = this.encryptData(value)
+  encryptCredentials(credentials: Record<string, unknown>): Record<string, string> {
+    if (!credentials || typeof credentials !== 'object' || Array.isArray(credentials)) {
+      throw new Error('Credentials must be an object of string values')
     }
-    
-    return encrypted
+    this.requireSecureStorage()
+    return Object.fromEntries(Object.entries(credentials).map(([key, value]) => {
+      if (key === 'cookies' && typeof value !== 'string') {
+        const encrypted = this.encryptData(JSON.stringify(this.copyCookieMap(value)))
+        return [key, COOKIE_ENCRYPTION_PREFIX + encrypted.slice(CREDENTIAL_ENCRYPTION_PREFIX.length)]
+      }
+      if (typeof value !== 'string') throw new Error('Credential values must be strings')
+      return [key, this.encryptData(value)]
+    }))
   }
 
   /**
@@ -467,24 +572,91 @@ class StoreManager {
    * @param encryptedCredentials Encrypted credentials object
    * @returns Decrypted credentials object
    */
-  decryptCredentials(encryptedCredentials: Record<string, string>): Record<string, string> {
-    const decrypted: Record<string, string> = {}
-    
-    for (const [key, value] of Object.entries(encryptedCredentials)) {
-      decrypted[key] = this.decryptData(value)
+  decryptCredentials(encryptedCredentials: Record<string, unknown>): Record<string, string> {
+    if (!encryptedCredentials || typeof encryptedCredentials !== 'object' || Array.isArray(encryptedCredentials)) {
+      throw new Error('Stored credentials are invalid. Sign in again to replace them.')
     }
-    
-    return decrypted
+    const credentials = Object.fromEntries(Object.entries(encryptedCredentials).map(([key, value]) => {
+      // Existing Perplexity OAuth/proxy callers exchange a cookie map despite the
+      // legacy Account type declaring only strings. Keep that shape at runtime.
+      if (key === 'cookies' && typeof value !== 'string') return [key, this.copyCookieMap(value)]
+      if (typeof value !== 'string') throw new Error('Stored credential is invalid. Sign in again to replace it.')
+      if (key === 'cookies' && value.startsWith(COOKIE_ENCRYPTION_PREFIX)) {
+        try {
+          const serialized = this.decryptData(CREDENTIAL_ENCRYPTION_PREFIX + value.slice(COOKIE_ENCRYPTION_PREFIX.length))
+          return [key, this.copyCookieMap(JSON.parse(serialized))]
+        } catch {
+          throw new Error('Stored cookie credentials could not be decrypted. Sign in again to replace them.')
+        }
+      }
+      return [key, this.decryptData(value)]
+    }))
+    return credentials as Record<string, string>
   }
 
   // ==================== Provider Operations ====================
+
+  /** Custom provider header values are OS-encrypted at rest. */
+  private readStoredProviders(): Provider[] {
+    const source = (this.store?.get('providers') || []) as Provider[]
+    if (!Array.isArray(source)) throw new Error('Stored provider data is invalid')
+    return source.map(provider => {
+      if (!provider || typeof provider !== 'object' || Array.isArray(provider)) {
+        throw new Error('Stored provider data is invalid')
+      }
+      const headers = provider.headers || {}
+      if (typeof headers !== 'object' || Array.isArray(headers)) {
+        throw new Error('Stored provider headers are invalid')
+      }
+      const decrypted = Object.fromEntries(Object.entries(headers).map(([name, value]) => {
+        if (typeof value !== 'string') throw new Error('Stored provider headers are invalid')
+        if (value.startsWith(PROVIDER_HEADER_ENCRYPTION_PREFIX)) {
+          const ciphertext = CREDENTIAL_ENCRYPTION_PREFIX + value.slice(PROVIDER_HEADER_ENCRYPTION_PREFIX.length)
+          return [name, this.decryptData(ciphertext)]
+        }
+        // Legacy plaintext is accepted only for one-way migration into OS
+        // protection; this fork does not reuse the upstream data directory.
+        return [name, value]
+      }))
+      return { ...provider, headers: decrypted }
+    })
+  }
+
+  private writeStoredProviders(providers: Provider[]): void {
+    if (!Array.isArray(providers)) throw new Error('Provider data must be a list')
+    const encoded = providers.map(provider => {
+      const headers = provider.headers || {}
+      if (!headers || typeof headers !== 'object' || Array.isArray(headers)) {
+        throw new Error('Provider header configuration is invalid')
+      }
+      const protectedHeaders = Object.fromEntries(Object.entries(headers).map(([name, value]) => {
+        if (!/^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/.test(name) || typeof value !== 'string' || /[\r\n\u0000]/.test(value)) {
+          throw new Error('Provider header configuration is invalid')
+        }
+        const stockHeader = provider.type === 'builtin' && BUILTIN_PROVIDERS.some(builtin =>
+          builtin.id === provider.id && builtin.headers?.[name] === value,
+        )
+        if (stockHeader || value === '') return [name, value]
+        const encrypted = this.encryptData(value)
+        return [name, PROVIDER_HEADER_ENCRYPTION_PREFIX + encrypted.slice(CREDENTIAL_ENCRYPTION_PREFIX.length)]
+      }))
+      return { ...provider, headers: protectedHeaders }
+    })
+    this.store!.set('providers', encoded)
+  }
+
+  /** Replace the full provider list through the OS-encrypted write boundary. */
+  replaceProviders(providers: Provider[]): void {
+    this.ensureInitialized()
+    this.writeStoredProviders(providers)
+  }
 
   /**
    * Get All Providers
    */
   getProviders(): Provider[] {
     this.ensureInitialized()
-    return this.store!.get('providers') || []
+    return this.readStoredProviders()
   }
 
   /**
@@ -492,7 +664,7 @@ class StoreManager {
    */
   getProviderById(id: string): Provider | undefined {
     this.ensureInitialized()
-    const providers = this.store!.get('providers') as Provider[] || []
+    const providers = this.readStoredProviders()
     return providers.find((p: Provider) => p.id === id)
   }
 
@@ -501,9 +673,8 @@ class StoreManager {
    */
   addProvider(provider: Provider): void {
     this.ensureInitialized()
-    const providers = this.store!.get('providers') as Provider[] || []
-    providers.push(provider)
-    this.store!.set('providers', providers)
+    const providers = this.readStoredProviders()
+    this.writeStoredProviders([...providers, provider])
   }
 
   /**
@@ -511,7 +682,7 @@ class StoreManager {
    */
   updateProvider(id: string, updates: Partial<Provider>): Provider | null {
     this.ensureInitialized()
-    const providers = this.store!.get('providers') as Provider[] || []
+    const providers = this.readStoredProviders()
     const index = providers.findIndex((p: Provider) => p.id === id)
     
     if (index === -1) {
@@ -524,7 +695,7 @@ class StoreManager {
       updatedAt: Date.now(),
     }
     
-    this.store!.set('providers', providers)
+    this.writeStoredProviders(providers)
     return providers[index]
   }
 
@@ -533,15 +704,20 @@ class StoreManager {
    */
   deleteProvider(id: string): boolean {
     this.ensureInitialized()
-    const providers = this.store!.get('providers') as Provider[] || []
+    const providers = this.readStoredProviders()
     const index = providers.findIndex((p: Provider) => p.id === id)
     
     if (index === -1) {
       return false
     }
+    // Last line of defense even if another caller bypasses a manager guard.
+    // Preserving built-ins also preserves their per-account session ownership.
+    if (providers[index].type !== 'custom' || BUILTIN_PROVIDERS.some(builtin => builtin.id === id)) {
+      throw new Error('Built-in providers cannot be deleted; disable them instead')
+    }
     
-    providers.splice(index, 1)
-    this.store!.set('providers', providers)
+    const remaining = providers.filter(provider => provider.id !== id)
+    this.writeStoredProviders(remaining)
     
     const accounts = this.store!.get('accounts') as Account[] || []
     const filteredAccounts = accounts.filter((a: Account) => a.providerId !== id)
@@ -646,8 +822,7 @@ class StoreManager {
       credentials: this.encryptCredentials(account.credentials),
     }
     
-    accounts.push(encryptedAccount)
-    this.store!.set('accounts', accounts)
+    this.store!.set('accounts', [...accounts, encryptedAccount])
   }
 
   /**
@@ -662,41 +837,53 @@ class StoreManager {
       return null
     }
     
-    console.log('[Store] Update account:', {
-      id,
-      updatesCredentials: updates.credentials,
-      oldCredentials: accounts[index].credentials,
-      oldCredentialsDecrypted: this.decryptCredentials(accounts[index].credentials),
-    })
-    
+    // Resolve the return value and encrypt before the single write. A failed
+    // decrypt must not turn a metadata update into a partial successful write.
+    // New credentials can replace an unreadable old value without decrypting it.
+    const credentials = updates.credentials !== undefined
+      ? updates.credentials
+      : this.decryptCredentials(accounts[index].credentials)
     const updatedAccount: Account = {
       ...accounts[index],
       ...updates,
+      credentials: this.encryptCredentials(credentials),
       updatedAt: Date.now(),
     }
-    
-    if (updates.credentials) {
-      updatedAccount.credentials = this.encryptCredentials(updates.credentials)
-      console.log('[Store] Encrypted credentials:', updatedAccount.credentials)
-      console.log('[Store] Old credentials:', accounts[index].credentials)
-      console.log('[Store] Credentials match:', JSON.stringify(updatedAccount.credentials) === JSON.stringify(accounts[index].credentials))
-    }
-    
-    accounts[index] = updatedAccount
-    this.store!.set('accounts', accounts)
-    
-    // Verify save was successful
-    const savedAccounts = this.store!.get('accounts') as Account[]
-    const savedAccount = savedAccounts.find(a => a.id === id)
-    console.log('[Store] Verify after save:', {
-      id,
-      savedCredentials: savedAccount?.credentials,
-    })
+
+    this.store!.set('accounts', accounts.map((account: Account, accountIndex: number) =>
+      accountIndex === index ? updatedAccount : account
+    ))
     
     return {
       ...updatedAccount,
-      credentials: updates.credentials || this.decryptCredentials(accounts[index].credentials),
+      credentials,
     }
+  }
+
+  /**
+   * Record one confirmed answer against the latest stored account.
+   * Keep credentials opaque and preserve all non-usage metadata.
+   */
+  recordAccountSuccess(id: string, providerId: string): boolean {
+    this.ensureInitialized()
+    const accounts = this.store!.get('accounts') as Account[] || []
+    const index = accounts.findIndex((account: Account) =>
+      account.id === id && account.providerId === providerId
+    )
+
+    if (index === -1) return false
+
+    const current = accounts[index]
+    const updatedAccount: Account = {
+      ...current,
+      requestCount: (current.requestCount || 0) + 1,
+      todayUsed: (current.todayUsed || 0) + 1,
+      lastUsed: Date.now(),
+    }
+    this.store!.set('accounts', accounts.map((account: Account, accountIndex: number) =>
+      accountIndex === index ? updatedAccount : account
+    ))
+    return true
   }
 
   /**
@@ -741,7 +928,7 @@ class StoreManager {
    */
   getConfig(): AppConfig {
     this.ensureInitialized()
-    return this.normalizeConfig(this.store!.get('config') || DEFAULT_CONFIG)
+    return this.readStoredConfig()
   }
 
   /**
@@ -749,8 +936,7 @@ class StoreManager {
    */
   setConfig(config: AppConfig): void {
     this.ensureInitialized()
-    const normalized = this.normalizeConfig(config)
-    this.store!.set('config', normalized)
+    const normalized = this.writeStoredConfig(config)
     this.requestLogManager?.setConfig(normalized.requestLogConfig)
   }
 
@@ -759,6 +945,15 @@ class StoreManager {
    */
   updateConfig(updates: Partial<AppConfig>): AppConfig {
     this.ensureInitialized()
+    if (Object.prototype.hasOwnProperty.call(updates, 'enableApiKey') &&
+        typeof updates.enableApiKey !== 'boolean') {
+      throw new Error('API key authentication setting must be a boolean')
+    }
+    if (Object.prototype.hasOwnProperty.call(updates, 'apiKeys') &&
+        (!Array.isArray(updates.apiKeys) || updates.apiKeys.some(key =>
+          !key || typeof key.id !== 'string' || typeof key.key !== 'string' || typeof key.enabled !== 'boolean'))) {
+      throw new Error('API key configuration is invalid')
+    }
     const currentConfig = this.getConfig()
     const newConfig = {
       ...currentConfig,
@@ -799,7 +994,7 @@ class StoreManager {
     }
 
     const normalized = this.normalizeConfig(newConfig)
-    this.store!.set('config', normalized)
+    this.writeStoredConfig(normalized)
     this.appLogManager?.setMaxEntries(this.getMaxLogEntries(normalized))
     this.requestLogManager?.setConfig(normalized.requestLogConfig)
     return normalized
@@ -810,7 +1005,7 @@ class StoreManager {
    */
   resetConfig(): AppConfig {
     this.ensureInitialized()
-    this.store!.set('config', DEFAULT_CONFIG)
+    this.writeStoredConfig(DEFAULT_CONFIG)
     this.appLogManager?.setMaxEntries(this.getMaxLogEntries(DEFAULT_CONFIG))
     this.requestLogManager?.setConfig(DEFAULT_CONFIG.requestLogConfig)
     return DEFAULT_CONFIG
@@ -1283,7 +1478,7 @@ class StoreManager {
    */
   getSessionConfig(): SessionConfig {
     this.ensureInitialized()
-    const config = this.store!.get('config') || DEFAULT_CONFIG
+    const config = this.getConfig()
     return config.sessionConfig || DEFAULT_SESSION_CONFIG
   }
 
@@ -1292,7 +1487,7 @@ class StoreManager {
    */
   updateSessionConfig(updates: Partial<SessionConfig>): SessionConfig {
     this.ensureInitialized()
-    const currentConfig = this.store!.get('config') || DEFAULT_CONFIG
+    const currentConfig = this.getConfig()
     const newSessionConfig = {
       ...(currentConfig.sessionConfig || DEFAULT_SESSION_CONFIG),
       ...updates,
@@ -1301,7 +1496,7 @@ class StoreManager {
       ...currentConfig,
       sessionConfig: newSessionConfig,
     }
-    this.store!.set('config', newConfig)
+    this.writeStoredConfig(newConfig)
     return newSessionConfig
   }
 
@@ -1651,13 +1846,14 @@ class StoreManager {
 
     const builtinConfig = BUILTIN_PROVIDERS.find(provider => provider.id === providerId)
     if (builtinConfig) {
-      const providers = (this.store!.get('providers') as Provider[] || []).map(provider => {
+      const providers = this.readStoredProviders().map(provider => {
         if (provider.id !== providerId || provider.type !== 'builtin') {
           return provider
         }
 
+        const { modelCatalog: _staleCatalog, ...providerWithoutCatalog } = provider
         return {
-          ...provider,
+          ...providerWithoutCatalog,
           apiEndpoint: builtinConfig.apiEndpoint,
           chatPath: builtinConfig.chatPath,
           supportedModels: builtinConfig.supportedModels,
@@ -1668,7 +1864,7 @@ class StoreManager {
           updatedAt: Date.now(),
         }
       })
-      this.store!.set('providers', providers)
+      this.writeStoredProviders(providers)
     }
 
     return this.getEffectiveModels(providerId)
@@ -1708,12 +1904,12 @@ class StoreManager {
    */
   exportData(): Omit<StoreSchema, 'accounts'> & { accounts: Omit<Account, 'credentials'>[] } {
     this.ensureInitialized()
-    const providers = this.store!.get('providers') || []
+    const providers = this.readStoredProviders().map(provider => ({ ...provider, headers: {} }))
     const accounts = (this.store!.get('accounts') || []).map((a: Account) => {
       const { credentials, ...rest } = a
       return rest
     })
-    const config = this.store!.get('config') || DEFAULT_CONFIG
+    const config = redactExportConfigSecrets(this.getConfig())
     const logs = this.getAppLogManager().exportLogs()
     const requestLogs = this.getRequestLogManager().exportRequestLogs()
     const systemPrompts = this.store!.get('systemPrompts') || []

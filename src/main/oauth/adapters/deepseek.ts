@@ -66,7 +66,7 @@ export class DeepSeekAdapter extends BaseOAuthAdapter {
         error: 'Please log in via browser, extract Token from Developer Tools and enter manually',
       }
     } catch (error) {
-      console.error('[DeepSeek] startLogin error:', error)
+      console.error('[DeepSeek] Failed to open login browser')
       const errorMessage = error instanceof Error ? error.message : 'Failed to open browser'
       this.emitProgress('error', errorMessage)
       
@@ -149,7 +149,7 @@ export class DeepSeekAdapter extends BaseOAuthAdapter {
         validateStatus: () => true,
       })
       
-      console.log('[DeepSeek OAuth] Response:', response.status, response.data)
+      console.log('[DeepSeek OAuth] Validation response received')
       
       if (response.status !== 200 || !response.data) {
         return {

@@ -70,6 +70,8 @@ export interface BuiltinProviderConfig extends Omit<Provider, 'createdAt' | 'upd
   tokenCheckMethod?: 'GET' | 'POST'
   /** Models list API endpoint for dynamic model fetching */
   modelsApiEndpoint?: string
+  /** Read-only web-model discovery method; Kimi uses a config RPC POST. */
+  modelsApiMethod?: 'GET' | 'POST'
   /** Additional headers for models API request */
   modelsApiHeaders?: Record<string, string>
 }
@@ -107,6 +109,8 @@ export interface Account {
   createdAt: number
   /** Updated time (timestamp) */
   updatedAt: number
+  /** Last time the account's public status was checked. */
+  lastStatusCheck?: number
   /** Error message (when status is error) */
   errorMessage?: string
   /** Request count */
@@ -136,6 +140,8 @@ export interface Provider {
   chatPath?: string
   /** Default request headers */
   headers: Record<string, string>
+  /** Provider-defined credential form metadata (never the credentials). */
+  credentialFields?: CredentialField[]
   /** Whether enabled */
   enabled: boolean
   /** Created time (timestamp) */
@@ -150,6 +156,12 @@ export interface Provider {
   supportedModels?: string[]
   /** Model name mapping */
   modelMappings?: Record<string, string>
+  /** Provenance for a read-only provider-web model discovery. This is not a
+   * successful model invocation or account entitlement claim. */
+  modelCatalog?: {
+    source: 'provider-web'
+    syncedAt: number
+  }
   /** Provider status */
   status?: ProviderStatus
   /** Last status check time */
@@ -187,6 +199,8 @@ export interface AppConfig {
   defaultModelMappingsSeeded?: boolean
   /** UI theme */
   theme: Theme
+  /** Display language; legacy stores can omit it. */
+  language?: 'zh-CN' | 'en-US'
   /** Auto start on boot */
   autoStart: boolean
   /** Auto start proxy on launch */
@@ -704,7 +718,7 @@ export const DEFAULT_CONTEXT_MANAGEMENT_CONFIG: ContextManagementConfig = {
 }
 
 export const DEFAULT_REQUEST_LOG_CONFIG: RequestLogConfig = {
-  enabled: true,
+  enabled: false,
   maxEntries: 200,
   includeBodies: false,
   maxBodyChars: 8000,
@@ -808,7 +822,7 @@ export const DEFAULT_CONFIG: AppConfig = {
   requestTimeout: 60000,
   retryCount: 3,
   apiKeys: [],
-  enableApiKey: false,
+  enableApiKey: true,
   oauthProxyMode: 'system',
   sessionConfig: DEFAULT_SESSION_CONFIG,
   toolCallingConfig: DEFAULT_TOOL_CALLING_CONFIG,

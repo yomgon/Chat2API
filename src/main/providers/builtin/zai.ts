@@ -26,6 +26,15 @@ export const zaiConfig: BuiltinProviderConfig = {
   },
   enabled: true,
   description: 'Z.ai - Free AI Chatbot powered by GLM-5.1, GLM-5, and GLM-4.7',
+  // Read-only model picker used by chat.z.ai, not the paid developer API.
+  modelsApiEndpoint: 'https://chat.z.ai/api/models',
+  modelsApiHeaders: {
+    Accept: 'application/json',
+    'Content-Type': 'application/json',
+    'Accept-Language': 'zh-CN,zh;q=0.9',
+    Origin: 'https://chat.z.ai',
+    Referer: 'https://chat.z.ai/',
+  },
   supportedModels: [
     'GLM-5.1',
     'GLM-5-Turbo',

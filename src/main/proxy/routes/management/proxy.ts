@@ -7,7 +7,9 @@ import Router from '@koa/router'
 import type { Context } from 'koa'
 import { managementAuthMiddleware } from '../../middleware/managementAuth'
 import { proxyServer } from '../../server'
+import { isLocalBindHost } from '../../localSecurity'
 import { proxyStatusManager } from '../../status'
+import { storeManager } from '../../../store/store'
 import type {
   ManagementApiResponse,
   ProxyStatusResponse,
@@ -16,6 +18,38 @@ import type {
 const router = new Router({ prefix: '/v0/management/proxy' })
 
 router.use(managementAuthMiddleware)
+
+let pendingTransition: 'stop' | 'restart' | null = null
+
+function scheduleAfterResponse(
+  ctx: Context,
+  transition: 'stop' | 'restart',
+  operation: () => Promise<boolean>,
+): void {
+  // Waiting for server.close() in the same HTTP handler can deadlock because
+  // the close callback waits for this response to finish.
+  pendingTransition = transition
+  let started = false
+  const run = () => {
+    if (started) return
+    started = true
+    void operation().then(success => {
+      if (!success) storeManager.addLog('error', 'Management proxy ' + transition + ' failed')
+    }).catch(() => {
+      storeManager.addLog('error', 'Management proxy ' + transition + ' encountered an error')
+    }).finally(() => {
+      pendingTransition = null
+    })
+  }
+  ctx.res.once('finish', run)
+  ctx.res.once('close', run)
+  ctx.set('Connection', 'close')
+}
+
+function isValidRestartTarget(port: unknown, host: unknown): boolean {
+  return (port === undefined || (typeof port === 'number' && Number.isInteger(port) && port >= 1 && port <= 65535)) &&
+    (host === undefined || (typeof host === 'string' && isLocalBindHost(host)))
+}
 
 interface ProxyStartRequest {
   port?: number
@@ -96,23 +130,23 @@ router.post('/start', async (ctx: Context) => {
 
 router.post('/stop', async (ctx: Context) => {
   try {
+    if (pendingTransition) {
+      ctx.status = 409
+      ctx.body = createErrorResponse('transition_pending', 'Proxy transition already pending')
+      return
+    }
     if (!proxyServer.isRunning()) {
       ctx.status = 400
       ctx.body = createErrorResponse('not_running', 'Proxy service is not running')
       return
     }
 
-    const success = await proxyServer.stop()
-
-    if (!success) {
-      ctx.status = 500
-      ctx.body = createErrorResponse('stop_failed', 'Failed to stop proxy service')
-      return
-    }
-
+    // HTTP 202 confirms acceptance; GET /status confirms final completion.
+    scheduleAfterResponse(ctx, 'stop', () => proxyServer.stop())
+    ctx.status = 202
     ctx.set('Content-Type', 'application/json')
     ctx.body = createSuccessResponse({
-      isRunning: false,
+      state: 'stopping',
     })
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Failed to stop proxy service'
@@ -123,25 +157,27 @@ router.post('/stop', async (ctx: Context) => {
 
 router.post('/restart', async (ctx: Context) => {
   try {
+    if (pendingTransition) {
+      ctx.status = 409
+      ctx.body = createErrorResponse('transition_pending', 'Proxy transition already pending')
+      return
+    }
     const request = (ctx.request.body as ProxyRestartRequest) || {}
     const port = request.port
     const host = request.host
-
-    const success = await proxyServer.restart(port, host)
-
-    if (!success) {
-      ctx.status = 500
-      ctx.body = createErrorResponse('restart_failed', 'Failed to restart proxy service')
+    if (!isValidRestartTarget(port, host)) {
+      ctx.status = 400
+      ctx.body = createErrorResponse('invalid_target', 'Proxy restart requires a loopback host and valid port')
       return
     }
 
-    const statusData = getProxyStatusData()
-
+    scheduleAfterResponse(ctx, 'restart', () => proxyServer.restart(port, host))
+    ctx.status = 202
     ctx.set('Content-Type', 'application/json')
     ctx.body = createSuccessResponse({
-      isRunning: statusData.isRunning,
-      port: statusData.port,
-      host: statusData.host,
+      state: 'restarting',
+      port: port ?? proxyStatusManager.getPort(),
+      host: host ?? proxyStatusManager.getHost(),
     })
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Failed to restart proxy service'
