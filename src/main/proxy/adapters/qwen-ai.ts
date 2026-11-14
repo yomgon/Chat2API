@@ -5,6 +5,7 @@
  */
 
 import axios, { AxiosResponse } from 'axios'
+import { selectQwenAiToken } from '../../providers/qwenAiToken'
 import { PassThrough } from 'stream'
 import { Account, Provider } from '../../store/types'
 import { hasToolUse, parseToolUse, ToolCall } from '../promptToolUse'
@@ -64,6 +65,8 @@ interface QwenAiMessage {
 
 interface ChatCompletionRequest {
   model: string
+  /** The load balancer has already selected this exact effective web wire ID. */
+  resolvedModelId?: boolean
   /** Original model name before mapping (used for feature detection like thinking mode) */
   originalModel?: string
   messages: QwenAiMessage[]
@@ -113,9 +116,9 @@ export class QwenAiAdapter {
   }
 
   private getToken(): string {
-    const token = this.getCredential(['token', 'accessToken', 'apiKey'])
+    const token = selectQwenAiToken(this.account.credentials)
     // Treat the token as opaque; never coerce objects, trim it or infer a JWT.
-    if (typeof token !== 'string' || !/^[\x21-\x7e]+$/.test(token)) {
+    if (!token) {
       throw new QwenAiProxyFailure('auth-preflight', 'Qwen AI token is invalid or missing')
     }
     return token
@@ -285,7 +288,10 @@ export class QwenAiAdapter {
     this.getToken()
     this.getCookies()
 
-    const modelId = this.mapModel(request.model)
+    // The forwarder passes an effective-catalog wire ID. Mapping it again can
+    // strip a literal -fast suffix or rewrite a discovered ID via old aliases.
+    // Retain historical display-name mapping only for direct legacy callers.
+    const modelId = request.resolvedModelId ? request.model : this.mapModel(request.model)
     
     // Get forced thinking mode setting from originalModel (preserves user's intent before mapping)
     // If originalModel exists, use it for thinking detection; otherwise fall back to request.model
@@ -352,14 +358,12 @@ export class QwenAiAdapter {
     const childId = uuid()
     const ts = Math.floor(Date.now() / 1000)
 
-    // Default to disable thinking mode to avoid automatic reasoning trigger
-    // Users can control thinking via:
-    // 1. Model name suffix: -thinking (force thinking), -fast (force fast mode)
-    // 2. enable_thinking parameter for explicit control
-    // 3. If neither is specified, thinking mode is disabled by default (fast mode)
-    const shouldEnableThinking = forceThinking !== undefined 
-      ? forceThinking 
-      : request.enable_thinking === true
+    // Explicit boolean options take priority over model aliases. Preserve
+    // alias inference only when the caller has not supplied a boolean;
+    // the existing default without either remains fast mode.
+    const shouldEnableThinking = typeof request.enable_thinking === 'boolean'
+      ? request.enable_thinking
+      : forceThinking === true
     
     const featureConfig: Record<string, any> = {
       thinking_enabled: shouldEnableThinking,
@@ -482,7 +486,8 @@ export class QwenAiStreamHandler {
   private streamTerminalSuccess: boolean = false
 
   constructor(model: string, onEnd?: (chatId: string) => void,
-    private readonly allowLegacyToolCalls: boolean = true) {
+    private readonly allowLegacyToolCalls: boolean = true,
+    private readonly normalizeManagedCompletion?: (result: any) => void) {
     this.model = model
     this.created = Math.floor(Date.now() / 1000)
     this.onEnd = onEnd
@@ -524,6 +529,7 @@ export class QwenAiStreamHandler {
     let summaryText = ''
     let finishReason: QwenAiFinishReason = 'stop'
     let pendingBytes = Buffer.alloc(0)
+    let pendingCR = false
     let frameLines: string[] = []
     let frameBytes = 0
     let firstLine = true
@@ -658,6 +664,27 @@ export class QwenAiStreamHandler {
       if (dataLines.length) acceptData(dataLines.join('\n'))
     }
 
+    const acceptLine = () => {
+      const decoded = pendingBytes.toString('utf8')
+      // Buffer decoding substitutes invalid UTF-8. Exact roundtrip rejects
+      // malformed bytes while preserving a genuine U+FFFD and split input.
+      requireQwenValue(Buffer.from(decoded, 'utf8').equals(pendingBytes))
+      frameBytes += pendingBytes.length
+      pendingBytes = Buffer.alloc(0)
+      let line = decoded.slice(0, -1)
+      if (line.endsWith('\r')) line = line.slice(0, -1)
+      if (firstLine && line.startsWith('\uFEFF')) line = line.slice(1)
+      firstLine = false
+      requireQwenValue(!line.includes('\r'))
+      if (line === '') {
+        acceptFrame()
+        frameLines = []
+        frameBytes = 0
+      } else {
+        frameLines.push(line)
+      }
+    }
+
     if (!stream || typeof stream.on !== 'function' || typeof stream.once !== 'function') {
       fail()
       return
@@ -668,7 +695,21 @@ export class QwenAiStreamHandler {
         requireQwenValue(Buffer.isBuffer(chunk))
         let offset = 0
         while (offset < chunk.length && !settled) {
-          const newline = chunk.indexOf(10, offset)
+          // Defer a trailing CR so a split CRLF is one delimiter, with both
+          // bytes charged to the same frame before its blank line is reset.
+          if (pendingCR) {
+            pendingCR = false
+            if (chunk[offset] === 10) {
+              requireQwenValue(frameBytes + pendingBytes.length + 1 <= maxFrameBytes)
+              pendingBytes = Buffer.concat([pendingBytes, chunk.subarray(offset, offset + 1)])
+              offset++
+            }
+            acceptLine()
+            continue
+          }
+          const lf = chunk.indexOf(10, offset)
+          const cr = chunk.indexOf(13, offset)
+          const newline = lf < 0 ? cr : cr < 0 ? lf : Math.min(lf, cr)
           const end = newline < 0 ? chunk.length : newline + 1
           const part = chunk.subarray(offset, end)
           // Bound a logical frame, independently of how TCP coalesces chunks.
@@ -676,23 +717,10 @@ export class QwenAiStreamHandler {
           pendingBytes = Buffer.concat([pendingBytes, part])
           offset = end
           if (newline < 0) break
-          const decoded = pendingBytes.toString('utf8')
-          // Buffer decoding substitutes invalid UTF-8. Exact roundtrip rejects
-          // malformed bytes while preserving a genuine U+FFFD and split input.
-          requireQwenValue(Buffer.from(decoded, 'utf8').equals(pendingBytes))
-          frameBytes += pendingBytes.length
-          pendingBytes = Buffer.alloc(0)
-          let line = decoded.slice(0, -1)
-          if (line.endsWith('\r')) line = line.slice(0, -1)
-          if (firstLine && line.startsWith('\uFEFF')) line = line.slice(1)
-          firstLine = false
-          requireQwenValue(!line.includes('\r'))
-          if (line === '') {
-            acceptFrame()
-            frameLines = []
-            frameBytes = 0
+          if (chunk[newline] === 13) {
+            pendingCR = true
           } else {
-            frameLines.push(line)
+            acceptLine()
           }
         }
       } catch {
@@ -706,6 +734,13 @@ export class QwenAiStreamHandler {
     stream.once('end', () => {
       if (settled) return
       try {
+        // A received CR is a real line terminator at EOF. It cannot invent the
+        // second (blank) line needed to dispatch a still-unfinished data event.
+        if (pendingCR) {
+          pendingCR = false
+          acceptLine()
+          if (settled) return
+        }
         requireQwenValue(!pendingBytes.length && !frameLines.length &&
           answerFinished && !!content.trim())
         // Explicit tool_choice:none must not silently reinterpret text/XML as
@@ -756,16 +791,59 @@ export class QwenAiStreamHandler {
       send({ role: 'assistant', content: '' })
     }
     this.consume(stream, delta => {
+      // A managed XML tool response cannot be projected into OpenAI SSE
+      // incrementally: the selected protocol is parsed only after clean EOF.
+      // In that mode, withhold content so no raw XML or false stop leaks.
+      if (this.normalizeManagedCompletion) return
       initial()
       send(delta)
     }, completion => {
-      initial()
-      completion.toolCalls.forEach((call, index) => {
-        send({ tool_calls: [{ index, ...call }] })
-      })
-      send({}, completion.finishReason)
-      output.end('data: [DONE]\n\n')
-      this.notifyCompleted()
+      try {
+        let content: string | null = completion.content
+        let calls = completion.toolCalls
+        let reason = completion.finishReason
+        if (this.normalizeManagedCompletion) {
+          const body = {
+            choices: [{
+              index: 0,
+              message: {
+                role: 'assistant',
+                content,
+                reasoning_content: completion.reasoningContent,
+                ...(calls.length ? { tool_calls: calls } : {}),
+              },
+              finish_reason: reason,
+            }],
+          }
+          this.normalizeManagedCompletion(body)
+          const choice = body.choices[0]
+          content = choice.message.content
+          calls = ('tool_calls' in choice.message ? choice.message.tool_calls : []) as typeof calls
+          reason = choice.finish_reason
+          requireQwenValue((typeof content === 'string' || content === null) &&
+            Array.isArray(calls) && calls.length <= 128 &&
+            calls.every(call => call.type === 'function' &&
+              typeof call.id === 'string' && !!call.id.trim() &&
+              typeof call.function?.name === 'string' && !!call.function.name.trim() &&
+              typeof call.function.arguments === 'string'))
+        }
+        initial()
+        if (this.normalizeManagedCompletion) {
+          if (completion.reasoningContent) send({ reasoning_content: completion.reasoningContent })
+          if (typeof content === 'string' && content) send({ content })
+        }
+        calls.forEach((call, index) => {
+          send({ tool_calls: [{ index, ...call }] })
+        })
+        send({}, reason)
+        output.end('data: [DONE]\n\n')
+        this.notifyCompleted()
+      } catch {
+        this.streamTerminalSuccess = false
+        output.end('data: ' + JSON.stringify({
+          error: { message: 'Qwen AI managed tool output was not confirmed', type: 'api_error' },
+        }) + '\n\n')
+      }
     }, () => {
       output.end('data: ' + JSON.stringify({
         error: { message: 'Qwen AI upstream stream did not complete', type: 'api_error' },

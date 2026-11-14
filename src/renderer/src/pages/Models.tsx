@@ -7,6 +7,7 @@ import { ModelList } from '@/components/models'
 import { ToolCallingPanel } from '@/components/models/ToolCallingPanel'
 import { ModelMappingConfig } from '@/components/proxy'
 import { useProxyStore } from '@/stores/proxyStore'
+import { useProvidersStore } from '@/stores/providersStore'
 
 export function Models() {
   const { t } = useTranslation()
@@ -14,12 +15,37 @@ export function Models() {
   const [searchParams, setSearchParams] = useSearchParams()
   const tabFromUrl = searchParams.get('tab')
   const [activeTab, setActiveTab] = useState(tabFromUrl || 'list')
-  const hasLoadedRef = useRef(false)
-
+  // Store change notifications can finish before an earlier initial IPC read.
+  // The newest metadata snapshot is the only one allowed to publish rows.
+  const modelPageRequestGenerationRef = useRef(0)
   useEffect(() => {
-    if (hasLoadedRef.current) return
-    hasLoadedRef.current = true
-    fetchAppConfig()
+    const refresh = async (kind?: 'config' | 'providers' | 'accounts') => {
+      const readRows = !kind || kind === 'providers' || kind === 'accounts'
+      const generation = readRows ? ++modelPageRequestGenerationRef.current : 0
+      if (!kind || kind === 'config') await fetchAppConfig()
+      if (readRows) {
+        if (generation !== modelPageRequestGenerationRef.current) return
+        try {
+          const [providers, accounts] = await Promise.all([
+            window.electronAPI.providers.getAll(),
+            window.electronAPI.accounts.getAll(),
+          ])
+          if (generation !== modelPageRequestGenerationRef.current) return
+          useProvidersStore.getState().setProviders(providers)
+          useProvidersStore.getState().setAccounts(accounts)
+        } catch {
+          // Keep the last known list; an unavailable IPC read is not an empty store.
+        }
+      }
+    }
+    void refresh()
+    const unsubscribe = window.electronAPI?.store?.onChanged?.(kind => {
+      void refresh(kind)
+    })
+    return () => {
+      ++modelPageRequestGenerationRef.current
+      unsubscribe?.()
+    }
   }, [fetchAppConfig])
 
   useEffect(() => {

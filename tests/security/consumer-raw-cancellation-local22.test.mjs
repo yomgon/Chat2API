@@ -5,6 +5,7 @@ import { PassThrough, Transform } from 'node:stream'
 import { createRequire } from 'node:module'
 import vm from 'node:vm'
 import ts from 'typescript'
+import { QWEN_AI_TOKEN_MODULE } from './helpers/qwenAiTokenModule.mjs'
 
 // Run actual Z.ai/Qwen International handler + common gate with an in-memory
 // raw Readable. Local source destruction is NOT evidence of remote cancellation.
@@ -36,6 +37,7 @@ const promptTools = evaluate(transpile('promptToolUse.ts'), {}, 'promptToolUse.t
 const gate = evaluate(transpile('streamTerminalGate.ts'),
   { stream: { PassThrough, Transform } }, 'streamTerminalGate.ts')
 const qwen = evaluate(transpile('adapters/qwen-ai.ts'), {
+  '../../providers/qwenAiToken': QWEN_AI_TOKEN_MODULE,
   axios: { __esModule: true, default: { create: () => ({
     get: forbidden, post: forbidden, delete: forbidden,
   }) } },

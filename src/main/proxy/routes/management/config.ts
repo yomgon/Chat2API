@@ -18,6 +18,16 @@ router.use(managementAuthMiddleware)
 
 const SENSITIVE_KEYS = ['managementApiSecret', 'apiKeys', 'credentials']
 
+function containsProtectedConfigWrite(updates: Partial<AppConfig>): boolean {
+  if (Object.prototype.hasOwnProperty.call(updates, 'apiKeys')) return true
+  if (Object.prototype.hasOwnProperty.call(updates, 'managementApi')) {
+    const managementApi = updates.managementApi
+    if (managementApi && typeof managementApi === 'object' && !Array.isArray(managementApi) &&
+        Object.prototype.hasOwnProperty.call(managementApi, 'managementApiSecret')) return true
+  }
+  return false
+}
+
 function maskSensitiveValue(value: unknown, key?: string): unknown {
   if (typeof value === 'string') {
     if (key && SENSITIVE_KEYS.some(k => key.toLowerCase().includes(k.toLowerCase()))) {
@@ -108,13 +118,25 @@ router.put('/', async (ctx: Context) => {
   try {
     const updates = ctx.request.body as Partial<AppConfig>
 
-    if (!updates || typeof updates !== 'object') {
+    if (!updates || typeof updates !== 'object' || Array.isArray(updates)) {
       ctx.status = 400
       ctx.body = {
         success: false,
         error: {
           code: 'invalid_request',
           message: 'Request body must be a valid configuration object',
+        },
+      } as ManagementApiResponse
+      return
+    }
+
+    if (containsProtectedConfigWrite(updates)) {
+      ctx.status = 400
+      ctx.body = {
+        success: false,
+        error: {
+          code: 'invalid_request',
+          message: 'API keys and the management API secret must be changed through their dedicated management endpoints',
         },
       } as ManagementApiResponse
       return
@@ -161,7 +183,7 @@ router.get('/:key', async (ctx: Context) => {
 
     const config = ConfigManager.get()
 
-    if (!(key in config)) {
+    if (!Object.prototype.hasOwnProperty.call(config, key)) {
       ctx.status = 404
       ctx.body = {
         success: false,
@@ -196,7 +218,20 @@ router.get('/:key', async (ctx: Context) => {
 router.put('/:key', async (ctx: Context) => {
   try {
     const key = ctx.params.key as keyof AppConfig
-    const { value } = ctx.request.body as { value: unknown }
+    const body = ctx.request.body as unknown
+    if (!body || typeof body !== 'object' || Array.isArray(body) ||
+        !Object.prototype.hasOwnProperty.call(body, 'value')) {
+      ctx.status = 400
+      ctx.body = {
+        success: false,
+        error: {
+          code: 'invalid_request',
+          message: 'Request body must contain a "value" field',
+        },
+      } as ManagementApiResponse
+      return
+    }
+    const { value } = body as { value: unknown }
 
     if (value === undefined) {
       ctx.status = 400
@@ -210,9 +245,23 @@ router.put('/:key', async (ctx: Context) => {
       return
     }
 
+    if (key === 'apiKeys' ||
+        (key === 'managementApi' && value && typeof value === 'object' && !Array.isArray(value) &&
+          Object.prototype.hasOwnProperty.call(value, 'managementApiSecret'))) {
+      ctx.status = 400
+      ctx.body = {
+        success: false,
+        error: {
+          code: 'invalid_request',
+          message: 'API keys and the management API secret must be changed through their dedicated management endpoints',
+        },
+      } as ManagementApiResponse
+      return
+    }
+
     const config = ConfigManager.get()
 
-    if (!(key in config)) {
+    if (!Object.prototype.hasOwnProperty.call(config, key)) {
       ctx.status = 404
       ctx.body = {
         success: false,

@@ -21,12 +21,6 @@ import { ExternalLink, AlertCircle } from 'lucide-react'
 
 type ProviderType = 'deepseek' | 'glm' | 'kimi' | 'mimo' | 'minimax' | 'qwen' | 'zai'
 
-interface OAuthLoginResult {
-  success: boolean
-  credentials?: Record<string, string>
-  error?: string
-}
-
 interface ManualTokenConfig {
   providerType: ProviderType
   tokenType: string
@@ -226,8 +220,7 @@ export function LoginDialog({
   }, [config])
 
   useEffect(() => {
-    const unsubscribe = window.electronAPI?.on('oauth:progress', (data: unknown) => {
-      const event = data as { status: OAuthProgressStatus; message: string; progress?: number }
+    const unsubscribe = window.electronAPI?.oauth?.onProgress((event) => {
       setProgress({
         status: event.status,
         message: event.message,
@@ -261,7 +254,7 @@ export function LoginDialog({
     if (!config?.loginUrl) return
     
     try {
-      await window.electronAPI?.invoke('app:openExternal', config.loginUrl)
+      await window.electronAPI?.app?.openExternal(config.loginUrl)
     } catch (err) {
       setError(t('oauth.cannotOpenBrowser'))
     }
@@ -283,14 +276,14 @@ export function LoginDialog({
     setProgress({ status: 'pending', message: t('oauth.validatingToken') })
 
     try {
-      const result = await window.electronAPI?.invoke('oauth:loginWithToken', {
+      const result = await window.electronAPI?.oauth?.loginWithToken(
         providerId,
         providerType,
         token,
-        realUserID: isMiniMax ? realUserID.trim() : undefined,
-        mimoUserId: isMimo ? mimoUserId.trim() : undefined,
-        mimoPhToken: isMimo ? mimoPhToken.trim() : undefined,
-      }) as OAuthLoginResult | undefined
+        isMiniMax ? realUserID.trim() : undefined,
+        isMimo ? mimoUserId.trim() : undefined,
+        isMimo ? mimoPhToken.trim() : undefined,
+      )
 
       if (result?.success) {
         setProgress({ status: 'success', message: t('oauth.loginSuccess') })

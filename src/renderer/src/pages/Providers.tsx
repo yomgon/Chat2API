@@ -34,7 +34,6 @@ export function Providers() {
   const { t } = useTranslation()
   const { toast } = useToast()
   const store = useProvidersStore()
-  const hasLoadedRef = useRef(false)
   
   const [viewMode, setViewMode] = useState<ViewMode>('providers')
   const [searchQuery, setSearchQuery] = useState('')
@@ -44,6 +43,10 @@ export function Providers() {
   // Keep a provider-scoped, non-secret catalog failure visible after toast
   // expiry; a transient toast alone hides why the previous model list stayed.
   const [modelRefreshErrors, setModelRefreshErrors] = useState<Record<string, string>>({})
+  // The trusted store can change while a previous multi-IPC page load is
+  // pending. Only the latest generation may publish provider/account rows;
+  // an older completed fetch must not undo a saved edit or a reconnect.
+  const dataRequestGenerationRef = useRef(0)
   
   const [showAddProviderDialog, setShowAddProviderDialog] = useState(false)
   const [showCustomProviderForm, setShowCustomProviderForm] = useState(false)
@@ -57,11 +60,10 @@ export function Providers() {
   const [modelEditorProvider, setModelEditorProvider] = useState<{ id: string; name: string } | null>(null)
   
   useEffect(() => {
-    if (hasLoadedRef.current) return
-    hasLoadedRef.current = true
-    
     const loadInitialData = async () => {
+      const generation = ++dataRequestGenerationRef.current
       if (!window.electronAPI?.providers?.getAll) {
+        if (generation !== dataRequestGenerationRef.current) return
         console.log('electronAPI not available')
         useProvidersStore.getState().setIsLoading(false)
         useProvidersStore.getState().setProviders([])
@@ -77,6 +79,7 @@ export function Providers() {
           window.electronAPI.providers.getBuiltin(),
           window.electronAPI.accounts.getAll(),
         ])
+        if (generation !== dataRequestGenerationRef.current) return
         
         useProvidersStore.getState().setProviders(providersData)
         useProvidersStore.getState().setBuiltinProviders(builtinData)
@@ -102,13 +105,24 @@ export function Providers() {
         useProvidersStore.getState().setProviderStatuses(statusMap)
         useProvidersStore.getState().setAccountCounts(countMap)
       } catch (error) {
-        console.error('Failed to load providers:')
+        if (generation === dataRequestGenerationRef.current) {
+          console.error('Failed to load providers:')
+        }
       } finally {
-        useProvidersStore.getState().setIsLoading(false)
+        if (generation === dataRequestGenerationRef.current) {
+          useProvidersStore.getState().setIsLoading(false)
+        }
       }
     }
     
-    loadInitialData()
+    void loadInitialData()
+    const unsubscribe = window.electronAPI?.store?.onChanged?.(kind => {
+      if (kind === 'providers' || kind === 'accounts') void loadInitialData()
+    })
+    return () => {
+      ++dataRequestGenerationRef.current
+      unsubscribe?.()
+    }
   }, [])
 
   const filteredProviders = store.providers.filter((provider) => {
@@ -467,6 +481,36 @@ export function Providers() {
     }
   }
 
+  /** Replace renderer account metadata only from the authoritative main store.
+   * Never merge an unverified status or plaintext edited credentials into the
+   * cached account list. Store change notifications also use this source. */
+  const reloadAccountMetadata = async (): Promise<void> => {
+    // This authoritative account refresh supersedes an earlier page fetch.
+    // It must not reread credentials or allow an older load to replace the
+    // just-committed name, validation status or usage counters in React.
+    const generation = ++dataRequestGenerationRef.current
+    try {
+      const accounts = await window.electronAPI.accounts.getAll()
+      if (generation !== dataRequestGenerationRef.current) return
+      const state = useProvidersStore.getState()
+      state.setAccounts(accounts)
+      if (state.selectedProviderId) {
+        const providerAccounts = accounts.filter(account =>
+          account.providerId === state.selectedProviderId)
+        state.updateAccountCount(state.selectedProviderId,
+          providerAccounts.length, providerAccounts.filter(account => account.status === 'active').length)
+      }
+    } finally {
+      // An account write may supersede a still-pending initial load. Its
+      // finally handler then (correctly) refuses to clear the newest loading
+      // state, so the superseding refresh must settle that state instead.
+      // Never clear it when a *newer* generation still owns the page.
+      if (generation === dataRequestGenerationRef.current) {
+        useProvidersStore.getState().setIsLoading(false)
+      }
+    }
+  }
+
   const handleAddAccount = async (data: {
     name: string
     email?: string
@@ -495,7 +539,7 @@ export function Providers() {
       setShowAddAccountDialog(false)
       toast({
         title: t('providers.addSuccess'),
-        description: t('providers.accountAdded'),
+        description: 'Account saved as inactive. Use Validate Credentials on the saved account to activate it. Saving did not verify the provider.',
       })
     } catch (error) {
       toast({
@@ -503,6 +547,8 @@ export function Providers() {
         description: error instanceof Error ? error.message : t('providers.cannotAddAccount'),
         variant: 'destructive',
       })
+      // AddAccountDialog must retain the entered form on an uncommitted write.
+      throw error
     }
   }
 
@@ -558,21 +604,16 @@ export function Providers() {
       
       const updated = await window.electronAPI.accounts.update(id, updates)
       if (updated) {
-        store.updateAccount(id, updates)
-        
-        if (store.selectedProviderId) {
-          const providerAccounts = store.getAccountsByProvider(store.selectedProviderId)
-          store.updateAccountCount(
-            store.selectedProviderId,
-            providerAccounts.length,
-            providerAccounts.filter(a => a.status === 'active').length
-          )
-        }
+        // A successful write is irreversible even when the subsequent UI
+        // metadata refresh fails. Avoid caching plaintext form credentials.
+        try { await reloadAccountMetadata() } catch {}
         
         toast({
           title: t('providers.updateSuccess'),
           description: t('providers.accountUpdated'),
         })
+      } else {
+        throw new Error('Account update was not committed')
       }
     } catch (error) {
       toast({
@@ -580,6 +621,8 @@ export function Providers() {
         description: error instanceof Error ? error.message : t('providers.operationFailed'),
         variant: 'destructive',
       })
+      // The form must not close/discard edits after an IPC/store refusal.
+      throw error
     }
   }
 
@@ -614,61 +657,33 @@ export function Providers() {
   }
 
   const handleValidateAccount = async (id: string) => {
+    let isValid: boolean
     try {
-      const isValid = await window.electronAPI.accounts.validate(id)
-      if (isValid) {
-        store.updateAccount(id, { status: 'active' })
-        
-        if (store.selectedProviderId) {
-          const providerAccounts = store.getAccountsByProvider(store.selectedProviderId)
-          store.updateAccountCount(
-            store.selectedProviderId,
-            providerAccounts.length,
-            providerAccounts.filter(a => a.status === 'active').length
-          )
-        }
-        
-        toast({
-          title: t('providers.validateSuccess'),
-          description: t('providers.credentialsValid'),
-        })
-      } else {
-        store.updateAccount(id, { status: 'error', errorMessage: t('providers.validateFailed') })
-        
-        if (store.selectedProviderId) {
-          const providerAccounts = store.getAccountsByProvider(store.selectedProviderId)
-          store.updateAccountCount(
-            store.selectedProviderId,
-            providerAccounts.length,
-            providerAccounts.filter(a => a.status === 'active').length
-          )
-        }
-        
-        toast({
-          title: t('providers.validateFailed'),
-          description: t('providers.credentialsInvalid'),
-          variant: 'destructive',
-        })
-      }
+      isValid = await window.electronAPI.accounts.validate(id)
     } catch (error) {
+      // A canceled/superseded validation or refused durable write can reject
+      // without changing stored status. The main store remains authoritative.
+      try { await reloadAccountMetadata() } catch {}
       const errorMessage = error instanceof Error ? error.message : t('providers.operationFailed')
-      store.updateAccount(id, { status: 'error', errorMessage })
-      
-      if (store.selectedProviderId) {
-        const providerAccounts = store.getAccountsByProvider(store.selectedProviderId)
-        store.updateAccountCount(
-          store.selectedProviderId,
-          providerAccounts.length,
-          providerAccounts.filter(a => a.status === 'active').length
-        )
-      }
-      
       toast({
         title: t('providers.validateFailed'),
         description: errorMessage,
         variant: 'destructive',
       })
+      return
     }
+    try { await reloadAccountMetadata() } catch {
+      // Validation already reached a definite result; failure to refresh
+      // metadata is not evidence that credentials became invalid.
+    }
+    toast(isValid ? {
+      title: t('providers.validateSuccess'),
+      description: t('providers.credentialsValid'),
+    } : {
+      title: t('providers.validateFailed'),
+      description: 'Account validation was not confirmed. The saved status remains authoritative.',
+      variant: 'destructive',
+    })
   }
 
   const handleReconnectZaiAccount = async (id: string): Promise<void> => {
@@ -779,8 +794,9 @@ export function Providers() {
           provider={selectedProvider}
           onBack={handleBackToAccounts}
           onEdit={async () => {
-            const fullAccount = await window.electronAPI.accounts.getById(selectedAccount.id, true)
-            setEditingAccount(fullAccount || selectedAccount)
+            // Edit only metadata already loaded from trusted main. Credentials
+            // stay OS-protected; the account form supports deliberate reentry.
+            setEditingAccount(selectedAccount)
             setViewMode('accounts')
             setShowAddAccountDialog(true)
           }}
@@ -818,8 +834,7 @@ export function Providers() {
           providerId={selectedProvider.id}
           onAddAccount={() => setShowAddAccountDialog(true)}
           onEditAccount={async (account) => {
-            const fullAccount = await window.electronAPI.accounts.getById(account.id, true)
-            setEditingAccount(fullAccount || account)
+            setEditingAccount(account)
             setShowAddAccountDialog(true)
           }}
           onDeleteAccount={handleDeleteAccount}

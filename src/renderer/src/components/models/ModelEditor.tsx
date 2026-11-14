@@ -3,7 +3,7 @@
  * Manages default and custom models for a provider
  */
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
 import {
   Dialog,
@@ -55,19 +55,29 @@ export function ModelEditor({
   const [isAdding, setIsAdding] = useState(false)
   const [isResetting, setIsResetting] = useState(false)
   const [deletingModel, setDeletingModel] = useState<string | null>(null)
+  // A preceding read can finish after add/remove/reset, or after the dialog
+  // switches providers. It must not undo an acknowledged persisted model edit.
+  const modelRequestGenerationRef = useRef(0)
 
   useEffect(() => {
     if (open) {
-      loadModels()
+      void loadModels()
+    } else {
+      ++modelRequestGenerationRef.current
+      setIsLoading(false)
     }
+    return () => { ++modelRequestGenerationRef.current }
   }, [open, providerId])
 
   const loadModels = async () => {
+    const generation = ++modelRequestGenerationRef.current
     setIsLoading(true)
     try {
       const effectiveModels = await window.electronAPI.providers.getEffectiveModels(providerId)
+      if (generation !== modelRequestGenerationRef.current) return
       setModels(effectiveModels || [])
     } catch (error) {
+      if (generation !== modelRequestGenerationRef.current) return
       console.error('Failed to load models:')
       toast({
         title: t('common.error'),
@@ -75,7 +85,7 @@ export function ModelEditor({
         variant: 'destructive',
       })
     } finally {
-      setIsLoading(false)
+      if (generation === modelRequestGenerationRef.current) setIsLoading(false)
     }
   }
 
@@ -110,6 +120,7 @@ export function ModelEditor({
       return
     }
 
+    const generation = ++modelRequestGenerationRef.current
     setIsAdding(true)
     try {
       const result = await window.electronAPI.providers.addCustomModel(providerId, {
@@ -117,8 +128,10 @@ export function ModelEditor({
         actualModelId: newActualModelId.trim(),
       })
 
+      if (generation !== modelRequestGenerationRef.current) return
       if (result.success) {
         setModels(result.models)
+        setIsLoading(false)
         setNewDisplayName('')
         setNewActualModelId('')
         setIsAddDialogOpen(false)
@@ -131,6 +144,7 @@ export function ModelEditor({
         throw new Error(result.error || 'Failed to add model')
       }
     } catch (error) {
+      if (generation !== modelRequestGenerationRef.current) return
       console.error('Failed to add model:')
       toast({
         title: t('common.error'),
@@ -138,17 +152,23 @@ export function ModelEditor({
         variant: 'destructive',
       })
     } finally {
-      setIsAdding(false)
+      if (generation === modelRequestGenerationRef.current) {
+        setIsAdding(false)
+        setIsLoading(false)
+      }
     }
   }
 
   const handleRemoveModel = async (modelName: string) => {
+    const generation = ++modelRequestGenerationRef.current
     setDeletingModel(modelName)
     try {
       const result = await window.electronAPI.providers.removeModel(providerId, modelName)
 
+      if (generation !== modelRequestGenerationRef.current) return
       if (result.success) {
         setModels(result.models)
+        setIsLoading(false)
         setModelsLastUpdated(Date.now())
         toast({
           title: t('common.success'),
@@ -158,6 +178,7 @@ export function ModelEditor({
         throw new Error(result.error || 'Failed to remove model')
       }
     } catch (error) {
+      if (generation !== modelRequestGenerationRef.current) return
       console.error('Failed to remove model:')
       toast({
         title: t('common.error'),
@@ -165,7 +186,10 @@ export function ModelEditor({
         variant: 'destructive',
       })
     } finally {
-      setDeletingModel(null)
+      if (generation === modelRequestGenerationRef.current) {
+        setDeletingModel(null)
+        setIsLoading(false)
+      }
     }
   }
 
@@ -174,12 +198,15 @@ export function ModelEditor({
       return
     }
 
+    const generation = ++modelRequestGenerationRef.current
     setIsResetting(true)
     try {
       const result = await window.electronAPI.providers.resetModels(providerId)
 
+      if (generation !== modelRequestGenerationRef.current) return
       if (result.success) {
         setModels(result.models)
+        setIsLoading(false)
         setModelsLastUpdated(Date.now())
         toast({
           title: t('common.success'),
@@ -189,6 +216,7 @@ export function ModelEditor({
         throw new Error(result.error || 'Failed to reset models')
       }
     } catch (error) {
+      if (generation !== modelRequestGenerationRef.current) return
       console.error('Failed to reset models:')
       toast({
         title: t('common.error'),
@@ -196,11 +224,14 @@ export function ModelEditor({
         variant: 'destructive',
       })
     } finally {
-      setIsResetting(false)
+      if (generation === modelRequestGenerationRef.current) {
+        setIsResetting(false)
+        setIsLoading(false)
+      }
     }
   }
 
-  const renderModelTable = (modelList: EffectiveModel[], isCustom: boolean) => {
+  const renderModelTable = (modelList: EffectiveModel[]) => {
     if (modelList.length === 0) {
       return (
         <div className="text-center py-8 text-muted-foreground border rounded-lg">
@@ -283,12 +314,12 @@ export function ModelEditor({
             <div className="space-y-6 mt-4">
               <div>
                 <h3 className="text-lg font-semibold mb-3">{t('modelEditor.defaultModels')}</h3>
-                {renderModelTable(defaultModels, false)}
+                {renderModelTable(defaultModels)}
               </div>
 
               <div>
                 <h3 className="text-lg font-semibold mb-3">{t('modelEditor.customModels')}</h3>
-                {renderModelTable(customModels, true)}
+                {renderModelTable(customModels)}
               </div>
 
               <Alert>

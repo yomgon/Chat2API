@@ -107,6 +107,22 @@ export class StoreManager {
     this.mainWindow = window
   }
 
+  /** Notify only the trusted owner window, with NO data or credentials. This
+   * event is a cache invalidation hint: renderers re-read current data through
+   * their existing trusted IPC getters. No diagnostic or renderer failure may
+   * reverse an already durable account/provider/config mutation. */
+  private notifyCommittedChange(kind: 'config' | 'providers' | 'accounts'): void {
+    try {
+      if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+        // Keep the store independent of the IPC registry; both sides use
+        // the same private, fixed channel string.
+        this.mainWindow.webContents.send('store:changed', kind)
+      }
+    } catch {
+      // Best-effort postcommit notification; never re-send a stored mutation.
+    }
+  }
+
   /**
    * Check if storage has initialization error
    */
@@ -256,6 +272,23 @@ export class StoreManager {
     return config.logRetentionDays * 1000
   }
 
+  /** Configuration persistence is the required transaction. Runtime logging
+   * consumers are optional observers and can fail independently after commit.
+   * Never propagate their exception as an apparent failed API-key regeneration
+   * or mapping save; in particular do not retry a committed secret mutation. */
+  private updatePostcommitConfigObservers(config: AppConfig): void {
+    try {
+      this.appLogManager?.setMaxEntries(this.getMaxLogEntries(config))
+    } catch {
+      // A log-retention observer must not rewrite or roll back stored config.
+    }
+    try {
+      this.requestLogManager?.setConfig(config.requestLogConfig)
+    } catch {
+      // Diagnostics configuration is separate from the durable API outcome.
+    }
+  }
+
   private normalizeConfig(config: Partial<AppConfig>): AppConfig {
     const rawConfig = {
       ...DEFAULT_CONFIG,
@@ -289,6 +322,7 @@ export class StoreManager {
     const normalized = this.normalizeConfig(config)
     const stored = encodeConfigSecrets(normalized, value => this.encryptData(value))
     this.store!.set('config', stored)
+    this.notifyCommittedChange?.('config')
     return normalized
   }
 
@@ -622,9 +656,9 @@ export class StoreManager {
     })
   }
 
-  private writeStoredProviders(providers: Provider[]): void {
+  private encodeStoredProviders(providers: Provider[]): Provider[] {
     if (!Array.isArray(providers)) throw new Error('Provider data must be a list')
-    const encoded = providers.map(provider => {
+    return providers.map(provider => {
       const headers = provider.headers || {}
       if (!headers || typeof headers !== 'object' || Array.isArray(headers)) {
         throw new Error('Provider header configuration is invalid')
@@ -642,7 +676,11 @@ export class StoreManager {
       }))
       return { ...provider, headers: protectedHeaders }
     })
-    this.store!.set('providers', encoded)
+  }
+
+  private writeStoredProviders(providers: Provider[]): void {
+    this.store!.set('providers', this.encodeStoredProviders(providers))
+    this.notifyCommittedChange?.('providers')
   }
 
   /** Replace the full provider list through the OS-encrypted write boundary. */
@@ -717,11 +755,20 @@ export class StoreManager {
     }
     
     const remaining = providers.filter(provider => provider.id !== id)
-    this.writeStoredProviders(remaining)
-    
     const accounts = this.store!.get('accounts') as Account[] || []
     const filteredAccounts = accounts.filter((a: Account) => a.providerId !== id)
-    this.store!.set('accounts', filteredAccounts)
+
+    // Provider and bound-account removal is ONE durable store mutation. Never
+    // commit the provider removal first and only then attempt an account write:
+    // if that second write is refused it strands accounts with no provider.
+    // Encrypt/validate the future provider list before either collection is
+    // changed, retaining opaque stored account credential ciphertext.
+    this.store!.set({
+      providers: this.encodeStoredProviders(remaining),
+      accounts: filteredAccounts,
+    })
+    this.notifyCommittedChange?.('providers')
+    this.notifyCommittedChange?.('accounts')
     
     return true
   }
@@ -754,6 +801,43 @@ export class StoreManager {
 
   // ==================== Account Operations ====================
 
+  /** Daily limits follow the desktop's local calendar day. Do not require a
+   * midnight timer, a proxy restart, an operating profile migration or an
+   * account-store write merely to check a model's availability. */
+  private getLocalUsageDay(timestamp: number): string | null {
+    if (!Number.isFinite(timestamp) || timestamp <= 0) return null
+    const date = new Date(timestamp)
+    if (Number.isNaN(date.getTime())) return null
+    const year = String(date.getFullYear()).padStart(4, '0')
+    const month = String(date.getMonth() + 1).padStart(2, '0')
+    const day = String(date.getDate()).padStart(2, '0')
+    return `${year}-${month}-${day}`
+  }
+
+  /** Historical rows have no usageDay. Use lastUsed only when it supplies an
+   * actual prior calendar day; unknown/malformed/future anchors keep the old
+   * quota consumed rather than granting an unverified extra allowance. */
+  private getEffectiveAccountUsage(account: Account, now: number = Date.now()): number {
+    const stored = account.todayUsed || 0
+    const today = this.getLocalUsageDay(now)
+    if (!today) return stored
+    let recordedDay: string | null
+    if (account.usageDay === undefined) {
+      recordedDay = this.getLocalUsageDay(account.lastUsed ?? Number.NaN)
+    } else if (typeof account.usageDay === 'string' &&
+        /^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])$/.test(account.usageDay)) {
+      recordedDay = account.usageDay
+    } else {
+      return stored
+    }
+    return recordedDay && recordedDay < today ? 0 : stored
+  }
+
+  private getAccountForCurrentDay(account: Account, now: number = Date.now()): Account {
+    const todayUsed = this.getEffectiveAccountUsage(account, now)
+    return todayUsed === (account.todayUsed || 0) ? account : { ...account, todayUsed }
+  }
+
   /**
    * Get All Accounts
    * @param includeCredentials Whether to include decrypted credentials
@@ -764,12 +848,12 @@ export class StoreManager {
     
     if (includeCredentials) {
       return accounts.map((account: Account) => ({
-        ...account,
+        ...this.getAccountForCurrentDay(account),
         credentials: this.decryptCredentials(account.credentials),
       }))
     }
     
-    return accounts
+    return accounts.map((account: Account) => this.getAccountForCurrentDay(account))
   }
 
   /**
@@ -783,12 +867,12 @@ export class StoreManager {
     
     if (account && includeCredentials) {
       return {
-        ...account,
+        ...this.getAccountForCurrentDay(account),
         credentials: this.decryptCredentials(account.credentials),
       }
     }
     
-    return account
+    return account ? this.getAccountForCurrentDay(account) : undefined
   }
 
   /**
@@ -801,12 +885,12 @@ export class StoreManager {
     
     if (includeCredentials) {
       return filtered.map((account: Account) => ({
-        ...account,
+        ...this.getAccountForCurrentDay(account),
         credentials: this.decryptCredentials(account.credentials),
       }))
     }
     
-    return filtered
+    return filtered.map((account: Account) => this.getAccountForCurrentDay(account))
   }
 
   /**
@@ -823,6 +907,7 @@ export class StoreManager {
     }
     
     this.store!.set('accounts', [...accounts, encryptedAccount])
+    this.notifyCommittedChange?.('accounts')
   }
 
   /**
@@ -830,6 +915,13 @@ export class StoreManager {
    */
   updateAccount(id: string, updates: Partial<Account>): Account | null {
     this.ensureInitialized()
+    // Direct internal OAuth/adapter callers also share this durable store.
+    // Protect the immutable account identity even when they bypass the
+    // higher-level AccountManager editable-field policy.
+    if (!updates || typeof updates !== 'object' || Array.isArray(updates) ||
+        'id' in updates || 'providerId' in updates || 'createdAt' in updates) {
+      throw new Error('Account identity is immutable')
+    }
     const accounts = this.store!.get('accounts') as Account[] || []
     const index = accounts.findIndex((a: Account) => a.id === id)
     
@@ -853,9 +945,10 @@ export class StoreManager {
     this.store!.set('accounts', accounts.map((account: Account, accountIndex: number) =>
       accountIndex === index ? updatedAccount : account
     ))
+    this.notifyCommittedChange?.('accounts')
     
     return {
-      ...updatedAccount,
+      ...this.getAccountForCurrentDay(updatedAccount),
       credentials,
     }
   }
@@ -874,15 +967,25 @@ export class StoreManager {
     if (index === -1) return false
 
     const current = accounts[index]
+    const now = Date.now()
+    const today = this.getLocalUsageDay(now)
+    if (!today) throw new Error('Local account usage calendar unavailable')
+    const priorDay = current.usageDay === undefined
+      ? this.getLocalUsageDay(current.lastUsed ?? Number.NaN)
+      : current.usageDay
     const updatedAccount: Account = {
       ...current,
       requestCount: (current.requestCount || 0) + 1,
-      todayUsed: (current.todayUsed || 0) + 1,
-      lastUsed: Date.now(),
+      todayUsed: this.getEffectiveAccountUsage(current, now) + 1,
+      // When a system clock moves backward, preserve the later already-used
+      // date rather than granting another daily allowance on clock recovery.
+      usageDay: priorDay && priorDay > today ? priorDay : today,
+      lastUsed: now,
     }
     this.store!.set('accounts', accounts.map((account: Account, accountIndex: number) =>
       accountIndex === index ? updatedAccount : account
     ))
+    this.notifyCommittedChange?.('accounts')
     return true
   }
 
@@ -900,6 +1003,7 @@ export class StoreManager {
     
     accounts.splice(index, 1)
     this.store!.set('accounts', accounts)
+    this.notifyCommittedChange?.('accounts')
     return true
   }
 
@@ -913,12 +1017,12 @@ export class StoreManager {
     
     if (includeCredentials) {
       return active.map((account: Account) => ({
-        ...account,
+        ...this.getAccountForCurrentDay(account),
         credentials: this.decryptCredentials(account.credentials),
       }))
     }
     
-    return active
+    return active.map((account: Account) => this.getAccountForCurrentDay(account))
   }
 
   // ==================== Configuration Operations ====================
@@ -937,7 +1041,7 @@ export class StoreManager {
   setConfig(config: AppConfig): void {
     this.ensureInitialized()
     const normalized = this.writeStoredConfig(config)
-    this.requestLogManager?.setConfig(normalized.requestLogConfig)
+    this.updatePostcommitConfigObservers(normalized)
   }
 
   /**
@@ -995,8 +1099,7 @@ export class StoreManager {
 
     const normalized = this.normalizeConfig(newConfig)
     this.writeStoredConfig(normalized)
-    this.appLogManager?.setMaxEntries(this.getMaxLogEntries(normalized))
-    this.requestLogManager?.setConfig(normalized.requestLogConfig)
+    this.updatePostcommitConfigObservers(normalized)
     return normalized
   }
 
@@ -1006,8 +1109,7 @@ export class StoreManager {
   resetConfig(): AppConfig {
     this.ensureInitialized()
     this.writeStoredConfig(DEFAULT_CONFIG)
-    this.appLogManager?.setMaxEntries(this.getMaxLogEntries(DEFAULT_CONFIG))
-    this.requestLogManager?.setConfig(DEFAULT_CONFIG.requestLogConfig)
+    this.updatePostcommitConfigObservers(DEFAULT_CONFIG)
     return DEFAULT_CONFIG
   }
 
@@ -1225,6 +1327,41 @@ export class StoreManager {
   getStatistics(): PersistentStatistics {
     this.ensureInitialized()
     return this.store!.get('statistics') || DEFAULT_STATISTICS
+  }
+
+  /** One authenticated client Chat/Legacy rejection before any provider
+   * dispatch. These are real API errors, not account or model operations.
+   * Statistics and optional request logging are separate best-effort receipts
+   * and neither may change the already determined HTTP status. */
+  recordClientPreflightRejection(input: {
+    statusCode: number
+    method: 'POST'
+    path: '/v1/chat/completions' | '/v1/completions'
+    model: string
+    latency: number
+    isStream: boolean
+    errorCode: string
+  }): void {
+    try {
+      // Omitting model/provider/account avoids false provider/model usage.
+      this.recordRequestInStats(false, input.latency)
+    } catch {
+      // A failed statistics writer is not permission to retry an HTTP effect.
+    }
+    try {
+      this.addRequestLog({
+        timestamp: Date.now() - input.latency,
+        status: 'error', statusCode: input.statusCode,
+        method: input.method, url: input.path, model: input.model,
+        responseStatus: input.statusCode, latency: input.latency,
+        isStream: input.isStream,
+        errorMessage: 'Local request rejected before provider dispatch (' + input.errorCode + ')',
+        // Never persist the client body, user input, API key, cookies, raw
+        // upstream message or a fabricated account selection.
+      })
+    } catch {
+      // An optional disabled/refused log sink cannot alter the API response.
+    }
   }
 
   /**

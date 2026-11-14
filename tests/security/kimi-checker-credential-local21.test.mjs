@@ -3,6 +3,9 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import vm from 'node:vm'
 import ts from 'typescript'
+import { QWEN_TICKET_MODULE } from './helpers/qwenTicketModule.mjs'
+import { QWEN_AI_TOKEN_MODULE } from './helpers/qwenAiTokenModule.mjs'
+import { ZAI_SESSION_MODULE } from './helpers/zaiSessionModule.mjs'
 
 // Actual product checker with synthetic HTTPS responses only. The selected
 // OAuth credential must be the one the web completion adapter would consume.
@@ -33,6 +36,9 @@ function harness({ status = 200, body = { subscription: { userName: 'Synthetic u
   const deps = {
     axios: { __esModule: true, default: fakeAxios, AxiosError },
     './builtin': { getBuiltinProvider: id => id === 'kimi' ? { id } : null },
+    './qwenTicket': QWEN_TICKET_MODULE,
+    './qwenAiToken': QWEN_AI_TOKEN_MODULE,
+    '../oauth/zaiSession': ZAI_SESSION_MODULE,
   }
   const mod = { exports: {} }
   vm.runInNewContext(code, { module: mod, exports: mod.exports, Date, Error, Buffer, URL,

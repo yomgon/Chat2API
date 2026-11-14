@@ -15,6 +15,11 @@ const compiled = ts.transpileModule(source, {
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
 })
 assert.equal((compiled.diagnostics || []).filter(d => d.category === ts.DiagnosticCategory.Error).length, 0)
+const mapperCompiled = ts.transpileModule(
+  readFileSync(path.join(root, 'src/main/proxy/modelMapper.ts'), 'utf8'), {
+    fileName: 'modelMapper.ts',
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
+  }).outputText
 
 const webEndpoints = {
   deepseek: 'https://chat.deepseek.com', glm: 'https://chatglm.cn',
@@ -48,11 +53,21 @@ function harness({ providers = [provider()], accounts, catalogs, mappings = {} }
       return syntheticAccounts.filter(a => a.providerId === id)
     },
   }
+  const mapperModule = { exports: {} }
+  vm.runInNewContext(mapperCompiled, {
+    module: mapperModule, exports: mapperModule.exports,
+    require: name => {
+      if (name === '../store/store') return { storeManager }
+      throw new Error('Unexpected model mapper dependency: ' + name)
+    },
+  }, { filename: 'synthetic-modelMapper.cjs', timeout: 1500 })
+  const modelMapper = new mapperModule.exports.ModelMapper()
   const module = { exports: {} }
   vm.runInNewContext(compiled.outputText, {
     module, exports: module.exports, Date, URL,
     require: name => {
       if (name === '../store/store') return { storeManager }
+      if (name === './modelMapper') return { modelMapper }
       throw new Error('Unexpected selector dependency: ' + name)
     },
     console: { log() {}, warn() {}, error() {} },

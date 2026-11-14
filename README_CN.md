@@ -1,11 +1,13 @@
 # Chat2API
 
+> 此仓库是 [xiaoY233/Chat2API](https://github.com/xiaoY233/Chat2API) 的独立 Windows 维护分支（GPL-3.0）。`1.4.0-local.101` 于 2026-11-15 通过 3,789 项离线/安全回归测试并完成 Windows 打包验证。尚未验证所有服务商的真实在线调用；安装包未经代码签名，仓库仅公开源代码，不发布可执行文件。
+
 <p align="center">
   <img src="build/icons.png" alt="Chat2API Logo" width="128" height="128">
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.3.0-blue?style=flat-square&logo=github" alt="Release">
+  <img src="https://img.shields.io/badge/Release-v1.4.0--local.101-blue?style=flat-square&logo=github" alt="Release">
   <img src="https://img.shields.io/badge/License-GPL--3.0-blue?style=flat-square" alt="License">
   <br>
   <a href="https://www.electronjs.org/"><img src="https://img.shields.io/badge/Electron-33+-47848F?style=flat-square&logo=electron&logoColor=white" alt="Electron"></a>

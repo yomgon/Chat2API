@@ -1,6 +1,6 @@
 {
   "name": "chat2api",
-  "version": "1.4.0-local.22",
+  "version": "1.4.0-local.101",
   "description": "Chat2API 管理器 - 统一管理多个 AI 服务提供商，提供 OpenAI 兼容 API 接口",
   "main": "./out/main/index.js",
   "author": {
@@ -10,6 +10,7 @@
   "homepage": "https://github.com/chat2api/Chat2API-Manager",
   "license": "GPL-3.0",
   "scripts": {
+    "typecheck": "tsc -b tsconfig.json --pretty false",
     "dev": "bash scripts/dev.sh",
     "dev:win": "electron-vite dev",
     "check:source-artifacts": "node scripts/check-source-artifacts.js",

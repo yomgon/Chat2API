@@ -130,6 +130,17 @@ export class ProxyStatusManager {
     this.latencySum += latency
   }
 
+  /** A refused authenticated local request never selected an upstream
+   * provider or reserved a model/account slot. Count the HTTP failure but
+   * do not fabricate model usage, an active connection or a provider effect. */
+  recordClientRejection(latency: number): void {
+    this.statistics.totalRequests++
+    this.statistics.failedRequests++
+    this.requestTimestamps.push(Date.now())
+    this.latencySum += latency
+    this.cleanupOldTimestamps()
+  }
+
   /**
    * Clean up expired timestamps (older than 1 minute)
    */

@@ -31,7 +31,11 @@ const storeSource = ts.createSourceFile('store.ts', source('src/main/store/store
 const storeClass = storeSource.statements.find(node =>
   ts.isClassDeclaration(node) && node.name?.text === 'StoreManager')
 assert.ok(storeClass, 'Extract the actual StoreManager class')
-const methodNames = ['ensureInitialized', 'getAccountsByProviderId', 'updateAccount', 'recordAccountSuccess']
+const methodNames = [
+  'ensureInitialized', 'getLocalUsageDay', 'getEffectiveAccountUsage',
+  'getAccountForCurrentDay', 'getAccountsByProviderId',
+  'updateAccount', 'recordAccountSuccess',
+]
 const selectedMethods = methodNames.flatMap(name => {
   const method = storeClass.members.find(node =>
     ts.isMethodDeclaration(node) && node.name.getText(storeSource) === name)
@@ -65,7 +69,7 @@ const account = overrides => Object.freeze({
   ...overrides,
 })
 const withoutUsage = row => {
-  const { requestCount, todayUsed, lastUsed, ...metadata } = row
+  const { requestCount, todayUsed, lastUsed, usageDay, ...metadata } = row
   return metadata
 }
 
@@ -326,10 +330,12 @@ for (const stream of [false, true]) {
     assert.equal(h.memory.rows[0], other)
     assert.equal(h.memory.writes.length, 0)
     assert.deepEqual(h.memory.events, ['get'])
-    assert.deepEqual(h.usage.stats, [true])
-    assert.equal(h.usage.success, 1)
-    assert.equal(h.usage.failure, 0)
-    assert.equal(operation.ctx.status, 200)
+    // A removed account cannot be settled. The completed upstream operation
+    // remains unconfirmed locally: never manufacture a successful API reply.
+    assert.deepEqual(h.usage.stats, [false])
+    assert.equal(h.usage.success, 0)
+    assert.equal(h.usage.failure, 1)
+    assert.equal(operation.ctx.status, stream ? 502 : 500)
   })
 
   test('same account ID moved to another provider is not charged by old ' + modeName(stream) + ' request', async t => {
@@ -342,8 +348,10 @@ for (const stream of [false, true]) {
     assert.equal(h.memory.rows[0], replacement)
     assert.equal(h.memory.writes.length, 0)
     assert.deepEqual(h.memory.events, ['get'])
-    assert.deepEqual(h.usage.stats, [true])
-    assert.equal(h.usage.failure, 0)
+    assert.deepEqual(h.usage.stats, [false])
+    assert.equal(h.usage.success, 0)
+    assert.equal(h.usage.failure, 1)
+    assert.equal(operation.ctx.status, stream ? 502 : 500)
   })
 }
 

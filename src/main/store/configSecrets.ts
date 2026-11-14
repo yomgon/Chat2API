@@ -62,7 +62,13 @@ function isProtectedSecret(value: string): boolean {
 
 function isLegacySecret(value: string, kind: SecretKind): boolean {
   if (kind === 'apiKey') {
-    return value.length === 51 && /^sk-[A-Za-z0-9]{48}$/.test(value)
+    // Both local GUI keys and the existing management API's generated keys
+    // are authenticated proxy API keys. The latter is sk-mgmt- plus exactly
+    // 32 hex characters (128 random bits); rejecting that format caused the
+    // *real* OS-protected StoreManager to refuse a committed management CRUD
+    // request with HTTP 500 before a new key could be saved.
+    return (value.length === 51 && /^sk-[A-Za-z0-9]{48}$/.test(value)) ||
+      (value.length === 40 && /^sk-mgmt-[A-Fa-f0-9]{32}$/.test(value))
   }
   return (value.length === 40 && /^sk-mgmt-[A-Fa-f0-9]{32}$/.test(value)) ||
     (value.length === 41 && /^mgmt_[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}$/.test(value))

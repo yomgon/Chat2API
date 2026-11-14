@@ -21,9 +21,13 @@ export function Settings() {
     const unsubscribe = window.electronAPI?.config?.onConfigChanged?.((config) => {
       setConfig(config)
     })
+    const unsubscribeStore = window.electronAPI?.store?.onChanged?.(kind => {
+      if (kind === 'config') void fetchConfig()
+    })
 
     return () => {
       unsubscribe?.()
+      unsubscribeStore?.()
     }
   }, [fetchConfig, setConfig])
 

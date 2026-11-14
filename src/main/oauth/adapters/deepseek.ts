@@ -65,16 +65,15 @@ export class DeepSeekAdapter extends BaseOAuthAdapter {
         providerType: 'deepseek',
         error: 'Please log in via browser, extract Token from Developer Tools and enter manually',
       }
-    } catch (error) {
+    } catch {
       console.error('[DeepSeek] Failed to open login browser')
-      const errorMessage = error instanceof Error ? error.message : 'Failed to open browser'
-      this.emitProgress('error', errorMessage)
+      this.emitProgress('error', 'Failed to open DeepSeek login page')
       
       return {
         success: false,
         providerId: options.providerId,
         providerType: 'deepseek',
-        error: errorMessage,
+        error: 'Failed to open DeepSeek login page',
       }
     }
   }
@@ -106,15 +105,14 @@ export class DeepSeekAdapter extends BaseOAuthAdapter {
         credentials: { token },
         accountInfo: validation.accountInfo,
       }
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error'
-      this.emitProgress('error', `Token validation failed: ${errorMessage}`)
+    } catch {
+      this.emitProgress('error', 'DeepSeek token validation failed')
       
       return {
         success: false,
         providerId,
         providerType: 'deepseek',
-        error: errorMessage,
+        error: 'DeepSeek token validation failed',
       }
     }
   }
@@ -130,13 +128,16 @@ export class DeepSeekAdapter extends BaseOAuthAdapter {
    * Validate token validity
    */
   async validateToken(credentials: Record<string, string>): Promise<TokenValidationResult> {
-    const token = credentials.token || credentials.userToken
+    const token = credentials?.token || credentials?.userToken
     
     if (!token) {
       return {
         valid: false,
         error: 'Token cannot be empty',
       }
+    }
+    if (typeof token !== 'string' || !/^[\x21-\x7e]+$/.test(token)) {
+      return { valid: false, error: 'DeepSeek token validation failed' }
     }
     
     try {
@@ -146,25 +147,30 @@ export class DeepSeekAdapter extends BaseOAuthAdapter {
           ...FAKE_HEADERS,
         },
         timeout: 15000,
+        maxRedirects: 0,
         validateStatus: () => true,
       })
       
       console.log('[DeepSeek OAuth] Validation response received')
       
-      if (response.status !== 200 || !response.data) {
+      const envelope = response.data
+      if (response.status !== 200 || !envelope || typeof envelope !== 'object' || Array.isArray(envelope) ||
+          (Object.prototype.hasOwnProperty.call(envelope, 'code') && envelope.code !== 0) ||
+          (envelope.data && typeof envelope.data === 'object' &&
+            Object.prototype.hasOwnProperty.call(envelope.data, 'biz_code') && envelope.data.biz_code !== 0)) {
         return {
           valid: false,
-          error: 'Token is invalid or expired',
+          error: 'DeepSeek token validation failed',
         }
       }
       
       // DeepSeek API returns: { code: 0, msg: '', data: { biz_code: 0, biz_msg: '', biz_data: { ... } } }
-      const bizData = response.data?.data?.biz_data
+      const bizData = envelope.data?.biz_data
       
-      if (!bizData) {
+      if (!bizData || typeof bizData !== 'object' || Array.isArray(bizData)) {
         return {
           valid: false,
-          error: 'Token validation failed: Invalid response data',
+          error: 'DeepSeek token validation failed',
         }
       }
       
@@ -177,11 +183,10 @@ export class DeepSeekAdapter extends BaseOAuthAdapter {
           name: bizData.name,
         },
       }
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Validation request failed'
+    } catch {
       return {
         valid: false,
-        error: errorMessage,
+        error: 'DeepSeek token validation failed',
       }
     }
   }
@@ -190,9 +195,9 @@ export class DeepSeekAdapter extends BaseOAuthAdapter {
    * Refresh token
    */
   async refreshToken(credentials: Record<string, string>): Promise<CredentialInfo | null> {
-    const token = credentials.token || credentials.refreshToken
+    const token = credentials?.token || credentials?.refreshToken
     
-    if (!token) {
+    if (typeof token !== 'string' || !/^[\x21-\x7e]+$/.test(token)) {
       return null
     }
     
@@ -203,14 +208,23 @@ export class DeepSeekAdapter extends BaseOAuthAdapter {
           ...FAKE_HEADERS,
         },
         timeout: 15000,
+        maxRedirects: 0,
         validateStatus: () => true,
       })
       
-      if (response.status !== 200 || !response.data?.biz_data?.token) {
+      // Validation and completion use the nested data.biz_data envelope;
+      // retain the old flat form for manually imported accounts. Reject
+      // explicit error codes before exposing any returned bearer credential.
+      const envelope = response.data
+      if (response.status !== 200 || !envelope || typeof envelope !== 'object' || Array.isArray(envelope) ||
+          (Object.prototype.hasOwnProperty.call(envelope, 'code') && envelope.code !== 0) ||
+          (envelope.data && typeof envelope.data === 'object' &&
+            Object.prototype.hasOwnProperty.call(envelope.data, 'biz_code') && envelope.data.biz_code !== 0)) {
         return null
       }
       
-      const newToken = response.data.biz_data.token
+      const newToken = envelope.data?.biz_data?.token ?? envelope.biz_data?.token
+      if (typeof newToken !== 'string' || !/^[\x21-\x7e]+$/.test(newToken)) return null
       
       return {
         type: 'access',

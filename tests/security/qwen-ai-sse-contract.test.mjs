@@ -7,6 +7,7 @@ import vm from 'node:vm'
 import { PassThrough } from 'node:stream'
 import { createRequire } from 'node:module'
 import ts from 'typescript'
+import { QWEN_AI_TOKEN_MODULE } from './helpers/qwenAiTokenModule.mjs'
 
 // Executes the real Qwen International SSE parser with synthetic chunks only.
 // No user account, Electron, browser cookies, network or provider POST.
@@ -25,6 +26,7 @@ function load(){
   assert.equal((transpiled.diagnostics||[]).filter(d=>d.category===ts.DiagnosticCategory.Error).length,0)
   const module={exports:{}}
   const allowed={
+    '../../providers/qwenAiToken':QWEN_AI_TOKEN_MODULE,
     axios:{__esModule:true,default:{create:()=>({})}},
     stream:{PassThrough},
     'eventsource-parser':requireNode('eventsource-parser'),

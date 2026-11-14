@@ -2,7 +2,8 @@ export interface DeepSeekChatOptionInput {
   model: string
   originalModel?: string
   web_search?: boolean
-  reasoning_effort?: string
+  /** Explicit false disables inferred thinking despite a display alias. */
+  reasoning_effort?: string | boolean
 }
 
 export interface DeepSeekChatOptions {
@@ -25,9 +26,10 @@ export function resolveDeepSeekChatOptions(
 
   return {
     modelType: isProModel ? 'expert' : 'default',
-    searchEnabled: Boolean(request.web_search) || isSearchAlias,
-    thinkingEnabled: Boolean(request.reasoning_effort)
-      || isThinkingAlias,
+    searchEnabled: request.web_search === undefined
+      ? isSearchAlias : Boolean(request.web_search),
+    thinkingEnabled: request.reasoning_effort === undefined
+      ? isThinkingAlias : Boolean(request.reasoning_effort),
   }
 }
 

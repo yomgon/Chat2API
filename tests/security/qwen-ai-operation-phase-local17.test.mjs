@@ -7,6 +7,7 @@ import vm from 'node:vm'
 import { PassThrough } from 'node:stream'
 import { createRequire } from 'node:module'
 import ts from 'typescript'
+import { QWEN_AI_TOKEN_MODULE } from './helpers/qwenAiTokenModule.mjs'
 
 // Real first-party adapter with strictly synthetic response objects only.
 // Never touch actual app/accounts, home profiles, network or a provider token.
@@ -43,6 +44,7 @@ function instance(responses) {
       if (name === 'stream') return { PassThrough }
       if (name === 'eventsource-parser') return requireNode('eventsource-parser')
       if (name === '../promptToolUse') return { hasToolUse: () => false, parseToolUse: () => null }
+      if (name === '../../providers/qwenAiToken') return QWEN_AI_TOKEN_MODULE
       throw new Error('Unexpected dependency: ' + name)
     },
     console: consoleStub, Buffer, URL, Date, Error, setTimeout, clearTimeout,

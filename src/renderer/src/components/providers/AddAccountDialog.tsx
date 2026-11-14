@@ -246,13 +246,17 @@ export function AddAccountDialog({
       if (editingAccount) {
         setName(editingAccount.name)
         setDailyLimit(editingAccount.dailyLimit?.toString() || '')
-        setCredentials(editingAccount.credentials || {})
+        // An account editor receives metadata only. Never load stored token,
+        // cookie, JWT or OS ciphertext back into a form just to rename it.
+        // Credentials are re-entered explicitly, field by field, if desired.
+        setCredentials({})
         setActiveTab('manual')
       } else {
         resetForm()
       }
+      if (isNewZaiAccount) setActiveTab('oauth')
     }
-  }, [open, editingAccount])
+  }, [open, editingAccount, isNewZaiAccount])
 
   const resetForm = () => {
     setName('')
@@ -273,8 +277,17 @@ export function AddAccountDialog({
   }
 
   const handleValidate = async () => {
-    if (zaiCreateAttempt.current || isZaiBrowserFlow) return
+    if (zaiCreateAttempt.current || isNewZaiAccount || isZaiBrowserFlow) return
     if (!provider) return
+
+    if (isEditing) {
+      // A partial replacement field is not the full stored credential set.
+      // Validate the committed account with the account-list action instead;
+      // never send incomplete tokens to an external validator from this form.
+      setValidationResult({ valid: false,
+        error: 'Save the account first, then use Validate on the saved account. Existing credentials are not read here.' })
+      return
+    }
 
     const requiredFields = credentialFields.filter(f => f.required)
     const missingFields = requiredFields.filter(f => !credentials[f.name])
@@ -310,7 +323,9 @@ export function AddAccountDialog({
   }
 
   const handleSubmit = async () => {
-    if (zaiCreateAttempt.current || isZaiBrowserFlow) return
+    // A new Z.ai web credential must be verified and committed by the
+    // protected owner login, never by generic form submission or token check.
+    if (zaiCreateAttempt.current || isNewZaiAccount || isZaiBrowserFlow) return
     if (!name.trim()) {
       setValidationResult({
         valid: false,
@@ -320,13 +335,21 @@ export function AddAccountDialog({
     }
 
     const requiredFields = credentialFields.filter(f => f.required)
-    const missingFields = requiredFields.filter(f => !credentials[f.name])
+    const missingFields = isEditing ? [] : requiredFields.filter(f => !credentials[f.name])
     
     if (missingFields.length > 0) {
       setValidationResult({
         valid: false,
         error: t('providers.fillRequiredFields', { fields: missingFields.map(f => f.label).join(', ') }),
       })
+      return
+    }
+
+    // Do not turn "1.5" into 1, or commit a malformed cap during a simple
+    // metadata edit. An empty edit leaves the existing limit unchanged.
+    if (dailyLimit && (!/^\d+$/.test(dailyLimit) ||
+        !Number.isSafeInteger(Number(dailyLimit)))) {
+      setValidationResult({ valid: false, error: 'Daily limit must be a non-negative whole number' })
       return
     }
 
@@ -340,16 +363,20 @@ export function AddAccountDialog({
         console.log('[AddAccountDialog] MiniMax identifier supplied')
       }
 
-      const data = {
-        name: name.trim(),
-        credentials: finalCredentials,
-        dailyLimit: dailyLimit ? parseInt(dailyLimit, 10) : undefined,
-      }
-
       if (isEditing && editingAccount && onUpdateAccount) {
-        await onUpdateAccount(editingAccount.id, data)
+        await onUpdateAccount(editingAccount.id, {
+          name: name.trim(),
+          ...(dailyLimit ? { dailyLimit: Number(dailyLimit) } : {}),
+          // No credential value means "keep all existing authentication".
+          // Only deliberate re-entry may cross the trusted write IPC.
+          ...(Object.keys(finalCredentials).length > 0
+            ? { credentials: finalCredentials } : {}),
+        })
       } else {
-        await onAddAccount(data)
+        await onAddAccount({
+          name: name.trim(),credentials: finalCredentials,
+          dailyLimit: dailyLimit ? Number(dailyLimit) : undefined,
+        })
       }
 
       onOpenChange(false)
@@ -502,18 +529,18 @@ export function AddAccountDialog({
                 if (!zaiCreateAttempt.current) setActiveTab(value)
               }}>
                 <TabsList className="grid w-full grid-cols-2">
-                  <TabsTrigger value="manual" disabled={isNewZaiAccount && zaiCreateLocked}>{t('providers.manualInput')}</TabsTrigger>
+                  <TabsTrigger value="manual" disabled={isNewZaiAccount}>{t('providers.manualInput')}</TabsTrigger>
                   <TabsTrigger value="oauth" disabled={isNewZaiAccount && zaiCreateLocked}>{t('providers.oauthLogin')}</TabsTrigger>
                 </TabsList>
 
                 <TabsContent value="manual" className="mt-4">
-                  <CredentialFieldsForm
+                  {!isNewZaiAccount && <CredentialFieldsForm
                     fields={credentialFields}
                     credentials={credentials}
                     onChange={handleCredentialChange}
                     t={t}
                     providerId={provider?.id}
-                  />
+                  />}
                 </TabsContent>
 
                 <TabsContent value="oauth" className="mt-4">
@@ -566,7 +593,15 @@ export function AddAccountDialog({
               </Tabs>
             )}
 
-            {(!supportsOAuth || isEditing) && (
+            {isEditing && (
+              <p role="note" className="text-xs text-muted-foreground">
+                Saved credentials are kept unchanged when these fields are blank.
+                Enter only the credential fields you intend to replace; other
+                stored fields remain intact. A replaced credential requires
+                explicit account validation before it can be used.
+              </p>
+            )}
+            {(!supportsOAuth || isEditing) && provider?.id !== 'zai' && (
               <CredentialFieldsForm
                 fields={credentialFields}
                 credentials={credentials}
@@ -574,6 +609,12 @@ export function AddAccountDialog({
                 t={t}
                 providerId={provider?.id}
               />
+            )}
+            {isEditing && provider?.id === 'zai' && (
+              <p role="note" className="text-xs text-muted-foreground">
+                Z.ai login credentials can only be replaced with Reconnect Z.ai
+                from the account list. Renaming this account does not affect its session.
+              </p>
             )}
 
             {validationResult.error && (

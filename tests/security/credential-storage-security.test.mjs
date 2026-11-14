@@ -584,6 +584,13 @@ test('account selection preserves credentials for forwarding without logging any
   const h = await loadSource('src/main/proxy/loadbalancer.ts', {
     '../store/types': typeImports,
     './types': { AccountSelection: undefined },
+    './modelMapper': { modelMapper: {
+      // This credential-only fixture has no mappings. The production
+      // selector now delegates model resolution to the shared ModelMapper.
+      getMatchingMapping: () => undefined,
+      hasAmbiguousMatchingMapping: () => false,
+      mapModel: requested => requested,
+    } },
     '../store/store': { storeManager: {
       getProviders: () => [provider],
       getAccountsByProviderId(id, include) { assert.equal(id, provider.id); includeCredentials.push(include); return accounts },

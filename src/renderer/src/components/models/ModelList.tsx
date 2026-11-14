@@ -1,4 +1,4 @@
-import { useState, useMemo, useCallback, memo, useEffect } from 'react'
+import { useState, useMemo, useCallback, memo, useEffect, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
@@ -143,11 +143,15 @@ export function ModelList() {
   const [selectAll, setSelectAll] = useState(false)
   const [currentPage, setCurrentPage] = useState(1)
   const [effectiveModelsMap, setEffectiveModelsMap] = useState<Record<string, EffectiveModel[]>>({})
+  const [modelReadErrors, setModelReadErrors] = useState<string[]>([])
+  const modelListRequestGenerationRef = useRef(0)
   
   const loadEffectiveModels = useCallback(async () => {
+    const generation = ++modelListRequestGenerationRef.current
     try {
       const enabledProviders = providers.filter(p => p.enabled)
       const newMap: Record<string, EffectiveModel[]> = {}
+      const failed: string[] = []
       
       for (const provider of enabledProviders) {
         try {
@@ -155,18 +159,30 @@ export function ModelList() {
           newMap[provider.id] = models
         } catch (error) {
           console.error('[Renderer] Operation failed')
-          newMap[provider.id] = []
+          // Failed IPC does not prove the persisted catalog was deleted.
+          failed.push(provider.id)
         }
       }
-      
-      setEffectiveModelsMap(newMap)
+      if (generation !== modelListRequestGenerationRef.current) return
+      setEffectiveModelsMap(previous => {
+        const merged = { ...newMap }
+        for (const id of failed) {
+          if (previous[id]) merged[id] = previous[id]
+        }
+        return merged
+      })
+      setModelReadErrors(failed)
     } catch (error) {
-      console.error('Failed to load effective models:')
+      if (generation === modelListRequestGenerationRef.current) {
+        console.error('Failed to load effective models:')
+        setModelReadErrors(providers.filter(p => p.enabled).map(p => p.id))
+      }
     }
   }, [providers])
   
   useEffect(() => {
-    loadEffectiveModels()
+    void loadEffectiveModels()
+    return () => { ++modelListRequestGenerationRef.current }
   }, [loadEffectiveModels, modelsLastUpdated])
   
   const modelList = useMemo(() => {
@@ -197,6 +213,7 @@ export function ModelList() {
       
       const providerAccounts = accountMap.get(provider.id) || []
       const hasActiveAccounts = activeProviderMap.get(provider.id) || false
+      const selectedActiveAccount = providerAccounts.find(account => account.status === 'active')
       
       for (const model of effectiveModels) {
         const modelId = `${provider.id}-${model.displayName}`
@@ -208,8 +225,10 @@ export function ModelList() {
           name: model.displayName,
           providerId: provider.id,
           providerName: provider.name,
-          accountId: providerAccounts[0]?.id,
-          accountName: providerAccounts[0]?.name,
+          // Display the same eligible account class as the dispatch path,
+          // never the first saved but inactive or unverified credential.
+          accountId: selectedActiveAccount?.id,
+          accountName: selectedActiveAccount?.name,
           status,
         })
       }
@@ -394,6 +413,11 @@ export function ModelList() {
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
+          {modelReadErrors.length > 0 && (
+            <p role="alert" className="text-sm text-destructive">
+              Model catalog refresh failed for {modelReadErrors.join(', ')}. Saved models were not deleted; displayed results may be stale.
+            </p>
+          )}
           <div className="text-center py-12 text-muted-foreground border rounded-lg">
             <Cpu className="h-12 w-12 mx-auto mb-4 opacity-50" />
             <p className="text-sm font-medium">{t('models.noModelsFound')}</p>
@@ -421,6 +445,11 @@ export function ModelList() {
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
+        {modelReadErrors.length > 0 && (
+          <p role="alert" className="text-sm text-destructive">
+            Model catalog refresh failed for {modelReadErrors.join(', ')}. Showing the last confirmed local catalog where available.
+          </p>
+        )}
         <div className="flex items-center gap-4">
           <div className="relative flex-1">
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />

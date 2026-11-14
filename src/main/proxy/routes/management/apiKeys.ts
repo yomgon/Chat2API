@@ -5,7 +5,7 @@
 
 import Router from '@koa/router'
 import type { Context } from 'koa'
-import { randomUUID } from 'crypto'
+import { randomBytes, randomUUID } from 'node:crypto'
 import { managementAuthMiddleware } from '../../middleware/managementAuth'
 import { storeManager } from '../../../store/store'
 import type { 
@@ -25,13 +25,10 @@ const KEY_RANDOM_LENGTH = 32
  * Format: sk-mgmt-{random-string}
  */
 function generateApiKeyValue(): string {
-  const randomBytes = new Uint8Array(KEY_RANDOM_LENGTH)
-  crypto.getRandomValues(randomBytes)
-  const randomString = Array.from(randomBytes)
-    .map(b => b.toString(16).padStart(2, '0'))
-    .join('')
-    .slice(0, KEY_RANDOM_LENGTH)
-  return `${API_KEY_PREFIX}${randomString}`
+  // Electron's Node main process is not guaranteed to expose global WebCrypto.
+  // Use the explicit Node CSPRNG; preserve the existing 32-hex-character key
+  // format (128 bits) and fail before persistence if entropy is unavailable.
+  return `${API_KEY_PREFIX}${randomBytes(KEY_RANDOM_LENGTH / 2).toString('hex')}`
 }
 
 /**
@@ -72,6 +69,21 @@ function createSuccessResponse<T>(data: T): ManagementApiResponse<T> {
   }
 }
 
+/** Once the key write is committed, a separate diagnostics-log failure must
+ * not convert the response into HTTP 500. A regeneration would otherwise
+ * replace the old secret without disclosing the only copy of its replacement
+ * to the authorized caller. Persisted config remains the source of truth. */
+function logCommittedKeyMutation(action: string, key: ApiKey): void {
+  try {
+    storeManager.addLog('info', `${action} API key: ${key.name}`, {
+      data: { keyId: key.id },
+    })
+  } catch {
+    // Logging is best-effort after the successful config write; never retry
+    // the secret mutation, roll it back using stale config, or expose its value.
+  }
+}
+
 /**
  * GET /v0/management/api-keys
  * List all API keys (key values masked)
@@ -99,15 +111,20 @@ router.get('/api-keys', managementAuthMiddleware, async (ctx: Context) => {
 router.post('/api-keys', managementAuthMiddleware, async (ctx: Context) => {
   try {
     const request = ctx.request.body as CreateApiKeyRequest
-    
+
     if (!request.name || typeof request.name !== 'string' || request.name.trim() === '') {
       ctx.status = 400
       ctx.body = createErrorResponse('invalid_request', 'Missing required field: name')
       return
     }
+    if (request.description !== undefined && typeof request.description !== 'string') {
+      ctx.status = 400
+      ctx.body = createErrorResponse('invalid_request', 'Invalid field: description must be a string')
+      return
+    }
     
     const config = storeManager.getConfig()
-    const apiKeys = config.apiKeys || []
+    const apiKeys = [...(config.apiKeys || [])]
     
     const newKey: ApiKey = {
       id: randomUUID(),
@@ -123,9 +140,7 @@ router.post('/api-keys', managementAuthMiddleware, async (ctx: Context) => {
     
     storeManager.updateConfig({ apiKeys })
     
-    storeManager.addLog('info', `Created API key: ${newKey.name}`, {
-      data: { keyId: newKey.id },
-    })
+    logCommittedKeyMutation('Created', newKey)
     
     ctx.status = 201
     ctx.set('Content-Type', 'application/json')
@@ -145,9 +160,33 @@ router.put('/api-keys/:id', managementAuthMiddleware, async (ctx: Context) => {
   try {
     const id = ctx.params.id
     const request = ctx.request.body as UpdateApiKeyRequest
+
+    // A missing/array body or a metadata-free update used to return HTTP 200
+    // and unnecessarily re-persist the unchanged API-key secret. Reject
+    // malformed input before touching the authoritative config, including
+    // requests with only unknown fields.
+    if (!request || typeof request !== 'object' || Array.isArray(request) ||
+        !['name', 'description', 'enabled'].some(field =>
+          Object.prototype.hasOwnProperty.call(request, field))) {
+      ctx.status = 400
+      ctx.body = createErrorResponse('invalid_request',
+        'Request body must contain valid API key metadata fields')
+      return
+    }
+
+    if (request.description !== undefined && typeof request.description !== 'string') {
+      ctx.status = 400
+      ctx.body = createErrorResponse('invalid_request', 'Invalid field: description must be a string')
+      return
+    }
+    if (request.enabled !== undefined && typeof request.enabled !== 'boolean') {
+      ctx.status = 400
+      ctx.body = createErrorResponse('invalid_request', 'Invalid field: enabled must be a boolean')
+      return
+    }
     
     const config = storeManager.getConfig()
-    const apiKeys = config.apiKeys || []
+    const apiKeys = [...(config.apiKeys || [])]
     const keyIndex = apiKeys.findIndex(k => k.id === id)
     
     if (keyIndex === -1) {
@@ -156,7 +195,7 @@ router.put('/api-keys/:id', managementAuthMiddleware, async (ctx: Context) => {
       return
     }
     
-    const existingKey = apiKeys[keyIndex]
+    const existingKey = { ...apiKeys[keyIndex] }
     
     if (request.name !== undefined) {
       if (typeof request.name !== 'string' || request.name.trim() === '') {
@@ -167,16 +206,9 @@ router.put('/api-keys/:id', managementAuthMiddleware, async (ctx: Context) => {
       existingKey.name = request.name.trim()
     }
     
-    if (request.description !== undefined) {
-      existingKey.description = request.description?.trim()
-    }
+    if (request.description !== undefined) existingKey.description = request.description.trim()
     
     if (request.enabled !== undefined) {
-      if (typeof request.enabled !== 'boolean') {
-        ctx.status = 400
-        ctx.body = createErrorResponse('invalid_request', 'Invalid field: enabled must be a boolean')
-        return
-      }
       existingKey.enabled = request.enabled
     }
     
@@ -184,9 +216,7 @@ router.put('/api-keys/:id', managementAuthMiddleware, async (ctx: Context) => {
     
     storeManager.updateConfig({ apiKeys })
     
-    storeManager.addLog('info', `Updated API key: ${existingKey.name}`, {
-      data: { keyId: id },
-    })
+    logCommittedKeyMutation('Updated', existingKey)
     
     const maskedKey = maskApiKey(existingKey)
     ctx.set('Content-Type', 'application/json')
@@ -207,7 +237,7 @@ router.delete('/api-keys/:id', managementAuthMiddleware, async (ctx: Context) =>
     const id = ctx.params.id
     
     const config = storeManager.getConfig()
-    const apiKeys = config.apiKeys || []
+    const apiKeys = [...(config.apiKeys || [])]
     const keyIndex = apiKeys.findIndex(k => k.id === id)
     
     if (keyIndex === -1) {
@@ -221,9 +251,7 @@ router.delete('/api-keys/:id', managementAuthMiddleware, async (ctx: Context) =>
     
     storeManager.updateConfig({ apiKeys })
     
-    storeManager.addLog('info', `Deleted API key: ${deletedKey.name}`, {
-      data: { keyId: id },
-    })
+    logCommittedKeyMutation('Deleted', deletedKey)
     
     ctx.set('Content-Type', 'application/json')
     ctx.body = createSuccessResponse({ id, deleted: true })
@@ -244,7 +272,7 @@ router.post('/api-keys/:id/regenerate', managementAuthMiddleware, async (ctx: Co
     const id = ctx.params.id
     
     const config = storeManager.getConfig()
-    const apiKeys = config.apiKeys || []
+    const apiKeys = [...(config.apiKeys || [])]
     const keyIndex = apiKeys.findIndex(k => k.id === id)
     
     if (keyIndex === -1) {
@@ -253,7 +281,7 @@ router.post('/api-keys/:id/regenerate', managementAuthMiddleware, async (ctx: Co
       return
     }
     
-    const existingKey = apiKeys[keyIndex]
+    const existingKey = { ...apiKeys[keyIndex] }
     const newKeyValue = generateApiKeyValue()
     
     existingKey.key = newKeyValue
@@ -263,9 +291,7 @@ router.post('/api-keys/:id/regenerate', managementAuthMiddleware, async (ctx: Co
     
     storeManager.updateConfig({ apiKeys })
     
-    storeManager.addLog('info', `Regenerated API key: ${existingKey.name}`, {
-      data: { keyId: id },
-    })
+    logCommittedKeyMutation('Regenerated', existingKey)
     
     ctx.set('Content-Type', 'application/json')
     ctx.body = createSuccessResponse(existingKey)

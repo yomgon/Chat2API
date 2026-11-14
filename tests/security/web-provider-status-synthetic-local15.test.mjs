@@ -7,6 +7,7 @@ import vm from 'node:vm'
 import { PassThrough } from 'node:stream'
 import { createRequire } from 'node:module'
 import ts from 'typescript'
+import { QWEN_AI_TOKEN_MODULE } from './helpers/qwenAiTokenModule.mjs'
 
 // Local, purely synthetic transports. Never opens an actual Electron profile,
 // proxy port, account, provider network connection, or sends a chat message.
@@ -43,6 +44,7 @@ function qwenHarness(statuses){
   }}
   const axios={create:()=>instance}
   const {QwenAiAdapter}=loadTS('src/main/proxy/adapters/qwen-ai.ts',{
+    '../../providers/qwenAiToken': QWEN_AI_TOKEN_MODULE,
     axios:{__esModule:true,default:axios},stream:{PassThrough},
     'eventsource-parser':requireNode('eventsource-parser'),
     '../promptToolUse':{hasToolUse:()=>false,parseToolUse:()=>null},
@@ -125,7 +127,7 @@ test('fixed, literal failure classifications are sent to the local route without
   assert.match(forward,/failureCode: 'kimi_upstream_operation_failed'/)
   assert.match(forward,/failureCode: 'qwen_ai_upstream_operation_failed'/)
   assert.match(forward,/safeWebErrorStatus\(error\) \?\? 502/)
-  assert.match(forward,/const maxRetries = consumerWebAdapter \? 0 : config\.retryCount/)
+  assert.match(forward,/const maxRetries = 0/)
   assert.match(route,/result\.failureCode \?\?/)
   assert.match(route,/provider\.id === 'zai'/)
   assert.doesNotMatch(route,/code: result\.error/)

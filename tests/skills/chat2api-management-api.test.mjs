@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
-import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
+import { pathToFileURL } from 'node:url'
 
 const script = 'skills/chat2api-management-api/scripts/management-api.mjs'
 const skill = 'skills/chat2api-management-api/SKILL.md'
@@ -57,8 +57,13 @@ test('management helper dry-run commands do not need network and do not leak sec
 })
 
 test('restore-tool-config exits nonzero on non-2xx response', async () => {
-  const configFile = path.join(os.tmpdir(), `toolCallingConfig-${process.pid}.json`)
-  const mockFile = path.join(os.tmpdir(), `mock-fetch-${process.pid}.mjs`)
+  // Keep the entire mock under the approved workspace. Windows native paths
+  // (C:\...\file.mjs) are not ESM import specifiers; --import needs a file URL.
+  const isolatedBase = path.join(process.cwd(), '.smoke-test-private-final')
+  fs.mkdirSync(isolatedBase, { recursive: true })
+  const temporaryRoot = fs.mkdtempSync(path.join(isolatedBase, 'local37-management-helper-'))
+  const configFile = path.join(temporaryRoot, 'toolCallingConfig.json')
+  const mockFile = path.join(temporaryRoot, 'mock-fetch.mjs')
   fs.writeFileSync(configFile, JSON.stringify({ enabled: true }))
   fs.writeFileSync(mockFile, `
 globalThis.fetch = async (url, options = {}) => {
@@ -84,7 +89,7 @@ globalThis.fetch = async (url, options = {}) => {
       CHAT2API_BASE_URL: 'http://mock.local',
       CHAT2API_MGMT_SECRET: 'mgmt_super_secret_value',
     }, {
-      nodeArgs: ['--import', mockFile],
+      nodeArgs: ['--import', pathToFileURL(mockFile).href],
     })
 
     assert.notEqual(result.status, 0)
@@ -93,8 +98,8 @@ globalThis.fetch = async (url, options = {}) => {
     assert.match(result.stderr, /restore rejected/)
     assert.doesNotMatch(result.stderr, /mgmt_super_secret_value/)
   } finally {
-    fs.rmSync(configFile, { force: true })
-    fs.rmSync(mockFile, { force: true })
+    // Only remove this test's fresh, unique directory, never a user file.
+    fs.rmSync(temporaryRoot, { recursive: true })
   }
 })
 

@@ -10,6 +10,8 @@ import { PassThrough, Readable } from 'node:stream'
 import { inspect } from 'node:util'
 import ts from 'typescript'
 import { createParser } from 'eventsource-parser'
+import { QWEN_TICKET_MODULE } from './helpers/qwenTicketModule.mjs'
+import { QWEN_AI_TOKEN_MODULE } from './helpers/qwenAiTokenModule.mjs'
 
 // Run: node --test tests/security/provider-adapter-log-privacy.test.mjs
 // Only adapter source and local compiler/parser packages are read. Application,
@@ -198,6 +200,8 @@ function loadAdapter(name, overrides = {}) {
   }
   const baseChunk = (id, model, created) => ({ id, model, created, object: 'chat.completion.chunk' })
   const imports = {
+    '../../providers/qwenTicket': QWEN_TICKET_MODULE,
+    '../../providers/qwenAiToken': QWEN_AI_TOKEN_MODULE,
     axios: axiosMock().axios,
     crypto,
     stream: { PassThrough, Readable },
@@ -359,7 +363,7 @@ test('static guard rejects payloads, prefixes, raw errors, keys, headers and ind
 })
 
 test('DeepSeek token acquisition keeps credentials and token-bearing responses out of logs', async () => {
-  const net = axiosMock([{ status: 200, data: { data: { biz_data: { token: markers.access } } } }])
+  const net = axiosMock([{ status: 200, data: { code: 0, data: { biz_code: 0, biz_data: { token: markers.access } } } }])
   const h = loadAdapter('deepseek.ts', { axios: net.axios })
   const adapter = new h.exports.DeepSeekAdapter(fixtureProvider, fixtureAccount({ token: markers.refresh }))
   assert.equal(await adapter.acquireToken(), markers.access)
@@ -390,11 +394,27 @@ test('GLM token rotation still updates the mocked store without logging either t
     data: { code: 0, result: { access_token: markers.access, refresh_token: markers.nextRefresh } },
   }])
   const updates = []
+  const original = {
+    id: 'offline-account', providerId: 'glm',
+    credentials: { refresh_token: markers.refresh },
+  }
   const h = loadAdapter('glm.ts', {
     axios: net.axios,
-    '../../store/store': { storeManager: { updateAccount: async (...args) => updates.push(args) } },
+    '../../store/store': { storeManager: {
+      getAccountById(id, includeCredentials) {
+        assert.equal(id, original.id)
+        assert.equal(includeCredentials, true)
+        return { ...original, credentials: { ...original.credentials } }
+      },
+      updateAccount(id, updatesToCommit) {
+        updates.push([id, updatesToCommit])
+        return { ...original, ...updatesToCommit }
+      },
+    } },
   })
-  const adapter = new h.exports.GLMAdapter(fixtureProvider, fixtureAccount({ refresh_token: markers.refresh }))
+  // A GLM refresh key is an identity credential, not the generic fixture's
+  // unrelated default token. The production adapter now rejects conflicts.
+  const adapter = new h.exports.GLMAdapter(fixtureProvider, original)
   assert.equal(await adapter.acquireToken(), markers.access)
   assert.equal(await adapter.acquireToken(), markers.access)
   assert.deepEqual(plain(updates), [['offline-account', { credentials: { refresh_token: markers.nextRefresh } }]])

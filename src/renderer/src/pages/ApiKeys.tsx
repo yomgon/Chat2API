@@ -35,28 +35,6 @@ import {
 } from 'lucide-react'
 import { toast } from '@/hooks/use-toast'
 import { useSettingsStore } from '@/stores/settingsStore'
-import type { ApiKey } from '@/types/electron'
-
-function generateApiKey(): string {
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
-  const bytes = new Uint8Array(64)
-  const limit = 256 - (256 % chars.length)
-  let key = 'sk-'
-  while (key.length < 51) {
-    globalThis.crypto.getRandomValues(bytes)
-    for (const byte of bytes) {
-      // Rejection sampling avoids bias while keeping the existing key format.
-      if (byte >= limit) continue
-      key += chars[byte % chars.length]
-      if (key.length === 51) break
-    }
-  }
-  return key
-}
-
-function generateId(): string {
-  return globalThis.crypto.randomUUID()
-}
 
 export default function ApiKeysPage() {
   const { t } = useTranslation()
@@ -67,20 +45,28 @@ export default function ApiKeysPage() {
   const [deleteKeyId, setDeleteKeyId] = useState<string | null>(null)
 
   useEffect(() => {
-    fetchConfig()
+    void fetchConfig()
+    const unsubscribe = window.electronAPI?.store?.onChanged?.(kind => {
+      if (kind === 'config') void fetchConfig()
+    })
+    return () => unsubscribe?.()
   }, [fetchConfig])
 
   const apiKeys = config?.apiKeys || []
 
   const handleToggleEnabled = async (keyId: string, enabled: boolean) => {
-    const updatedKeys = apiKeys.map(k => 
-      k.id === keyId ? { ...k, enabled } : k
-    )
-    await updateConfig({ apiKeys: updatedKeys })
-    toast({
-      title: enabled ? t('apiKeys.keyEnabled') : t('apiKeys.keyDisabled'),
-      description: enabled ? t('apiKeys.keyEnabled') : t('apiKeys.keyDisabled'),
-    })
+    try {
+      await window.electronAPI.apiKeys.setEnabled(keyId, enabled)
+      await fetchConfig()
+      toast({
+        title: enabled ? t('apiKeys.keyEnabled') : t('apiKeys.keyDisabled'),
+        description: enabled ? t('apiKeys.keyEnabled') : t('apiKeys.keyDisabled'),
+      })
+    } catch {
+      await fetchConfig()
+      toast({ title: t('common.error'), description: t('settings.configSaveFailed'),
+        variant: 'destructive' })
+    }
   }
 
   const handleAddKey = async () => {
@@ -93,16 +79,9 @@ export default function ApiKeysPage() {
       return
     }
 
-    let newKey: ApiKey
     try {
-      newKey = {
-        id: generateId(),
-        name: newKeyName.trim(),
-        key: generateApiKey(),
-        enabled: true,
-        createdAt: Date.now(),
-        usageCount: 0,
-      }
+      await window.electronAPI.apiKeys.create(newKeyName.trim())
+      await fetchConfig()
     } catch {
       toast({
         title: t('common.error'),
@@ -112,7 +91,6 @@ export default function ApiKeysPage() {
       return
     }
 
-    await updateConfig({ apiKeys: [...apiKeys, newKey] })
     setShowAddDialog(false)
     setNewKeyName('')
   }
@@ -120,13 +98,21 @@ export default function ApiKeysPage() {
   const handleDeleteKey = async () => {
     if (!deleteKeyId) return
     
-    const updatedKeys = apiKeys.filter(k => k.id !== deleteKeyId)
-    await updateConfig({ apiKeys: updatedKeys })
-    setDeleteKeyId(null)
-    toast({
-      title: t('apiKeys.deleted'),
-      description: t('apiKeys.keyDeleted'),
-    })
+    try {
+      const deleted = await window.electronAPI.apiKeys.delete(deleteKeyId)
+      if (!deleted) throw new Error('API key was already removed')
+      await fetchConfig()
+      setDeleteKeyId(null)
+      toast({
+        title: t('apiKeys.deleted'),
+        description: t('apiKeys.keyDeleted'),
+      })
+    } catch {
+      await fetchConfig()
+      setDeleteKeyId(null)
+      toast({ title: t('common.error'), description: t('settings.configSaveFailed'),
+        variant: 'destructive' })
+    }
   }
 
   const handleCopyKey = (key: string) => {
@@ -148,7 +134,15 @@ export default function ApiKeysPage() {
   }
 
   const handleToggleGlobalEnabled = async (enabled: boolean) => {
-    await updateConfig({ enableApiKey: enabled })
+    const committed = await updateConfig({ enableApiKey: enabled })
+    if (!committed) {
+      toast({
+        title: t('common.error'),
+        description: t('settings.configSaveFailed'),
+        variant: 'destructive',
+      })
+      return
+    }
     toast({
       title: enabled ? t('apiKeys.authEnabled') : t('apiKeys.authDisabled'),
       description: enabled ? t('apiKeys.authEnabled') : t('apiKeys.authDisabled'),

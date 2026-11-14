@@ -13,7 +13,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { RequestLogDetail } from './RequestLogDetail'
-import { RequestLogStats } from './RequestLogStats'
+import { RequestLogStats, type RequestLogStatsData } from './RequestLogStats'
 import { Trash2 } from 'lucide-react'
 
 interface RequestLogEntry {
@@ -37,15 +37,6 @@ interface RequestLogEntry {
   isStream: boolean
   errorMessage?: string
   errorStack?: string
-}
-
-interface RequestLogStatsData {
-  total: number
-  success: number
-  error: number
-  todayTotal: number
-  todaySuccess: number
-  todayError: number
 }
 
 interface RowProps {
@@ -80,6 +71,7 @@ export function RequestLogList() {
   const { t } = useTranslation()
   const [logs, setLogs] = useState<RequestLogEntry[]>([])
   const [stats, setStats] = useState<RequestLogStatsData | null>(null)
+  const [requestLoggingEnabled, setRequestLoggingEnabled] = useState<boolean | undefined>(undefined)
   const [selectedLog, setSelectedLog] = useState<RequestLogEntry | null>(null)
   const [statusFilter, setStatusFilter] = useState<'all' | 'success' | 'error'>('all')
   const [isLoading, setIsLoading] = useState(true)
@@ -105,18 +97,36 @@ export function RequestLogList() {
 
   const fetchStats = useCallback(async () => {
     try {
-      const result = await window.electronAPI?.requestLogs?.getStats()
-      if (result) {
-        setStats(result)
-      }
+      // Global accounting is independent of retained log rows and their filters.
+      const result = await window.electronAPI?.statistics?.getToday?.()
+      setStats(result && [result.totalRequests, result.successRequests, result.failedRequests]
+        .every(count => Number.isSafeInteger(count) && count >= 0)
+        ? {
+            totalRequests: result.totalRequests,
+            successRequests: result.successRequests,
+            failedRequests: result.failedRequests,
+          }
+        : null)
     } catch (error) {
-      console.error('Failed to fetch request log stats:')
+      setStats(null)
+      console.error('Failed to fetch today statistics:')
+    }
+  }, [])
+
+  const fetchLoggingSetting = useCallback(async () => {
+    try {
+      const result = await window.electronAPI?.config?.get?.()
+      const enabled = result?.requestLogConfig?.enabled
+      setRequestLoggingEnabled(typeof enabled === 'boolean' ? enabled : undefined)
+    } catch (error) {
+      setRequestLoggingEnabled(undefined)
+      console.error('Failed to fetch request log settings:')
     }
   }, [])
 
   const refreshLogs = useCallback(async () => {
-    await Promise.all([fetchLogs(), fetchStats()])
-  }, [fetchLogs, fetchStats])
+    await Promise.all([fetchLogs(), fetchStats(), fetchLoggingSetting()])
+  }, [fetchLogs, fetchStats, fetchLoggingSetting])
 
   useEffect(() => {
     setIsLoading(true)
@@ -125,7 +135,7 @@ export function RequestLogList() {
 
   useEffect(() => {
     const interval = setInterval(() => {
-      refreshLogs().catch((error) => {
+      refreshLogs().catch(() => {
         console.error('Failed to refresh request logs:')
       })
     }, 3000)
@@ -234,7 +244,7 @@ export function RequestLogList() {
         </div>
       </div>
 
-      {stats && <RequestLogStats stats={stats} />}
+      <RequestLogStats stats={stats} isLoading={isLoading} />
 
       <div ref={containerRef} className="flex-1 mt-4">
         {isLoading ? (
@@ -242,8 +252,11 @@ export function RequestLogList() {
             {t('common.loading')}
           </div>
         ) : logs.length === 0 ? (
-          <div className="flex items-center justify-center h-32 text-muted-foreground">
-            {t('logs.noRequestLogs')}
+          <div className="flex flex-col items-center justify-center gap-2 h-32 text-muted-foreground">
+            <p>{t('logs.noRequestLogs')}</p>
+            {requestLoggingEnabled === false && (
+              <p className="text-sm">{t('settings.requestLogEnabled')}: {t('common.disabled')}</p>
+            )}
           </div>
         ) : (
           <List

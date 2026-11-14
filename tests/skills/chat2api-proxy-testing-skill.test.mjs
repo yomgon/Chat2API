@@ -43,19 +43,34 @@ const implementedScriptPaths = [
   'skills/chat2api-provider-model-matrix/scripts/run-model-matrix.mjs',
 ]
 
-const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+function parseFrontmatter(text) {
+  // Preserve the exact name and description contract while accepting native
+  // Windows CRLF and Unix LF. Do not normalize field contents or key order.
+  const match = /^---\r?\nname: ([^\r\n]+)\r?\ndescription: ([^\r\n]+)\r?\n---(?:\r?\n|$)/.exec(text)
+  assert.ok(match, 'Valid skill frontmatter with exact name/description fields')
+  return { name: match[1], description: match[2] }
+}
 
 test('versioned Chat2API testing skills exist and have trigger-only descriptions', () => {
   for (const { file, name, description } of skillPaths) {
     const text = fs.readFileSync(file, 'utf8')
     // Skill frontmatter is a discovery contract; keep exact names and descriptions stable.
-    assert.match(
-      text,
-      new RegExp(`^---\\nname: ${escapeRegExp(name)}\\ndescription: ${escapeRegExp(description)}\\n---`, 'm'),
-      file,
-    )
+    const parsed = parseFrontmatter(text)
+    assert.equal(parsed.name, name, file)
+    assert.equal(parsed.description, description, file)
     assert.doesNotMatch(text, /T[B]D|FI[X]ME|deferred work/, file)
   }
+})
+
+test('skill metadata accepts CRLF and LF but refuses a changed field or description', () => {
+  const source = fs.readFileSync(skillPaths[0].file, 'utf8')
+  const parsed = parseFrontmatter(source)
+  assert.deepEqual(parseFrontmatter(source.replace(/\r\n/g, '\n')), parsed)
+  assert.deepEqual(parseFrontmatter(source.replace(/\r?\n/g, '\r\n')), parsed)
+  assert.notEqual(parseFrontmatter(source.replace('name: chat2api-management-api',
+    'name: altered-management-api')).name, parsed.name)
+  assert.notEqual(parseFrontmatter(source.replace('description: Use when',
+    'description: Altered when')).description, parsed.description)
 })
 
 test('focused skill docs reference implemented script paths only', () => {

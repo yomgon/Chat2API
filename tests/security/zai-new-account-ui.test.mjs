@@ -224,14 +224,14 @@ test('the trimmed name creates once before rerender and blocks stale manual hand
   const request = deferred()
   const h = fixture({}, { create: () => request.promise })
   h.name('  Named once  ')
-  const staleSave = h.button('providers.addAccount').props.onClick
-  const staleValidate = h.button('providers.validateCredentials').props.onClick
+  assert.ok(!h.nodes('Button').some(node =>
+    ['providers.addAccount','providers.validateCredentials'].some(label =>
+      JSON.stringify(node.props.children).includes(label))))
   h.tab('oauth')
   const click = h.button('Sign in and add Z.ai account').props.onClick
   const first = click(), second = click()
   await second
-  await staleSave()
-  await staleValidate()
+  // No stale manual Z.ai action exists to bypass the pending owner login.
   h.render()
   assert.deepEqual(h.createNames, ['Named once'])
   assert.equal(h.legacy.length, 0)
@@ -456,21 +456,22 @@ test('ordinary parent callback identity changes do not cancel active creation', 
   h.assertPrivate()
 })
 
-test('the selected manual Z.ai form keeps its existing validation and single-save path', async () => {
+test('new Z.ai accounts cannot enter the generic manual validation or single-save path', async () => {
   const h = fixture()
-  h.name('  Manual account  ')
-  h.nodes('CredentialFieldsForm')[0].props.onChange('token', 'synthetic-manual-value')
-  h.input('dailyLimit').props.onChange({ target: { value: '25' } })
+  h.name('  Protected account  ')
   h.render()
-  await h.button('providers.validateCredentials').props.onClick()
+  assert.equal(h.nodes('CredentialFieldsForm').length,0)
+  assert.equal(h.nodes('Input').filter(node => node.props.id === 'dailyLimit').length,0)
+  assert.ok(!h.nodes('Button').some(node =>
+    ['providers.addAccount','providers.validateCredentials'].some(label =>
+      JSON.stringify(node.props.children).includes(label))))
+  assert.equal(h.nodes('Tabs')[0].props.value,'oauth')
+  await h.button('Sign in and add Z.ai account').props.onClick()
   await h.flush()
-  await h.button('providers.addAccount').props.onClick()
-  await h.flush()
-  assert.equal(h.createNames.length, 0)
+  assert.deepEqual(h.createNames,['Protected account'])
   assert.equal(h.legacy.length, 0)
-  assert.deepEqual(h.validations, [['zai', { token: 'synthetic-manual-value' }]])
-  assert.deepEqual(h.adds, [{ name: 'Manual account', credentials: { token: 'synthetic-manual-value' }, dailyLimit: 25 }])
-  assert.deepEqual(h.closes, [false])
+  assert.equal(h.validations.length,0)
+  assert.equal(h.adds.length,0)
 })
 
 test('non-Z.ai OAuth retains credential mapping and the later manual save', async () => {
@@ -495,7 +496,7 @@ test('editing a Z.ai account preserves the manual update path', async () => {
   assert.ok(!h.text().includes('Sign in and add Z.ai account'))
   await h.button('providers.saveChanges').props.onClick()
   await h.flush()
-  assert.deepEqual(h.updates, [['synthetic-existing', { name: 'Existing account', credentials: { token: 'synthetic-existing-value' } }]])
+  assert.deepEqual(h.updates, [['synthetic-existing', { name: 'Existing account' }]])
   assert.equal(h.createNames.length, 0)
   assert.equal(h.adds.length, 0)
   assert.equal(h.legacy.length, 0)

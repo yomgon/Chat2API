@@ -166,7 +166,12 @@ export class SlidingWindowStrategy {
     const nonSystemMessages = messages.filter(msg => msg.role !== 'system')
 
     const maxNonSystemMessages = this.config.maxMessages - systemMessages.length
-    const keptNonSystemMessages = nonSystemMessages.slice(-maxNonSystemMessages)
+    // slice(-0) is slice(0), i.e. *all* old non-system turns. If system
+    // messages exhaust the configured budget, keep zero non-system turns
+    // instead of bypassing the limit and leaking the untrimmed conversation.
+    const keptNonSystemMessages = maxNonSystemMessages > 0
+      ? nonSystemMessages.slice(-maxNonSystemMessages)
+      : []
 
     const result = [...systemMessages, ...keptNonSystemMessages]
 

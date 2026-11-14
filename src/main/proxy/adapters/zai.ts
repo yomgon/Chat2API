@@ -121,6 +121,8 @@ interface ZaiMessage {
 
 interface ChatCompletionRequest {
   model: string
+  /** The load balancer has already selected this exact effective web wire ID. */
+  resolvedModelId?: boolean
   /** Original model name before mapping (used for feature detection like web search, thinking mode) */
   originalModel?: string
   messages: ZaiMessage[]
@@ -414,9 +416,10 @@ export class ZaiAdapter {
   async deleteChat(chatId: string): Promise<boolean> {
     try {
       const token = await this.ensureToken()
+      const encodedChatId = encodeURIComponent(chatId)
       
       const response = await axios.delete(
-        `${ZAI_API_BASE}/api/v1/chats/${chatId}`,
+        `${ZAI_API_BASE}/api/v1/chats/${encodedChatId}`,
         {
           headers: {
             Authorization: `Bearer ${token}`,
@@ -473,9 +476,6 @@ export class ZaiAdapter {
   }
 
   async chatCompletion(request: ChatCompletionRequest): Promise<{ response: AxiosResponse; chatId: string; requestId: string }> {
-    const token = await this.ensureToken()
-    const userId = this.extractUserIDFromToken(token)
-    
     console.log('[Z.ai] Chat completion requested')
     
     // Z.ai API requires specific model name casing:
@@ -496,7 +496,11 @@ export class ZaiAdapter {
       'GLM-5': 'glm-5',
       'GLM-4.7': 'glm-4.7',
     }
-    const mappedModel = modelMapping[request.model] || modelMapping[request.model.toLowerCase()] || request.model
+    // Preserve exact effective-catalog IDs selected by the forwarder. Only
+    // direct legacy callers still need the historical display-name mapping.
+    const mappedModel = request.resolvedModelId === true
+      ? request.model
+      : modelMapping[request.model] || modelMapping[request.model.toLowerCase()] || request.model
     
     console.log('[Z.ai] Model mapping resolved')
     
@@ -546,10 +550,17 @@ export class ZaiAdapter {
     }
     
     const signaturePrompt = this.extractLastUserMessage(processedMessages)
+
+    // A no-expiry web JWT requires an authenticated first-party identity GET.
+    // Reject unsupported local history and parts BEFORE even that read-only
+    // remote operation; the following create/completion still reuse one pin.
+    const token = await this.ensureToken()
+    const userId = this.extractUserIDFromToken(token)
     
     // Always create a new chat (single-turn mode only)
     const chatResult = await this.createChatWithVerifiedToken(mappedModel, signaturePrompt, token)
     const chatId = chatResult.chatId
+    const encodedChatId = encodeURIComponent(chatId)
     const messageId = chatResult.messageId
     const parentMessageId = null
     console.log('[Z.ai] Created new chat')
@@ -652,8 +663,8 @@ export class ZaiAdapter {
       viewport_size: '923x945',
       color_depth: '30',
       pixel_ratio: '2',
-      current_url: `${ZAI_API_BASE}/c/${chatId}`,
-      pathname: `/c/${chatId}`,
+      current_url: `${ZAI_API_BASE}/c/${encodedChatId}`,
+      pathname: `/c/${encodedChatId}`,
       search: '',
       hash: '',
       host: 'chat.z.ai',
@@ -685,7 +696,7 @@ export class ZaiAdapter {
             'X-Signature': signature,
             'X-FE-Version': X_FE_VERSION,
             'Cookie': `token=${token}`,
-            Referer: `${ZAI_API_BASE}/c/${chatId}`,
+            Referer: `${ZAI_API_BASE}/c/${encodedChatId}`,
             Priority: 'u=1, i',
           },
           responseType: 'stream',
@@ -742,7 +753,8 @@ export class ZaiStreamHandler {
   private thinkingCitationBuffer: { value: string } = { value: '' }
 
   constructor(model: string, onEnd?: (chatId: string) => void,
-    private readonly allowLegacyToolCalls: boolean = true) {
+    private readonly allowLegacyToolCalls: boolean = true,
+    private readonly normalizeManagedCompletion?: (result: any) => void) {
     this.model = model
     this.created = Math.floor(Date.now() / 1000)
     this.onEnd = onEnd
@@ -872,6 +884,49 @@ export class ZaiStreamHandler {
 
     void this.handleNonStream(stream).then(result => {
       if (transStream.destroyed || transStream.writableEnded) return
+      // Both API modes must run the same selected managed-tool parser after
+      // the real provider terminal and clean EOF. The nonstream result is
+      // already complete here; never publish raw tool XML as a stopped SSE.
+      if (this.normalizeManagedCompletion) {
+        try {
+          this.normalizeManagedCompletion(result)
+        } catch {
+          fail(false)
+          return
+        }
+        const choice = result?.choices?.[0]
+        const calls: unknown = choice?.message?.tool_calls
+        if (calls !== undefined) {
+          if (!Array.isArray(calls) || !calls.length || calls.length > 128 ||
+              !calls.every(call => call?.type === 'function' &&
+                typeof call.id === 'string' && !!call.id.trim() &&
+                typeof call.function?.name === 'string' && !!call.function.name.trim() &&
+                typeof call.function.arguments === 'string' &&
+                (() => { try { JSON.parse(call.function.arguments); return true } catch { return false } })())) {
+            fail(false)
+            return
+          }
+          const safeContent = choice.message.content
+          if (safeContent !== null && typeof safeContent !== 'string') {
+            fail(false)
+            return
+          }
+          emit({ index: 0, delta: { role: 'assistant',
+            ...(typeof safeContent === 'string' && safeContent ? { content: safeContent } : {}) },
+          finish_reason: null })
+          for (let i = 0; i < calls.length; i++) {
+            emit({ index: 0, delta: { tool_calls: [{ index: i, ...calls[i] }] },
+              finish_reason: null })
+          }
+          emit({ index: 0, delta: {}, finish_reason: 'tool_calls' }, result?.usage)
+          emittedSuccessfulTerminal = true
+          transStream.end('data: [DONE]\n\n')
+          if (this.onEnd && this.chatId) {
+            try { this.onEnd(this.chatId) } catch { console.error('[Z.ai] onEnd callback error') }
+          }
+          return
+        }
+      }
       const answer = result?.choices?.[0]?.message?.content
       if (typeof answer !== 'string' || !answer.trim()) {
         fail(false)
@@ -1153,7 +1208,12 @@ export class ZaiStreamHandler {
           }
           // Neither a partial SSE event nor a dangling UTF-8 sequence may be
           // silently discarded merely because an earlier DONE was received.
-          if (pendingFrame || !sawTerminal) {
+          // A complete empty LF/CRLF line carries no event data. The parser
+          // already consumed it, although the two-newline frame tracker can
+          // retain an odd blank line. Ignore only those fully terminated empty
+          // lines, never partial data, spaces, tabs or a dangling CR.
+          const hasIncompleteFrame = pendingFrame !== '' && !/^(?:\r?\n)*$/.test(pendingFrame)
+          if (hasIncompleteFrame || !sawTerminal) {
             rejectOnce(new Error('Z.ai transport ended before upstream completion; outcome unconfirmed'))
             return
           }

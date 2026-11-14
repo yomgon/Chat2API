@@ -136,12 +136,14 @@ export function ModelMappingConfig({ onConfigChange }: ModelMappingConfigProps) 
   }, [])
 
   useEffect(() => {
-    if (!isInitializedRef.current && modelMappings.length >= 0) {
+    // A management CRUD mutation can arrive while this page remains mounted.
+    // Refresh clean drafts, but never overwrite unsaved local edits.
+    if (!isInitializedRef.current || !hasChanges) {
       setMappings([...modelMappings])
       setOriginalMappings([...modelMappings])
       isInitializedRef.current = true
     }
-  }, [modelMappings])
+  }, [modelMappings, hasChanges])
 
   useEffect(() => {
     if (hasChanges) {
@@ -290,9 +292,10 @@ export function ModelMappingConfig({ onConfigChange }: ModelMappingConfigProps) 
       mappingRecord[mapping.requestModel] = mapping
     }
 
-    const success = await saveAppConfig({
-      modelMappings: mappingRecord,
-    })
+    const originalRecord = Object.fromEntries(
+      originalMappings.map(mapping => [mapping.requestModel, mapping]))
+    const success = await saveAppConfig({ modelMappings: mappingRecord },
+      { expectedModelMappings: originalRecord })
 
     if (success) {
       setModelMappings(mappings)
@@ -321,9 +324,11 @@ export function ModelMappingConfig({ onConfigChange }: ModelMappingConfigProps) 
 
   const handleRestoreDefaults = async () => {
     const defaultMappings = Object.values(DEFAULT_MODEL_MAPPINGS)
+    const originalRecord = Object.fromEntries(
+      originalMappings.map(mapping => [mapping.requestModel, mapping]))
     const success = await saveAppConfig({
       modelMappings: DEFAULT_MODEL_MAPPINGS,
-    })
+    }, { expectedModelMappings: originalRecord })
 
     if (success) {
       setMappings(defaultMappings)

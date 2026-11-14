@@ -39,6 +39,11 @@ function createSuccessResponse<T>(data: T): ManagementApiResponse<T> {
   }
 }
 
+function getOwnModelMapping(model: string): ModelMapping | undefined {
+  const mappings = ConfigManager.getModelMappings()
+  return Object.prototype.hasOwnProperty.call(mappings, model) ? mappings[model] : undefined
+}
+
 /**
  * GET /v0/management/model-mappings
  * List all model mappings
@@ -64,20 +69,46 @@ router.get('/model-mappings', managementAuthMiddleware, async (ctx: Context) => 
 router.post('/model-mappings', managementAuthMiddleware, async (ctx: Context) => {
   try {
     const request = ctx.request.body as CreateModelMappingRequest
-
-    if (!request.requestModel) {
+    if (!request || typeof request !== 'object' || Array.isArray(request)) {
       ctx.status = 400
-      ctx.body = createErrorResponse('invalid_request', 'Missing required field: requestModel')
+      ctx.body = createErrorResponse('invalid_request', 'Request body must be an object')
       return
     }
 
-    if (!request.actualModel) {
+    if (typeof request.requestModel !== 'string' || !request.requestModel.trim()) {
       ctx.status = 400
-      ctx.body = createErrorResponse('invalid_request', 'Missing required field: actualModel')
+      ctx.body = createErrorResponse('invalid_request', 'Missing or invalid required field: requestModel')
       return
     }
 
-    const existingMapping = ConfigManager.getModelMapping(request.requestModel)
+    // ConfigManager currently persists mappings in an ordinary object.
+    // Assigning "__proto__" changes that object's prototype instead of
+    // storing an own model key; the API used to return 201 for an alias that
+    // subsequent GET /v1/models and chat could not resolve. Refuse this one
+    // unpersistable key before any config mutation. The valid "constructor"
+    // own-key mapping must continue to work for legacy configs.
+    if (request.requestModel === '__proto__') {
+      ctx.status = 400
+      ctx.body = createErrorResponse('invalid_request', 'Reserved model mapping name')
+      return
+    }
+
+    if (typeof request.actualModel !== 'string' || !request.actualModel.trim()) {
+      ctx.status = 400
+      ctx.body = createErrorResponse('invalid_request', 'Missing or invalid required field: actualModel')
+      return
+    }
+
+    if ((request.preferredProviderId !== undefined &&
+          (typeof request.preferredProviderId !== 'string' || !request.preferredProviderId.trim())) ||
+        (request.preferredAccountId !== undefined &&
+          (typeof request.preferredAccountId !== 'string' || !request.preferredAccountId.trim()))) {
+      ctx.status = 400
+      ctx.body = createErrorResponse('invalid_request', 'Invalid preferred provider or account identifier')
+      return
+    }
+
+    const existingMapping = getOwnModelMapping(request.requestModel)
     if (existingMapping) {
       ctx.status = 409
       ctx.body = createErrorResponse('mapping_exists', `Model mapping already exists: ${request.requestModel}`)
@@ -112,7 +143,21 @@ router.put('/model-mappings/:model', managementAuthMiddleware, async (ctx: Conte
     const model = decodeURIComponent(ctx.params.model)
     const request = ctx.request.body as UpdateModelMappingRequest
 
-    const existingMapping = ConfigManager.getModelMapping(model)
+    if (!request || typeof request !== 'object' || Array.isArray(request) ||
+        !['actualModel', 'preferredProviderId', 'preferredAccountId'].some(field =>
+          Object.prototype.hasOwnProperty.call(request, field)) ||
+        (request.actualModel !== undefined &&
+          (typeof request.actualModel !== 'string' || !request.actualModel.trim())) ||
+        (request.preferredProviderId !== undefined &&
+          (typeof request.preferredProviderId !== 'string' || !request.preferredProviderId.trim())) ||
+        (request.preferredAccountId !== undefined &&
+          (typeof request.preferredAccountId !== 'string' || !request.preferredAccountId.trim()))) {
+      ctx.status = 400
+      ctx.body = createErrorResponse('invalid_request', 'Invalid model mapping update')
+      return
+    }
+
+    const existingMapping = getOwnModelMapping(model)
     if (!existingMapping) {
       ctx.status = 404
       ctx.body = createErrorResponse('mapping_not_found', `Model mapping not found: ${model}`)
@@ -144,6 +189,12 @@ router.put('/model-mappings/:model', managementAuthMiddleware, async (ctx: Conte
 router.delete('/model-mappings/:model', managementAuthMiddleware, async (ctx: Context) => {
   try {
     const model = decodeURIComponent(ctx.params.model)
+
+    if (!getOwnModelMapping(model)) {
+      ctx.status = 404
+      ctx.body = createErrorResponse('mapping_not_found', `Model mapping not found: ${model}`)
+      return
+    }
 
     const deleted = ConfigManager.removeModelMapping(model)
 

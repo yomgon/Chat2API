@@ -6,6 +6,7 @@ import { PassThrough } from 'node:stream'
 import { createRequire } from 'node:module'
 import vm from 'node:vm'
 import ts from 'typescript'
+import { QWEN_AI_TOKEN_MODULE } from './helpers/qwenAiTokenModule.mjs'
 
 // Execute product parsers with synthetic in-memory streams only. All transport
 // methods are forbidden stubs: no app, profile, real credentials or network.
@@ -49,6 +50,7 @@ function load(credentials = { token }, tools = promptTools) {
     throw new Error('Synthetic transport is forbidden')
   }
   const exported = execute(adapterCode, {
+    '../../providers/qwenAiToken': QWEN_AI_TOKEN_MODULE,
     axios: { __esModule: true, default: { create: () => ({
       post: forbidden, delete: forbidden, get: forbidden,
     }) } },

@@ -4,6 +4,7 @@ import type {
   Provider, 
   Account, 
   ProxyStatus, 
+  ProxyStatistics,
   ProviderCheckResult, 
   OAuthResult,
   AuthType,
@@ -26,6 +27,9 @@ const proxyAPI = {
   
   getStatus: (): Promise<ProxyStatus> => 
     ipcRenderer.invoke(IpcChannels.PROXY_GET_STATUS),
+
+  getStatistics: (): Promise<ProxyStatistics> =>
+    ipcRenderer.invoke(IpcChannels.PROXY_GET_STATISTICS),
   
   onStatusChanged: (callback: (status: ProxyStatus) => void) => {
     const handler = (_event: Electron.IpcRendererEvent, status: ProxyStatus) => callback(status)
@@ -37,6 +41,13 @@ const proxyAPI = {
 const storeAPI = {
   clearAll: (): Promise<boolean> =>
     ipcRenderer.invoke(IpcChannels.STORE_CLEAR_ALL),
+
+  onChanged: (callback: (kind: 'config' | 'providers' | 'accounts') => void) => {
+    const handler = (_event: Electron.IpcRendererEvent,
+      kind: 'config' | 'providers' | 'accounts') => callback(kind)
+    ipcRenderer.on(IpcChannels.STORE_CHANGED, handler)
+    return () => ipcRenderer.removeListener(IpcChannels.STORE_CHANGED, handler)
+  },
   
   onInitError: (callback: (error: { message: string | null }) => void) => {
     const handler = (_event: Electron.IpcRendererEvent, error: { message: string | null }) => callback(error)
@@ -205,8 +216,13 @@ const oauthAPI = {
   cancelLogin: (): Promise<void> => 
     ipcRenderer.invoke(IpcChannels.OAUTH_CANCEL_LOGIN),
   
-  loginWithToken: (providerId: string, providerType: ProviderType, token: string): Promise<OAuthResult> =>
-    ipcRenderer.invoke(IpcChannels.OAUTH_LOGIN_WITH_TOKEN, { providerId, providerType, token }),
+  loginWithToken: (
+    providerId: string, providerType: ProviderType, token: string,
+    realUserID?: string, mimoUserId?: string, mimoPhToken?: string,
+  ): Promise<OAuthResult> =>
+    ipcRenderer.invoke(IpcChannels.OAUTH_LOGIN_WITH_TOKEN, {
+      providerId, providerType, token, realUserID, mimoUserId, mimoPhToken,
+    }),
   
   validateToken: (providerId: string, providerType: ProviderType, credentials: Record<string, string>): Promise<TokenValidationResult> =>
     ipcRenderer.invoke(IpcChannels.OAUTH_VALIDATE_TOKEN, { providerId, providerType, credentials }),
@@ -421,6 +437,9 @@ interface UpdateStatus {
 const appAPI = {
   getVersion: (): Promise<string> => 
     ipcRenderer.invoke(IpcChannels.APP_GET_VERSION),
+
+  isTestQuietStartup: (): Promise<boolean> =>
+    ipcRenderer.invoke(IpcChannels.APP_GET_TEST_QUIET_STARTUP),
   
   minimize: (): Promise<void> => 
     ipcRenderer.invoke(IpcChannels.APP_MINIMIZE),
@@ -493,14 +512,21 @@ const configAPI = {
   get: (): Promise<AppConfig> => 
     ipcRenderer.invoke(IpcChannels.CONFIG_GET),
   
-  update: (updates: Partial<AppConfig>): Promise<boolean> => 
-    ipcRenderer.invoke(IpcChannels.CONFIG_UPDATE, updates),
+  update: (updates: Partial<AppConfig>, options?: { expectedModelMappings?: AppConfig['modelMappings'] }): Promise<boolean> =>
+    ipcRenderer.invoke(IpcChannels.CONFIG_UPDATE, updates, options),
   
   onConfigChanged: (callback: (config: AppConfig) => void) => {
     const handler = (_event: Electron.IpcRendererEvent, config: AppConfig) => callback(config)
     ipcRenderer.on(IpcChannels.CONFIG_CHANGED, handler)
     return () => ipcRenderer.removeListener(IpcChannels.CONFIG_CHANGED, handler)
   },
+}
+
+const apiKeysAPI = {
+  create: (name: string) => ipcRenderer.invoke(IpcChannels.API_KEYS_CREATE, name),
+  setEnabled: (id: string, enabled: boolean) =>
+    ipcRenderer.invoke(IpcChannels.API_KEYS_SET_ENABLED, id, enabled),
+  delete: (id: string) => ipcRenderer.invoke(IpcChannels.API_KEYS_DELETE, id),
 }
 
 const promptsAPI = {
@@ -657,6 +683,7 @@ const electronAPI = {
   statistics: statisticsAPI,
   app: appAPI,
   config: configAPI,
+  apiKeys: apiKeysAPI,
   prompts: promptsAPI,
   session: sessionAPI,
   managementApi: managementApiAPI,

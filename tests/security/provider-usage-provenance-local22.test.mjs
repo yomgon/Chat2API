@@ -7,6 +7,7 @@ import * as zlib from 'node:zlib'
 import { createRequire } from 'node:module'
 import vm from 'node:vm'
 import ts from 'typescript'
+import { QWEN_TICKET_MODULE } from './helpers/qwenTicketModule.mjs'
 
 // Run each real provider decoder and the real shared OpenAI terminal gate.
 // No Electron app, account, credential store, HTTP, remote request or cleanup.
@@ -37,6 +38,7 @@ function harness(provider) {
   const stubConsole = Object.fromEntries(['log', 'info', 'warn', 'error'].map(level =>
     [level, (...args) => log.push({ level, args })]))
   const common = {
+    '../../providers/qwenTicket': QWEN_TICKET_MODULE,
     axios: { __esModule: true, default: {
       get: forbidden, post: forbidden, delete: forbidden,
       create: () => ({ get: forbidden, post: forbidden, request: forbidden }),

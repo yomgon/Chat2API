@@ -11,6 +11,7 @@ import type { ManagementApiResponse } from '../../../../shared/types'
 import type { ToolClientAdapterId } from '../../../../shared/toolCalling'
 
 const router = new Router({ prefix: '/v0/management/tool-calling' })
+const SUPPORTED_CLIENT_ADAPTERS = new Set(['standard-openai-tools', 'cherry-studio-mcp'])
 
 router.use(managementAuthMiddleware)
 
@@ -28,8 +29,24 @@ router.get('/status', async (ctx: Context) => {
 
 router.post('/smoke', async (ctx: Context) => {
   const body = ctx.request.body as { clientAdapterId?: ToolClientAdapterId }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    ctx.status = 400
+    ctx.body = {
+      success: false,
+      error: { code: 'invalid_request', message: 'Request body must be an object' },
+    } as ManagementApiResponse
+    return
+  }
   const config = ConfigManager.get()
   const clientAdapterId = body.clientAdapterId ?? config.toolCallingConfig.clientAdapterId
+  if (typeof clientAdapterId !== 'string' || !SUPPORTED_CLIENT_ADAPTERS.has(clientAdapterId)) {
+    ctx.status = 400
+    ctx.body = {
+      success: false,
+      error: { code: 'invalid_request', message: 'Unsupported tool client adapter' },
+    } as ManagementApiResponse
+    return
+  }
   const fixture = buildSmokeFixture(clientAdapterId)
 
   const result = setLatestToolCallingSmokeResult({

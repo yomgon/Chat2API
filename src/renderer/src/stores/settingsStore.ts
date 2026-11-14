@@ -43,12 +43,18 @@ interface SettingsState {
   setLogDesensitization: (enabled: boolean) => void
   config: AppConfig | null
   setConfig: (config: AppConfig) => void
-  updateConfig: (updates: Partial<AppConfig>) => Promise<void>
+  updateConfig: (updates: Partial<AppConfig>) => Promise<boolean>
   fetchConfig: () => Promise<void>
 }
 
 export const SETTINGS_STORAGE_KEY = 'chat2api-settings'
 const SETTINGS_STORAGE_VERSION = 1
+
+// IPC config reads and writes overlap with CONFIG_CHANGED and STORE_CHANGED.
+// Only the latest authoritative main-process snapshot may update the React
+// state; an older read or failed edit must never resurrect revoked keys or
+// persist a misleading boot/login setting across a Windows restart.
+let configSnapshotGeneration = 0
 
 type PersistedSettings = Partial<Pick<SettingsState,
   | 'theme' | 'sidebarCollapsed' | 'proxyEnabled' | 'oauthProxyMode' | 'language'
@@ -156,7 +162,7 @@ function createSettingsStorage(): StateStorage {
 }
 
 export const useSettingsStore = create<SettingsState>()(
-  persist(
+  persist<SettingsState, [], [], PersistedSettings>(
     (set, get) => ({
       theme: 'system',
       setTheme: (theme) => set({ theme }),
@@ -167,37 +173,38 @@ export const useSettingsStore = create<SettingsState>()(
       setProxyEnabled: (enabled) => set({ proxyEnabled: enabled }),
       oauthProxyMode: 'system',
       setOauthProxyMode: async (mode) => {
-        set({ oauthProxyMode: mode })
         try {
-          await window.electronAPI.config.update({ oauthProxyMode: mode })
+          const committed = await window.electronAPI.config.update({ oauthProxyMode: mode })
+          if (committed !== false) set({ oauthProxyMode: mode })
         } catch (error) {
           console.error('Failed to update oauthProxyMode:')
         }
       },
       language: 'en-US',
       setLanguage: async (language) => {
-        set({ language })
-        await i18n.changeLanguage(language)
         try {
-          await window.electronAPI.config.update({ language: language })
+          const committed = await window.electronAPI.config.update({ language })
+          if (committed === false) return
+          set({ language })
+          await i18n.changeLanguage(language)
         } catch (error) {
           console.error('Failed to update language:')
         }
       },
       autoStart: false,
       setAutoStart: async (enabled) => {
-        set({ autoStart: enabled })
         try {
-          await window.electronAPI.config.update({ autoStart: enabled })
+          const committed = await window.electronAPI.config.update({ autoStart: enabled })
+          if (committed !== false) set({ autoStart: enabled })
         } catch (error) {
           console.error('Failed to update autoStart:')
         }
       },
       autoStartProxy: false,
       setAutoStartProxy: async (enabled) => {
-        set({ autoStartProxy: enabled })
         try {
-          await window.electronAPI.config.update({ autoStartProxy: enabled })
+          const committed = await window.electronAPI.config.update({ autoStartProxy: enabled })
+          if (committed !== false) set({ autoStartProxy: enabled })
         } catch (error) {
           console.error('Failed to update autoStartProxy:')
         }
@@ -219,10 +226,21 @@ export const useSettingsStore = create<SettingsState>()(
       logDesensitization: true,
       setLogDesensitization: (enabled) => set({ logDesensitization: enabled }),
       config: null,
-      setConfig: (config) => set({ config }),
+      setConfig: (config) => {
+        // Trusted CONFIG_CHANGED has newer main-store state than a pending GET.
+        ++configSnapshotGeneration
+        set({
+          config,
+          autoStart: config.autoStart,
+          autoStartProxy: config.autoStartProxy,
+          oauthProxyMode: config.oauthProxyMode || 'system',
+          language: config.language || 'en-US',
+        })
+      },
       updateConfig: async (updates) => {
         const currentConfig = get().config
-        if (!currentConfig) return
+        if (!currentConfig) return false
+        const generation = ++configSnapshotGeneration
         
         const newConfig = {
           ...currentConfig,
@@ -234,18 +252,27 @@ export const useSettingsStore = create<SettingsState>()(
               }
             : currentConfig.requestLogConfig,
         }
-        set({ config: newConfig })
-        
         try {
-          await window.electronAPI.config.update(updates)
+          const committed = await window.electronAPI.config.update(updates)
+          if (committed === false) return false
+          // A newer main CONFIG_CHANGED event may have already reconciled
+          // this write. Never overwrite its canonical API-key/model snapshot.
+          if (generation === configSnapshotGeneration) {
+            set({ config: newConfig })
+          }
+          return true
         } catch (error) {
           console.error('Failed to update config:')
-          set({ config: currentConfig })
+          // The rejected precommit write never entered renderer persistence.
+          // A newer event or later successful write must not be rolled back.
+          return false
         }
       },
       fetchConfig: async () => {
+        const generation = ++configSnapshotGeneration
         try {
           const config = await window.electronAPI.config.get()
+          if (!config || generation !== configSnapshotGeneration) return
           set({ 
             config,
             autoStart: config.autoStart,

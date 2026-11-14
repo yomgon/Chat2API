@@ -11,6 +11,20 @@ import {
   validateProviderEndpoint,
 } from '../providers/endpointTrust'
 
+/** A completed provider-store write must not be reported to management
+ * callers as failed merely because independent diagnostics are unavailable. */
+function logCommittedProviderChange(
+  message: string, providerId: string, data?: { deletedAccounts: number }
+): void {
+  try {
+    storeManager.addLog('info', message, {
+      providerId, ...(data ? { data } : {}),
+    })
+  } catch {
+    // Do not retry a committed provider mutation or expose log error details.
+  }
+}
+
 /**
  * Provider Manager Class
  * Provides all provider-related operations
@@ -130,9 +144,7 @@ export class ProviderManager {
     
     storeManager.addProvider(provider)
     
-    storeManager.addLog('info', `Create provider: ${provider.name}`, {
-      providerId: provider.id,
-    })
+    logCommittedProviderChange(`Create provider: ${provider.name}`, provider.id)
     
     return provider
   }
@@ -176,9 +188,7 @@ export class ProviderManager {
     const updated = storeManager.updateProvider(id, validatedUpdates)
     
     if (updated) {
-      storeManager.addLog('info', `Update provider: ${existing.name}`, {
-        providerId: id,
-      })
+      logCommittedProviderChange(`Update provider: ${existing.name}`, id)
     }
     
     return updated
@@ -199,19 +209,17 @@ export class ProviderManager {
       throw new Error('Built-in providers cannot be deleted; disable them instead')
     }
     
-    // Delete all accounts associated with the provider
-    const accounts = storeManager.getAccountsByProviderId(id)
-    for (const account of accounts) {
-      storeManager.deleteAccount(account.id)
-    }
-    
+    // StoreManager.deleteProvider owns the provider+account cascade in one
+    // durable write. Deleting accounts first would irreversibly lose them
+    // if the later provider write failed.
+    const boundAccountCount = storeManager.getAccountsByProviderId(id).length
     const result = storeManager.deleteProvider(id)
     
     if (result) {
-      storeManager.addLog('info', `Delete provider: ${provider.name}`, {
-        providerId: id,
-        data: { deletedAccounts: accounts.length },
-      })
+      logCommittedProviderChange(
+        `Delete provider: ${provider.name}`, id,
+        { deletedAccounts: boundAccountCount },
+      )
     }
     
     return result

@@ -1,6 +1,11 @@
 {
   "compilerOptions": {
     "composite": true,
+    "rootDir": ".",
+    "declaration": true,
+    "emitDeclarationOnly": true,
+    "outDir": "./.smoke-test-private-final/ts-reference-build/node",
+    "tsBuildInfoFile": "./.smoke-test-private-final/ts-reference-build/node.tsbuildinfo",
     "target": "ES2022",
     "skipLibCheck": true,
     "module": "ESNext",

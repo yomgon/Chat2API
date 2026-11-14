@@ -73,11 +73,13 @@ interface ProxyAPI {
   start: (port?: number) => Promise<boolean>
   stop: () => Promise<boolean>
   getStatus: () => Promise<ProxyStatus>
+  getStatistics: () => Promise<ProxyStatistics>
   onStatusChanged: (callback: (status: ProxyStatus) => void) => () => void
 }
 
 interface StoreAPI {
   clearAll: () => Promise<boolean>
+  onChanged: (callback: (kind: 'config' | 'providers' | 'accounts') => void) => () => void
   onInitError: (callback: (error: { message: string | null }) => void) => () => void
   retryInit: () => Promise<{ success: boolean; error?: string }>
 }
@@ -162,7 +164,10 @@ interface AccountsAPI {
 interface OAuthAPI {
   startLogin: (providerId: string, providerType: ProviderVendor) => Promise<OAuthResult>
   cancelLogin: () => Promise<void>
-  loginWithToken: (providerId: string, providerType: ProviderVendor, token: string) => Promise<OAuthResult>
+  loginWithToken: (
+    providerId: string, providerType: ProviderVendor, token: string,
+    realUserID?: string, mimoUserId?: string, mimoPhToken?: string,
+  ) => Promise<OAuthResult>
   validateToken: (providerId: string, providerType: ProviderVendor, credentials: Record<string, string>) => Promise<{
     valid: boolean
     tokenType?: string
@@ -258,6 +263,7 @@ interface UpdateStatus {
 
 interface AppAPI {
   getVersion: () => Promise<string>
+  isTestQuietStartup: () => Promise<boolean>
   checkUpdate: () => Promise<UpdateStatus>
   downloadUpdate: () => Promise<void>
   installUpdate: () => Promise<void>
@@ -278,8 +284,14 @@ interface AppAPI {
 
 interface ConfigAPI {
   get: () => Promise<AppConfig>
-  update: (updates: Partial<AppConfig>) => Promise<boolean>
+  update: (updates: Partial<AppConfig>, options?: { expectedModelMappings?: AppConfig['modelMappings'] }) => Promise<boolean>
   onConfigChanged: (callback: (config: AppConfig) => void) => () => void
+}
+
+interface ApiKeysAPI {
+  create: (name: string) => Promise<ApiKey>
+  setEnabled: (id: string, enabled: boolean) => Promise<ApiKey>
+  delete: (id: string) => Promise<boolean>
 }
 
 interface PromptsAPI {
@@ -477,6 +489,7 @@ interface ElectronAPI {
   statistics: StatisticsAPI
   app: AppAPI
   config: ConfigAPI
+  apiKeys: ApiKeysAPI
   prompts: PromptsAPI
   session: SessionAPI
   managementApi: ManagementApiAPI

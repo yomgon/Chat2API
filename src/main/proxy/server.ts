@@ -4,6 +4,7 @@
  */
 
 import Koa, { type Context, type Next } from 'koa'
+import { app as electronApp } from 'electron'
 import Router from '@koa/router'
 import bodyParser from 'koa-bodyparser'
 import { Server as HttpServer } from 'http'
@@ -15,6 +16,59 @@ import { sessionManager } from './sessionManager'
 import { evaluateProxyKey, hasUntrustedBrowserOrigin, isLocalBindHost, isTrustedHostHeader } from './localSecurity'
 
 const SLOW_REQUEST_THRESHOLD_MS = 1500
+
+/** Authenticated API admission failures are real local client failures even
+ * if no provider account exists. Count them once without inventing a provider
+ * effect, penalizing an account or retaining credentials/message content.
+ * Provider-dispatched requests are settled exclusively by the Chat/Legacy
+ * routes, including their asynchronous verified SSE terminal. */
+function recordRejectedBeforeProviderDispatch(ctx: Context, latency: number): void {
+  if (ctx.method !== 'POST' ||
+      (ctx.path !== '/v1/chat/completions' && ctx.path !== '/v1/completions') ||
+      ctx.status < 400 || ctx.state.providerDispatchStarted ||
+      ctx.res?.destroyed) return
+
+  const rawBody = ctx.request.body
+  const fields = rawBody && typeof rawBody === 'object' && !Array.isArray(rawBody)
+    ? rawBody as Record<string, unknown> : {}
+  const rawModel = fields.model
+  const model = typeof rawModel === 'string' && /^[A-Za-z0-9_.-]{1,128}$/.test(rawModel)
+    ? rawModel : '[preflight]'
+  const rawError = ctx.body && typeof ctx.body === 'object' && !Array.isArray(ctx.body)
+    ? (ctx.body as { error?: unknown }).error : undefined
+  const rawCode = rawError && typeof rawError === 'object' && !Array.isArray(rawError)
+    ? (rawError as { code?: unknown }).code : undefined
+  const code = typeof rawCode === 'string' && /^[a-z0-9_]{2,64}$/.test(rawCode)
+    ? rawCode : 'preflight_rejected'
+
+  // Admission receipts are a distinct store operation. Provider-attempt
+  // fakes and their existing accounting contracts have no such operation;
+  // they must never be mistaken for a provider request or charge. The real
+  // persistent store owns one local request failure without model/account
+  // usage, and its log sink is independent of the original HTTP response.
+  if (typeof storeManager.recordClientPreflightRejection !== 'function') return
+  try {
+    if (typeof proxyStatusManager.recordClientRejection === 'function') {
+      proxyStatusManager.recordClientRejection(latency)
+    }
+  } catch {}
+  try {
+    storeManager.recordClientPreflightRejection({
+      statusCode: ctx.status, method: 'POST', path: ctx.path, model, latency,
+      isStream: fields.stream === true, errorCode: code,
+    })
+  } catch {}
+}
+
+/** Listener/session lifetime is authoritative; optional diagnostics must not
+ * throw from Node's async listen/close callbacks or leave start/stop pending. */
+function logProxyLifecycle(level: 'info' | 'error', message: string): void {
+  try {
+    storeManager.addLog(level, message)
+  } catch {
+    // Never alter an already committed listener/close outcome for logging.
+  }
+}
 
 /**
  * Proxy Server Class
@@ -112,6 +166,12 @@ export class ProxyServer {
     }))
 
     this.app.use(async (ctx, next) => {
+      const started = Date.now()
+      await next()
+      recordRejectedBeforeProviderDispatch(ctx, Date.now() - started)
+    })
+
+    this.app.use(async (ctx, next) => {
       const startTime = Date.now()
 
       await next()
@@ -122,16 +182,22 @@ export class ProxyServer {
         (ctx.status >= 400 || latency >= SLOW_REQUEST_THRESHOLD_MS)
 
       if (shouldRecordAccessLog) {
-        storeManager.addLog('warn', `${ctx.method} ${ctx.path} ${ctx.status} ${latency}ms`, {
-          data: {
-            method: ctx.method,
-            path: ctx.path,
-            status: ctx.status,
-            latency,
-            clientIP: ctx.ip,
-            slowRequest: latency >= SLOW_REQUEST_THRESHOLD_MS,
-          },
-        })
+        try {
+          storeManager.addLog('warn', `${ctx.method} ${ctx.path} ${ctx.status} ${latency}ms`, {
+            data: {
+              method: ctx.method,
+              path: ctx.path,
+              status: ctx.status,
+              latency,
+              clientIP: ctx.ip,
+              slowRequest: latency >= SLOW_REQUEST_THRESHOLD_MS,
+            },
+          })
+        } catch {
+          // Access diagnostics are best effort. A failed log write after the
+          // route has completed must not replace an authenticated API status
+          // or turn an already-committed mutation into an apparent HTTP 500.
+        }
       }
     })
   }
@@ -149,7 +215,7 @@ export class ProxyServer {
     this.router.get('/', async (ctx) => {
       ctx.body = {
         name: 'Chat2API Proxy',
-      version: '1.4.0-local.18',
+        version: electronApp.getVersion(),
         description: 'OpenAI API compatible proxy service',
         endpoints: [
           'POST /v1/chat/completions',
@@ -203,6 +269,28 @@ export class ProxyServer {
           return
         }
         await next()
+        // Management route handlers often catch storage/provider exceptions
+        // and put error.message directly into their JSON response. Those
+        // exception strings can contain credentials, tokens, request URLs or
+        // protected store internals. Sanitize at this final Koa response
+        // boundary instead of trusting each independent management handler.
+        // Keep stable machine-readable error codes and normal 4xx validation.
+        const response = ctx.body
+        const error = response && typeof response === 'object' && !Array.isArray(response)
+          ? (response as { success?: unknown, error?: unknown }).error : undefined
+        const code = error && typeof error === 'object' && !Array.isArray(error)
+          ? (error as { code?: unknown }).code : undefined
+        if (ctx.status >= 500 || code === 'provider_not_found' || code === 'forbidden') {
+          if (error && typeof error === 'object' && !Array.isArray(error)) {
+            const safeCode = typeof code === 'string' && /^[a-z0-9_]{1,64}$/.test(code)
+              ? code : 'internal_error'
+            const message = safeCode === 'provider_not_found'
+              ? 'Provider not found'
+              : safeCode === 'forbidden' ? 'Management operation forbidden'
+                : 'Management API operation failed'
+            ctx.body = { success: false, error: { code: safeCode, message } }
+          }
+        }
       } catch {
         ctx.status = 503
         ctx.body = {
@@ -243,14 +331,22 @@ export class ProxyServer {
   private setupErrorHandler(): void {
     this.app.on('error', (err, ctx) => {
       const status = err.status || 500
-
-      storeManager.addLog('error', 'Local proxy server error', {
-        data: {
-          status,
-          path: ctx.path,
-          method: ctx.method,
-        },
-      })
+      // Koa invokes error listeners synchronously while constructing its
+      // HTTP error response. If an optional diagnostic writer throws from
+      // this event callback, Koa's onerror path itself rejects and the
+      // client may hang instead of receiving the original 4xx/5xx.
+      // Unlike an account/config write, this log is not a commit boundary.
+      try {
+        storeManager.addLog('error', 'Local proxy server error', {
+          data: {
+            status,
+            path: ctx.path,
+            method: ctx.method,
+          },
+        })
+      } catch {
+        // Preserve Koa's original response and never disclose log failures.
+      }
     })
   }
 
@@ -265,11 +361,11 @@ export class ProxyServer {
     const requestedPort = port ?? proxyStatusManager.getPort()
     const requestedHost = host ?? proxyStatusManager.getHost()
     if (!Number.isInteger(requestedPort) || requestedPort < 1 || requestedPort > 65535) {
-      storeManager.addLog('error', 'Local proxy rejected invalid port')
+      logProxyLifecycle('error', 'Local proxy rejected invalid port')
       return false
     }
     if (!isLocalBindHost(requestedHost)) {
-      storeManager.addLog('error', 'Local proxy rejected non-loopback bind host')
+      logProxyLifecycle('error', 'Local proxy rejected non-loopback bind host')
       return false
     }
 
@@ -285,16 +381,19 @@ export class ProxyServer {
           proxyStatusManager.setPort(this.port)
           proxyStatusManager.setHost(this.host)
 
-          storeManager.addLog('info', `Proxy server started successfully, listening on ${this.host}:${this.port}`)
+          logProxyLifecycle('info', `Proxy server started successfully, listening on ${this.host}:${this.port}`)
 
           resolve(true)
         })
 
         this.server.on('error', (err: NodeJS.ErrnoException) => {
+          // Session cleanup starts before Koa attempts to bind. A rejected
+          // listener never reaches stop(), so release the scheduler here.
+          sessionManager.destroy()
           if (err.code === 'EADDRINUSE') {
-            storeManager.addLog('error', `Port ${this.port} is already in use`)
+            logProxyLifecycle('error', `Port ${this.port} is already in use`)
           } else {
-            storeManager.addLog('error', 'Local proxy listener error')
+            logProxyLifecycle('error', 'Local proxy listener error')
           }
           this.server = null
           resolve(false)
@@ -304,7 +403,8 @@ export class ProxyServer {
           this.server = null
         })
       } catch (error) {
-        storeManager.addLog('error', 'Failed to start local proxy server')
+        sessionManager.destroy()
+        logProxyLifecycle('error', 'Failed to start local proxy server')
         resolve(false)
       }
     })
@@ -323,7 +423,7 @@ export class ProxyServer {
     return new Promise((resolve) => {
       this.server!.close((err) => {
         if (err) {
-          storeManager.addLog('error', 'Failed to stop local proxy server')
+          logProxyLifecycle('error', 'Failed to stop local proxy server')
           resolve(false)
           return
         }
@@ -331,7 +431,7 @@ export class ProxyServer {
         this.server = null
         proxyStatusManager.stop()
 
-        storeManager.addLog('info', 'Proxy server stopped')
+        logProxyLifecycle('info', 'Proxy server stopped')
 
         resolve(true)
       })

@@ -6,6 +6,7 @@ import crypto from 'node:crypto'
 import { PassThrough } from 'node:stream'
 import { inspect } from 'node:util'
 import ts from 'typescript'
+import { QWEN_AI_TOKEN_MODULE } from './helpers/qwenAiTokenModule.mjs'
 
 // Execute the actual adapters and Z.ai identity checks in closed VMs. Only
 // synthetic Axios spies exist: no Electron, store, profile or HTTP is loaded.
@@ -100,6 +101,7 @@ function harness(id, { unknownExpiry = false } = {}) {
   for (const action of ['delete', 'request', 'put', 'patch']) axios[action] = deny(action)
   axios.create = () => axios
   const dependencies = {
+    '../../providers/qwenAiToken': QWEN_AI_TOKEN_MODULE,
     axios: { __esModule: true, default: axios },
     crypto,
     stream: { PassThrough },
@@ -171,8 +173,8 @@ async function assertRejectedBeforePost(id, messages, options = {}) {
     : 'Qwen AI request messages are not supported')
   assert.equal(error.upstreamStatus, undefined)
   assert.equal(error.upstreamHttpStatus, undefined, 'local rejection must not invent an upstream status')
-  assert.equal(h.calls.filter(call => call.method === 'GET').length,
-    id === 'zai' && options.unknownExpiry ? 1 : 0)
+  assert.equal(h.calls.filter(call => call.method === 'GET').length, 0,
+    'Malformed input must be rejected before Z.ai no-exp identity verification')
 }
 
 for (const id of providers) {
@@ -293,9 +295,23 @@ test('zai: leading system cannot be relocated past an initial assistant', () =>
   ]))
 test('zai: assistant-only input has no current user and rejects before POST', () =>
   assertRejectedBeforePost('zai', [{ role: 'assistant', content: 'PREFIX' }]))
-test('zai: no-exp auth remains one GET and cannot authorize malformed-message POSTs', () =>
+test('zai: invalid no-exp message causes zero auth GET and zero completion POSTs', () =>
   assertRejectedBeforePost('zai', [{ role: 'user', content: [part('text'),
     { type: 'file', file: { file_data: PRIVATE } }] }], { unknownExpiry: true }))
+test('zai: invalid local history with no-exp JWT must never start a remote auth GET', async () => {
+  const h = harness('zai', { unknownExpiry: true })
+  const invalid = [
+    { role: 'user', content: 'Previous question' },
+    { role: 'assistant', content: null, tool_calls: [{ id: 'call92', type: 'function',
+      function: { name: 'lookup', arguments: '{}' } }] },
+    { role: 'tool', tool_call_id: 'call92', content: 'Not supported' },
+  ]
+  const failure = await h.attempt(invalid)
+  assert.ok(failure instanceof h.Failure)
+  assert.equal(failure.stage, 'chat-creation')
+  assert.deepEqual(h.calls.map(call => call.method), [],
+    'Invalid input must not trigger even a remote identity GET before either POST')
+})
 test('zai: no-exp identity and both authorized payloads remain pinned while normalizing text', async () => {
   const h = harness('zai', { unknownExpiry: true })
   const { body } = await captureWire(h, [{ role: 'user', content: [part('one '), part('two')] }])

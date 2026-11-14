@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs'
 import { PassThrough } from 'node:stream'
 import vm from 'node:vm'
 import ts from 'typescript'
+import { QWEN_AI_TOKEN_MODULE } from './helpers/qwenAiTokenModule.mjs'
 
 // Product forwarder methods and Qwen International's real response handler,
 // with inert synthetic transports and no Electron, HTTP, credentials or app.
@@ -104,6 +105,7 @@ function qwenAiHandler(allowLegacyToolCalls) {
   vm.runInNewContext(compile(source('src/main/proxy/adapters/qwen-ai.ts'), 'qwen-ai.ts'), {
     module: mod, exports: mod.exports, Buffer, Date, Error,
     require(name) {
+      if (name === '../../providers/qwenAiToken') return QWEN_AI_TOKEN_MODULE
       if (name === 'axios') return { __esModule: true,
         default: { create: () => ({ post: forbidden, delete: forbidden, get: forbidden }) } }
       if (name === 'stream') return { PassThrough }

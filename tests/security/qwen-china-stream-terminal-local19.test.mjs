@@ -7,6 +7,7 @@ import * as zlib from 'node:zlib'
 import vm from 'node:vm'
 import ts from 'typescript'
 import { createParser } from 'eventsource-parser'
+import { QWEN_TICKET_MODULE } from './helpers/qwenTicketModule.mjs'
 
 // Production adapter and terminal gate with explicit offline dependencies.
 // No application/profile/account import, credential, socket or provider call.
@@ -64,6 +65,7 @@ function harness(options = {}) {
     else ready()
   } }
   const exports = load(adapterCode, {
+    '../../providers/qwenTicket': QWEN_TICKET_MODULE,
     axios: { __esModule: true, default: { create: () => ({ post: blocked }), post: blocked, get: blocked } },
     stream: streams,
     zlib: options.zlib ?? zlib,

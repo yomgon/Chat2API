@@ -145,12 +145,21 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
     setError(null)
 
     try {
+      // The native main-process startup latch is the authority here. Query
+      // it BEFORE constructing the provider-status promise on every refresh,
+      // including the initial mount and the 60-second timer. If the guarded
+      // IPC cannot confirm normal mode, do not issue a provider status check.
+      const quietStartup = await (
+        window.electronAPI?.app?.isTestQuietStartup?.() ?? Promise.resolve(true)
+      ).catch(() => true)
       const proxyStatusPromise = window.electronAPI?.proxy?.getStatus?.() ?? Promise.resolve(null)
-      const statisticsPromise = window.electronAPI?.invoke?.('proxy:getStatistics') ?? Promise.resolve(null)
+      const statisticsPromise = window.electronAPI?.proxy?.getStatistics?.() ?? Promise.resolve(null)
       const persistentStatsPromise = window.electronAPI?.statistics?.get?.() ?? Promise.resolve(null)
       const providersPromise = window.electronAPI?.providers?.getAll?.() ?? Promise.resolve([])
       const accountsPromise = window.electronAPI?.accounts?.getAll?.() ?? Promise.resolve([])
-      const providerStatusPromise = window.electronAPI?.providers?.checkAllStatus?.() ?? Promise.resolve({})
+      const providerStatusPromise = quietStartup
+        ? Promise.resolve({})
+        : window.electronAPI?.providers?.checkAllStatus?.() ?? Promise.resolve({})
       const logsPromise = window.electronAPI?.logs?.get?.({ limit: 10 }) ?? Promise.resolve([])
       const trendPromise = window.electronAPI?.logs?.getTrend?.(7) ?? Promise.resolve([])
       const requestLogTrendPromise = window.electronAPI?.requestLogs?.getTrend?.(7) ?? Promise.resolve([])

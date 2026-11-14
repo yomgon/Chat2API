@@ -1,16 +1,18 @@
 import assert from 'node:assert/strict'
-import { webcrypto } from 'node:crypto'
+import { randomBytes, randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { stripTypeScriptTypes } from 'node:module'
 import { fileURLToPath } from 'node:url'
 import vm from 'node:vm'
 import test from 'node:test'
+import ts from 'typescript'
 
 const root = new URL('../../', import.meta.url)
 const readSource = (path) => readFileSync(new URL(path, root), 'utf8')
 const storeSource = readSource('src/renderer/src/stores/settingsStore.ts')
 const dataSource = readSource('src/renderer/src/components/settings/DataManagement.tsx')
 const keysSource = readSource('src/renderer/src/pages/ApiKeys.tsx')
+const dashboardSource = readSource('src/renderer/src/pages/Dashboard.tsx')
 const storageKey = 'chat2api-settings'
 const secretValues = ['SENTINEL_API_SECRET', 'SENTINEL_MANAGEMENT_SECRET', 'SENTINEL_PROVIDER_SECRET']
 const mainConfig = {
@@ -175,28 +177,68 @@ async function importBackup(handlers, backup) {
   assert.equal(event.target.value, '')
 }
 
-function loadKeyHelpers(crypto = webcrypto) {
-  const context = {
-    crypto,
-    Math: Object.assign(Object.create(Math), { random: () => assert.fail('Math.random must not generate keys or IDs') }),
+// The renderer no longer creates secrets or replaces the entire API key list.
+// Exercise the real trusted-main create callback extracted from production AST.
+function loadMainCreateHandler({ randomBytesImpl = randomBytes, randomUUIDImpl = randomUUID,
+  failWrites = false } = {}) {
+  const src = readSource('src/main/ipc/handlers.ts')
+  const tree = ts.createSourceFile('handlers.ts', src, ts.ScriptTarget.Latest, true)
+  let callback
+  const visit = node => {
+    if (ts.isCallExpression(node) && ts.isIdentifier(node.expression)
+        && node.expression.text === 'handleTrusted' && node.arguments.length >= 2
+        && ts.isPropertyAccessExpression(node.arguments[0])
+        && node.arguments[0].name.text === 'API_KEYS_CREATE') {
+      callback = node.arguments[1].getText(tree)
+    }
+    ts.forEachChild(node, visit)
   }
-  const start = keysSource.indexOf('function generateApiKey()')
-  const end = keysSource.indexOf('export default function ApiKeysPage()')
-  assert.ok(start >= 0 && end > start)
-  vm.runInNewContext(executable(keysSource.slice(start, end)) + '\nObject.assign(globalThis, { generateApiKey, generateId });', context, { timeout: 2000 })
-  return context
+  visit(tree)
+  assert.ok(callback, 'Dedicated key-create trusted IPC handler must exist')
+  const mod = { exports: {} }
+  const compiled = ts.transpileModule('exports.handler = ' + callback, {
+    fileName: 'create-key-handler.ts',
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
+  }).outputText
+  let config = clone(mainConfig)
+  const writes = []
+  const storeManager = {
+    getConfig: () => clone(config),
+    updateConfig(patch) {
+      if (failWrites) throw Error('Synthetic private persistence refusal')
+      writes.push(clone(patch))
+      config = { ...config, ...clone(patch) }
+      return clone(config)
+    },
+  }
+  vm.runInNewContext(compiled, {
+    module: mod, exports: mod.exports, storeManager,
+    randomBytes: randomBytesImpl, randomUUID: randomUUIDImpl,
+    Buffer, Date, Error,
+    Math: Object.assign(Object.create(Math), {
+      random: () => assert.fail('Math.random must never produce API keys'),
+    }),
+  }, { timeout: 2000 })
+  return { create: mod.exports.handler, writes, config: () => clone(config) }
 }
 
-function loadAddKeyHandler(crypto = webcrypto) {
-  const context = loadKeyHelpers(crypto)
-  const updates = []
+function loadAddKeyHandler({ failCreate = false } = {}) {
+  const context = {}
+  const calls = []
+  const refreshes = []
   const toasts = []
   const dialogStates = []
   const names = []
   Object.assign(context, {
     newKeyName: ' Offline test ',
-    apiKeys: mainConfig.apiKeys,
-    updateConfig: async (update) => updates.push(update),
+    window: { electronAPI: { apiKeys: {
+      create: async name => {
+        calls.push(name)
+        if (failCreate) throw Error('Synthetic credential store failure')
+        return { id: 'synthetic-created', name, key: 'sk-' + 'A'.repeat(48) }
+      },
+    } } },
+    fetchConfig: async () => { refreshes.push(true) },
     toast: (toast) => toasts.push(toast),
     t: (key) => key,
     setShowAddDialog: (state) => dialogStates.push(state),
@@ -206,7 +248,7 @@ function loadAddKeyHandler(crypto = webcrypto) {
   const end = keysSource.indexOf('  const handleDeleteKey = async', start)
   assert.ok(start >= 0 && end > start)
   vm.runInNewContext(executable(keysSource.slice(start, end)) + '\nglobalThis.addKey = handleAddKey;', context, { timeout: 2000 })
-  return { addKey: context.addKey, updates, toasts, dialogStates, names }
+  return { addKey: context.addKey, calls, refreshes, toasts, dialogStates, names }
 }
 
 test('config stays available to IPC/UI while all store writes exclude secrets', async () => {
@@ -401,55 +443,169 @@ test('request logging defaults to off without replacing an explicit existing set
   assert.equal(loadDataHandlers(fixture).requestLogConfig.enabled, true)
 })
 
-test('API keys keep the sk- plus 48 alphanumeric contract using WebCrypto', () => {
-  const { generateApiKey, generateId } = loadKeyHelpers()
-  const keys = new Set(Array.from({ length: 16 }, () => generateApiKey()))
+test('trusted main API key generator retains the sk- plus 48 alphanumeric contract', async () => {
+  const f = loadMainCreateHandler()
+  const keys = new Set()
+  for (let i = 0; i < 16; i++) {
+    const created = await f.create(null, 'Synthetic')
+    keys.add(created.key)
+    assert.match(created.id, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
+  }
   assert.equal(keys.size, 16)
   for (const key of keys) assert.match(key, /^sk-[A-Za-z0-9]{48}$/)
-  assert.match(generateId(), /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
+  assert.equal(f.writes.length, 16)
 })
 
-test('API key generation rejects biased byte values and refills from the crypto source', () => {
+test('main API key generation rejects biased byte values and refills from node:crypto', async () => {
   let calls = 0
-  const { generateApiKey } = loadKeyHelpers({
-    getRandomValues(bytes) {
+  const f = loadMainCreateHandler({
+    randomBytesImpl(size) {
       calls++
-      for (let index = 0; index < bytes.length; index++) {
+      const bytes = Buffer.alloc(size)
+      for (let index = 0; index < size; index++) {
         bytes[index] = calls === 1 ? 248 + (index % 8) : index % 62
       }
       return bytes
     },
   })
-  assert.equal(generateApiKey(), 'sk-' + 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'.slice(0, 48))
+  const created = await f.create(null, 'Synthetic')
+  assert.equal(created.key, 'sk-' + 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'.slice(0, 48))
   assert.equal(calls, 2)
 })
 
-test('crypto failure never falls back to Math.random or writes a partial API key', async () => {
-  for (const crypto of [null, { randomUUID: () => 'test-id', getRandomValues: () => { throw new Error('crypto unavailable') } }]) {
-    const { generateApiKey } = loadKeyHelpers(crypto)
-    assert.throws(() => generateApiKey())
-    const handlers = loadAddKeyHandler(crypto)
+test('main crypto failure and GUI IPC refusal never produce a partial API key', async () => {
+  const f = loadMainCreateHandler({
+    randomBytesImpl: () => { throw Error('Synthetic crypto unavailable') },
+  })
+  await assert.rejects(f.create(null, 'Synthetic'))
+  assert.equal(f.writes.length, 0)
+  for (const failCreate of [true]) {
+    const handlers = loadAddKeyHandler({ failCreate })
     await handlers.addKey()
-    assert.equal(handlers.updates.length, 0)
+    assert.equal(handlers.calls.length, 1)
+    assert.equal(handlers.refreshes.length, 0)
     assert.equal(handlers.dialogStates.length, 0)
     assert.equal(handlers.names.length, 0)
     assert.equal(handlers.toasts.at(-1).variant, 'destructive')
   }
 })
 
-test('secure key creation preserves existing API key records and the updateConfig contract', async () => {
+test('secure main key creation preserves existing records; GUI uses only keyed create IPC', async () => {
   const before = JSON.stringify(mainConfig.apiKeys)
-  const handlers = loadAddKeyHandler()
-  await handlers.addKey()
-  assert.equal(handlers.updates.length, 1)
-  assert.equal(handlers.updates[0].apiKeys[0], mainConfig.apiKeys[0])
-  const created = handlers.updates[0].apiKeys[1]
-  assert.equal(created.name, 'Offline test')
+  const f = loadMainCreateHandler()
+  const created = await f.create(null, 'Offline test')
+  assert.equal(f.writes.length, 1)
+  assert.equal(f.writes[0].apiKeys[0].key, secretValues[0])
+  assert.equal(f.writes[0].apiKeys[1].name, 'Offline test')
   assert.match(created.key, /^sk-[A-Za-z0-9]{48}$/)
   assert.equal(created.enabled, true)
   assert.equal(created.usageCount, 0)
   assert.equal(typeof created.createdAt, 'number')
+  const handlers = loadAddKeyHandler()
+  await handlers.addKey()
+  assert.deepEqual(handlers.calls, ['Offline test'])
+  assert.equal(handlers.refreshes.length, 1)
   assert.equal(JSON.stringify(mainConfig.apiKeys), before)
   assert.deepEqual(handlers.dialogStates, [false])
   assert.deepEqual(handlers.names, [''])
+})
+
+test('local101 RED: refused main Settings writes do not persist a false auto-start, proxy or OAuth state', async () => {
+  const f = loadSettings()
+  f.failures.ipc = true
+  await f.store.getState().setAutoStart(true)
+  await f.store.getState().setAutoStartProxy(true)
+  await f.store.getState().setOauthProxyMode('none')
+  await f.store.getState().setLanguage('zh-CN')
+  assert.equal(f.store.getState().autoStart, false)
+  assert.equal(f.store.getState().autoStartProxy, false)
+  assert.equal(f.store.getState().oauthProxyMode, 'system')
+  assert.equal(f.store.getState().language, 'en-US')
+  assert.equal(f.languages.includes('zh-CN'), false,
+    'Rejected language persistence must not change the visible UI translation')
+  const saved = JSON.parse(f.entries.get(storageKey) || '{"state":{}}').state
+  assert.notEqual(saved.autoStart, true)
+  assert.notEqual(saved.autoStartProxy, true)
+  assert.notEqual(saved.oauthProxyMode, 'none')
+  assert.notEqual(saved.language, 'zh-CN')
+})
+
+test('local101 RED: previous Settings fetch cannot undo a newer committed main-config event', async () => {
+  const f = loadSettings()
+  let resolve
+  f.context.window.electronAPI.config.get = () => new Promise(yes => { resolve = yes })
+  const older = f.store.getState().fetchConfig()
+  const committed = {
+    ...mainConfig, autoStart: true, autoStartProxy: true, language: 'zh-CN',
+    modelMappings: { newest: { requestModel: 'newest', actualModel: 'local101-wire' } },
+  }
+  f.store.getState().setConfig(committed)
+  resolve(clone(mainConfig))
+  await older
+  assert.equal(f.store.getState().config.modelMappings.newest.actualModel, 'local101-wire')
+  assert.equal(f.store.getState().autoStart, true)
+  assert.equal(f.store.getState().autoStartProxy, true)
+  assert.equal(f.store.getState().language, 'zh-CN')
+})
+
+test('local101 RED: old refused Settings mutation cannot roll back a newer committed config event', async () => {
+  const f = loadSettings()
+  f.store.getState().setConfig(mainConfig)
+  let reject
+  f.context.window.electronAPI.config.update = () =>
+    new Promise((_yes,no) => {reject = no})
+  const older = f.store.getState().updateConfig({ enableApiKey: true })
+  const committed = { ...mainConfig, enableApiKey: false,
+    requestLogConfig: { ...mainConfig.requestLogConfig, enabled: false } }
+  f.store.getState().setConfig(committed)
+  reject(Error('SYNTHETIC_OLD_WRITE_REFUSED'))
+  await older
+  assert.equal(f.store.getState().config.enableApiKey, false)
+  assert.equal(f.store.getState().config.requestLogConfig.enabled, false)
+})
+
+test('local101 RED: rejected API-key global enable must not display a success toast', async () => {
+  const f = loadSettings()
+  f.store.getState().setConfig(mainConfig)
+  f.context.window.electronAPI.config.update = async () => false
+  const toasts=[]
+  const context={ t:x=>x,toast:x=>toasts.push(x),
+    updateConfig:f.store.getState().updateConfig }
+  const start=keysSource.indexOf('  const handleToggleGlobalEnabled = async')
+  const end=keysSource.indexOf('  const formatDate =',start)
+  assert.ok(start>=0&&end>start)
+  vm.runInNewContext(executable(keysSource.slice(start,end))+
+    '\nthis.toggleGlobal=handleToggleGlobalEnabled;',context,{timeout:2000})
+  await context.toggleGlobal(true)
+  assert.equal(toasts.at(-1)?.variant,'destructive')
+  assert.equal(f.store.getState().config.enableApiKey,mainConfig.enableApiKey,
+    'A rejected write cannot change the durable enabled flag')
+})
+
+test('local101 RED: denied native Proxy Start cannot paint the Dashboard toggle as Running',async()=>{
+  const tree=ts.createSourceFile('Dashboard.tsx',dashboardSource,ts.ScriptTarget.Latest,
+    true,ts.ScriptKind.TSX)
+  let declaration
+  const visit=node=>{
+    if(ts.isVariableDeclaration(node)&&node.name.getText(tree)==='handleToggleProxy')
+      declaration=node.getText(tree)
+    ts.forEachChild(node,visit)
+  }
+  visit(tree)
+  assert.ok(declaration,'Production Dashboard start/stop action required')
+  const events=[]
+  const ctx={
+    useCallback:f=>f,
+    proxyStatus:{isRunning:false},
+    setProxyEnabled:v=>events.push(['claimed-running',v]),
+    refreshData:()=>events.push(['authoritative-refresh']),
+    window:{electronAPI:{proxy:{start:async()=>false,stop:async()=>false}}},
+    console:{error(){}},
+  }
+  vm.runInNewContext(executable('const '+declaration+';')+
+    '\nthis.nativeProxyToggle=handleToggleProxy;',ctx,{timeout:2000})
+  await ctx.nativeProxyToggle()
+  assert.equal(events.some(event=>event[0]==='claimed-running'),false,
+    'A native start() rejection is not a running Koa listener')
+  assert.equal(events.some(event=>event[0]==='authoritative-refresh'),true)
 })

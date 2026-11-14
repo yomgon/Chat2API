@@ -3,47 +3,46 @@ import { Card, CardContent } from '@/components/ui/card'
 import { TrendingUp, CheckCircle, XCircle, Activity } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
-interface RequestLogStats {
-  total: number
-  success: number
-  error: number
-  todayTotal: number
-  todaySuccess: number
-  todayError: number
+export interface RequestLogStatsData {
+  totalRequests: number
+  successRequests: number
+  failedRequests: number
 }
 
 interface RequestLogStatsProps {
-  stats: RequestLogStats
+  stats: RequestLogStatsData | null
+  isLoading?: boolean
 }
 
-export function RequestLogStats({ stats }: RequestLogStatsProps) {
+export function RequestLogStats({ stats, isLoading = false }: RequestLogStatsProps) {
   const { t } = useTranslation()
-  const successRate = stats.todayTotal > 0 
-    ? Math.round((stats.todaySuccess / stats.todayTotal) * 100) 
+  const unavailable = isLoading ? t('common.loading') : t('models.unavailable')
+  const successRate = stats && stats.totalRequests > 0
+    ? Math.round((stats.successRequests / stats.totalRequests) * 100)
     : 0
 
   const statCards = [
     {
       label: t('logs.todayRequests'),
-      value: stats.todayTotal,
+      value: stats?.totalRequests ?? unavailable,
       icon: TrendingUp,
       color: 'text-primary',
     },
     {
       label: t('logs.todaySuccess'),
-      value: stats.todaySuccess,
+      value: stats?.successRequests ?? unavailable,
       icon: CheckCircle,
       color: 'text-green-500',
     },
     {
       label: t('logs.todayErrors'),
-      value: stats.todayError,
+      value: stats?.failedRequests ?? unavailable,
       icon: XCircle,
       color: 'text-red-500',
     },
     {
       label: t('dashboard.successRate'),
-      value: `${successRate}%`,
+      value: stats ? `${successRate}%` : unavailable,
       icon: Activity,
       color: 'text-blue-500',
     },

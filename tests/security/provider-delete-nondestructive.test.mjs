@@ -100,7 +100,12 @@ for (const [label, path, providerImport, trustImport, exportName] of [
         : { './builtin': { getBuiltinProvider: id => id === 'zai' ? { id } : undefined } }),
     })
     assert.equal(actual.exports[exportName].delete(h.provider.id), true)
-    assert.deepEqual(h.calls, { getAccounts: 1, deleteAccounts: 2, deleteProvider: 1, logs: 1 })
+    // Core StoreManager owns the complete single-write provider/account
+    // cascade; neither legacy manager nor renderer IPC deletes accounts first.
+    assert.deepEqual(h.calls, {
+      getAccounts: path.includes('/store/providers.ts') ? 1 : 0,
+      deleteAccounts: 0, deleteProvider: 1, logs: 1,
+    })
   })
 }
 

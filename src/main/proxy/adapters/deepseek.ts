@@ -51,7 +51,9 @@ interface ChallengeResponse {
 
 interface DeepSeekMessage {
   role: 'user' | 'assistant' | 'system' | 'tool'
-  content: string | null
+  // The Chat route accepts text-part arrays. Preserve typed text in the
+  // prompt projector instead of assuming all consumer messages are strings.
+  content: string | Array<{ type: 'text'; text: string }> | null
   tool_call_id?: string
   tool_calls?: any[]
 }
@@ -70,7 +72,14 @@ interface ChatCompletionRequest {
 }
 
 const tokenCache = new Map<string, TokenInfo>()
-const sessionCache = new Map<string, { sessionId: string; createdAt: number }>()
+// A stable account ID may survive a credential replacement or re-login.
+// Keep the session tied to the exact credential that created it, not merely
+// the account ID. This is volatile in-process state, never persisted/logged.
+const sessionCache = new Map<string, {
+  sessionId: string
+  createdAt: number
+  credentialToken: string
+}>()
 
 function generateRandomString(length: number, charset: string = 'alphanumeric'): string {
   const sets = {
@@ -118,8 +127,10 @@ export class DeepSeekAdapter {
   }
 
   private async acquireToken(): Promise<string> {
-    if (!this.token) {
-      throw new Error('DeepSeek Token not configured, please add Token in account settings')
+    // Reject wrong-typed stored credentials and CRLF before any bearer GET.
+    // A JSON object must never be coerced into Authorization.
+    if (typeof this.token !== 'string' || !/^[\x21-\x7e]+$/.test(this.token)) {
+      throw new Error('DeepSeek token is missing or invalid')
     }
 
     const cached = tokenCache.get(this.token)
@@ -135,6 +146,7 @@ export class DeepSeekAdapter {
         ...FAKE_HEADERS,
       },
       timeout: 15000,
+      maxRedirects: 0,
       validateStatus: () => true,
     })
 
@@ -148,15 +160,21 @@ export class DeepSeekAdapter {
       throw new Error(`Failed to acquire token: HTTP ${result.status}`)
     }
 
-    // Response structure: { code: 0, data: { biz_code: 0, biz_data: { token: "..." } } }
-    const bizData = result.data?.data?.biz_data || result.data?.biz_data
-    if (!bizData?.token) {
-      const errorMsg = result.data?.msg || result.data?.data?.biz_msg || 'Unknown error'
-      console.log('[DeepSeek] Token response missing access token')
-      throw new Error(`Failed to acquire token: ${errorMsg}`)
+    // HTTP 200 can still contain a failed business envelope. Never adopt a
+    // stale token field or create remote session state from such a response.
+    // A successful legacy flat envelope has code:0 without nested biz_code.
+    const data = result.data
+    const bizCode = data?.data?.biz_code ?? data?.biz_code
+    const bizData = data?.data?.biz_data || data?.biz_data
+    const accessToken = bizData?.token
+    if (data?.code !== 0 ||
+        (bizCode !== undefined && bizCode !== 0) ||
+        typeof accessToken !== 'string' ||
+        !/^[\x21-\x7e]+$/.test(accessToken)) {
+      console.log('[DeepSeek] Token response was not confirmed')
+      throw new Error('Failed to acquire token: authentication response unconfirmed')
     }
 
-    const accessToken = bizData.token
     tokenCache.set(this.token, {
       accessToken,
       refreshToken: this.token,
@@ -170,7 +188,8 @@ export class DeepSeekAdapter {
   private async createSession(): Promise<string> {
     const cacheKey = this.account.id
     const cached = sessionCache.get(cacheKey)
-    if (cached && Date.now() - cached.createdAt < 300000) {
+    if (cached && cached.credentialToken === this.token &&
+        Date.now() - cached.createdAt < 300000) {
       return cached.sessionId
     }
 
@@ -185,6 +204,7 @@ export class DeepSeekAdapter {
           Cookie: generateCookie(),
         },
         timeout: 15000,
+        maxRedirects: 0,
         validateStatus: () => true,
       }
     )
@@ -198,7 +218,9 @@ export class DeepSeekAdapter {
     }
 
     const sessionId = bizData?.chat_session?.id
-    sessionCache.set(cacheKey, { sessionId, createdAt: Date.now() })
+    sessionCache.set(cacheKey, {
+      sessionId, createdAt: Date.now(), credentialToken: this.token,
+    })
 
     return sessionId
   }
@@ -215,6 +237,7 @@ export class DeepSeekAdapter {
             ...FAKE_HEADERS,
           },
           timeout: 15000,
+          maxRedirects: 0,
           validateStatus: () => true,
         }
       )
@@ -225,7 +248,13 @@ export class DeepSeekAdapter {
       if (success) {
         // Clear cache
         const cacheKey = this.account.id
-        sessionCache.delete(cacheKey)
+        // An old in-flight conversation may finish cleanup after the user
+        // reconnects the same account with a different credential. Never
+        // evict the new session from the old operation's deletion ACK.
+        const current = sessionCache.get(cacheKey)
+        if (current?.sessionId === sessionId && current.credentialToken === this.token) {
+          sessionCache.delete(cacheKey)
+        }
         console.log('[DeepSeek] Session deleted')
       }
       return success
@@ -246,6 +275,7 @@ export class DeepSeekAdapter {
           ...FAKE_HEADERS,
         },
         timeout: 15000,
+        maxRedirects: 0,
         validateStatus: () => true,
       }
     )
@@ -289,31 +319,51 @@ export class DeepSeekAdapter {
 
   private messagesToPrompt(messages: DeepSeekMessage[], isMultiTurn: boolean = false): string {
     const toolProfile = getProviderToolProfile('deepseek')
+    // Koa accepts text-part arrays for every text-capable role, including tool
+    // results. Preserve their exact concatenation: String(array) leaks
+    // "[object Object]" into the wire and join('\n') invents user text.
+    const readText = (value: unknown, nullForToolOnly = false): string => {
+      if (typeof value === 'string') return value
+      if (nullForToolOnly && value === null) return ''
+      if (!Array.isArray(value) || value.length === 0) {
+        throw new Error('DeepSeek message content is not supported')
+      }
+      return value.map((part: unknown) => {
+        if (!part || typeof part !== 'object' || Array.isArray(part)) {
+          throw new Error('DeepSeek message content is not supported')
+        }
+        const item = part as { type?: unknown, text?: unknown }
+        if (item.type !== 'text' || typeof item.text !== 'string' ||
+            Object.keys(item).some(key => key !== 'type' && key !== 'text')) {
+          throw new Error('DeepSeek message content is not supported')
+        }
+        return item.text
+      }).join('')
+    }
     const processedMessages = messages.map(message => {
       let text: string
 
       // Handle tool calls in assistant message
       if (message.role === 'assistant' && message.tool_calls && message.tool_calls.length > 0) {
-        text = toolProfile.formatAssistantToolCalls(message.tool_calls.map(tc => ({
+        const callsText = toolProfile.formatAssistantToolCalls(message.tool_calls.map(tc => ({
           id: tc.id,
           name: tc.function.name,
           arguments: tc.function.arguments,
         })))
+        // The OpenAI assistant turn may contain both natural-language content
+        // and tool_calls. Dropping the text corrupts multi-turn context.
+        const precedingText = readText(message.content, true)
+        text = precedingText ? precedingText + '\n' + callsText : callsText
       }
       // Handle tool response message
       else if (message.role === 'tool' && message.tool_call_id) {
         text = toolProfile.formatToolResult({
           toolCallId: message.tool_call_id,
-          content: String(message.content || ''),
+          content: readText(message.content),
         })
       }
-      else if (Array.isArray(message.content)) {
-        const texts = message.content
-          .filter((item: any) => item.type === 'text')
-          .map((item: any) => item.text)
-        text = texts.join('\n')
-      } else {
-        text = String(message.content || '')
+      else {
+        text = readText(message.content)
       }
       return { role: message.role, text }
     })
@@ -370,7 +420,6 @@ export class DeepSeekAdapter {
         return block.text
       })
       .join('')
-      .replace(/!\[.+\]\(.+\)/g, '')
   }
 
   async chatCompletion(request: ChatCompletionRequest): Promise<{ response: AxiosResponse; sessionId: string }> {
@@ -419,6 +468,7 @@ export class DeepSeekAdapter {
           'X-Ds-Pow-Response': challengeAnswer,
         },
         timeout: 120000,
+        maxRedirects: 0,
         validateStatus: () => true,
         responseType: 'stream',
       }
@@ -439,6 +489,7 @@ export class DeepSeekAdapter {
             ...FAKE_HEADERS,
           },
           timeout: 30000,
+          maxRedirects: 0,
           validateStatus: () => true,
         }
       )
@@ -458,7 +509,17 @@ export class DeepSeekAdapter {
   }
 
   static isDeepSeekProvider(provider: Provider): boolean {
-    return provider.id === 'deepseek' || provider.apiEndpoint.includes('deepseek.com')
+    if (provider.id === 'deepseek') return true
+    // A configured custom endpoint such as notdeepseek.com or a URL path
+    // containing "deepseek.com" must not be dispatched to the fixed consumer
+    // web origin with that custom account's credentials.
+    try {
+      const url = new URL(provider.apiEndpoint)
+      return url.origin === 'https://chat.deepseek.com' &&
+        !url.username && !url.password
+    } catch {
+      return false
+    }
   }
 
   /**

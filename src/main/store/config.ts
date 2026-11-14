@@ -14,6 +14,17 @@ import {
 } from './types'
 import { normalizeToolCallingConfig } from '../../shared/toolCalling'
 
+/** A committed configuration/mapping write is authoritative. A separate
+ * diagnostic log failure must not turn its management HTTP response into 500,
+ * leaving the caller believing an already-persisted change was rolled back. */
+function logCommittedConfigChange(message: string, data?: { changedKeys: string[] }): void {
+  try {
+    storeManager.addLog('info', message, data ? { data } : undefined)
+  } catch {
+    // No retry or rollback against a potentially newer config snapshot.
+  }
+}
+
 /**
  * Config Manager class
  * Provides all operations related to app configuration
@@ -34,10 +45,8 @@ export class ConfigManager {
   static update(updates: Partial<AppConfig>): AppConfig {
     const updated = storeManager.updateConfig(updates)
     
-    storeManager.addLog('info', 'Update app configuration', {
-      data: {
-        changedKeys: Object.keys(updates).filter(key => Object.prototype.hasOwnProperty.call(DEFAULT_CONFIG, key)),
-      },
+    logCommittedConfigChange('Update app configuration', {
+      changedKeys: Object.keys(updates).filter(key => Object.prototype.hasOwnProperty.call(DEFAULT_CONFIG, key)),
     })
     
     return updated
@@ -123,7 +132,7 @@ export class ConfigManager {
     
     this.update({ modelMappings: mappings })
     
-    storeManager.addLog('info', `Set model mapping: ${mapping.requestModel} -> ${mapping.actualModel}`)
+    logCommittedConfigChange(`Set model mapping: ${mapping.requestModel} -> ${mapping.actualModel}`)
   }
 
   /**
@@ -141,7 +150,7 @@ export class ConfigManager {
     delete mappings[model]
     this.update({ modelMappings: mappings })
     
-    storeManager.addLog('info', `Delete model mapping: ${model}`)
+    logCommittedConfigChange(`Delete model mapping: ${model}`)
     
     return true
   }
@@ -311,27 +320,32 @@ export class ConfigManager {
    */
   static validate(config: Partial<AppConfig>): { valid: boolean; errors: string[] } {
     const errors: string[] = []
+    // HTTP JSON inputs are untyped at runtime. A quoted number, non-finite
+    // value or fractional counter must not pass JS coercive range comparisons
+    // and become an unusable persisted operating setting.
+    const integerWithin = (value: unknown, min: number, max: number): boolean =>
+      Number.isSafeInteger(value) && (value as number) >= min && (value as number) <= max
     
     if (config.proxyPort !== undefined) {
-      if (config.proxyPort < 1 || config.proxyPort > 65535) {
+      if (!integerWithin(config.proxyPort, 1, 65535)) {
         errors.push('Proxy port must be between 1-65535')
       }
     }
     
     if (config.logRetentionDays !== undefined) {
-      if (config.logRetentionDays < 1 || config.logRetentionDays > 365) {
+      if (!integerWithin(config.logRetentionDays, 1, 365)) {
         errors.push('Log retention days must be between 1-365')
       }
     }
     
     if (config.requestTimeout !== undefined) {
-      if (config.requestTimeout < 1000 || config.requestTimeout > 300000) {
+      if (!integerWithin(config.requestTimeout, 1000, 300000)) {
         errors.push('Request timeout must be between 1000-300000 milliseconds')
       }
     }
     
     if (config.retryCount !== undefined) {
-      if (config.retryCount < 0 || config.retryCount > 10) {
+      if (!integerWithin(config.retryCount, 0, 10)) {
         errors.push('Retry count must be between 0-10')
       }
     }

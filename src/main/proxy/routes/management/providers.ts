@@ -146,8 +146,56 @@ router.put('/:id', async (ctx: Context) => {
 
     const updates: Partial<Omit<Provider, 'id' | 'type' | 'createdAt'>> = {}
 
+    const isStringRecord = (value: unknown): value is Record<string, string> =>
+      !!value && typeof value === 'object' && !Array.isArray(value) &&
+      Object.values(value).every(item => typeof item === 'string')
+
+    if (request.name !== undefined &&
+        (typeof request.name !== 'string' || request.name.trim() === '')) {
+      ctx.status = 400
+      ctx.body = createErrorResponse('invalid_request', 'Invalid field: name must be a non-empty string')
+      return
+    }
+    if (request.apiEndpoint !== undefined &&
+        (typeof request.apiEndpoint !== 'string' || request.apiEndpoint.trim() === '')) {
+      ctx.status = 400
+      ctx.body = createErrorResponse('invalid_request', 'Invalid field: apiEndpoint must be a non-empty string')
+      return
+    }
+    if (request.chatPath !== undefined && typeof request.chatPath !== 'string') {
+      ctx.status = 400
+      ctx.body = createErrorResponse('invalid_request', 'Invalid field: chatPath must be a string')
+      return
+    }
+    if (request.headers !== undefined && !isStringRecord(request.headers)) {
+      ctx.status = 400
+      ctx.body = createErrorResponse('invalid_request', 'Invalid field: headers must contain only string values')
+      return
+    }
+    if (request.description !== undefined && typeof request.description !== 'string') {
+      ctx.status = 400
+      ctx.body = createErrorResponse('invalid_request', 'Invalid field: description must be a string')
+      return
+    }
+    if (request.icon !== undefined && typeof request.icon !== 'string') {
+      ctx.status = 400
+      ctx.body = createErrorResponse('invalid_request', 'Invalid field: icon must be a string')
+      return
+    }
+    if (request.supportedModels !== undefined &&
+        (!Array.isArray(request.supportedModels) || request.supportedModels.some(model => typeof model !== 'string'))) {
+      ctx.status = 400
+      ctx.body = createErrorResponse('invalid_request', 'Invalid field: supportedModels must be an array of strings')
+      return
+    }
+    if (request.modelMappings !== undefined && !isStringRecord(request.modelMappings)) {
+      ctx.status = 400
+      ctx.body = createErrorResponse('invalid_request', 'Invalid field: modelMappings must contain only string values')
+      return
+    }
+
     if (request.name !== undefined) {
-      updates.name = request.name
+      updates.name = request.name.trim()
     }
 
     if (request.apiEndpoint !== undefined) {
@@ -163,6 +211,11 @@ router.put('/:id', async (ctx: Context) => {
     }
 
     if (request.enabled !== undefined) {
+      if (typeof request.enabled !== 'boolean') {
+        ctx.status = 400
+        ctx.body = createErrorResponse('invalid_request', 'Invalid field: enabled must be a boolean')
+        return
+      }
       updates.enabled = request.enabled
     }
 

@@ -43,7 +43,21 @@ function createSuccessResponse<T>(data: T): ManagementApiResponse<T> {
  */
 function transformSession(session: SessionRecord): SessionRecord {
   return {
-    ...session,
+    id: session.id,
+    providerId: session.providerId,
+    accountId: session.accountId,
+    sessionType: session.sessionType,
+    messages: session.messages,
+    createdAt: session.createdAt,
+    lastActiveAt: session.lastActiveAt,
+    status: session.status,
+    ...(session.model !== undefined ? { model: session.model } : {}),
+    ...(session.metadata !== undefined ? {
+      metadata: {
+        ...(session.metadata.title !== undefined ? { title: session.metadata.title } : {}),
+        ...(session.metadata.tokenCount !== undefined ? { tokenCount: session.metadata.tokenCount } : {}),
+      },
+    } : {}),
   }
 }
 

@@ -13,6 +13,16 @@ const compiled = ts.transpileModule(source, {
   fileName: pathname,
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
 }).outputText
+const mapperSource = readFileSync(new URL('../../src/main/proxy/modelMapper.ts', import.meta.url), 'utf8')
+const mapperCompiled = ts.transpileModule(mapperSource, {
+  fileName: 'modelMapper.ts',
+  compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
+}).outputText
+const loadBalancerSource = readFileSync(new URL('../../src/main/proxy/loadbalancer.ts', import.meta.url), 'utf8')
+const loadBalancerCompiled = ts.transpileModule(loadBalancerSource, {
+  fileName: 'loadbalancer.ts',
+  compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
+}).outputText
 
 function routeHarness({ providers = [], accounts = [], effective = {}, mappings = {} } = {}) {
   const routes = {}
@@ -25,11 +35,31 @@ function routeHarness({ providers = [], accounts = [], effective = {}, mappings 
     getEffectiveModels: id => effective[id] || [],
     getConfig: () => ({ modelMappings: mappings }),
   }
+  const mapperModule = { exports: {} }
+  vm.runInNewContext(mapperCompiled, {
+    module: mapperModule, exports: mapperModule.exports,
+    require: name => {
+      if (name === '../store/store') return { storeManager }
+      throw new Error('Blocked model mapper import: ' + name)
+    },
+  }, { filename: 'isolated-real-modelMapper.cjs', timeout: 2000 })
+  const modelMapper = new mapperModule.exports.ModelMapper()
+  const loadBalancerModule = { exports: {} }
+  vm.runInNewContext(loadBalancerCompiled, {
+    module: loadBalancerModule, exports: loadBalancerModule.exports, Date, Math, Map, Set,
+    console: { log() {} },
+    require: name => {
+      if (name === '../store/store') return { storeManager }
+      if (name === './modelMapper') return { modelMapper }
+      throw new Error('Blocked loadbalancer import: ' + name)
+    },
+  }, { filename: 'isolated-real-loadBalancer.cjs', timeout: 2000 })
+  const loadBalancer = new loadBalancerModule.exports.LoadBalancer()
   const requireMock = specifier => {
     if (specifier === '@koa/router') return { default: Router }
     if (specifier === '../../store/store') return { storeManager }
-    if (specifier === '../loadbalancer') return { loadBalancer: {} }
-    if (specifier === '../modelMapper') return { modelMapper: {} }
+    if (specifier === '../loadbalancer') return { loadBalancer }
+    if (specifier === '../modelMapper') return { modelMapper }
     throw new Error('Blocked network/application import: ' + specifier)
   }
   const exports = {}

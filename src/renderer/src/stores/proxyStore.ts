@@ -41,7 +41,8 @@ interface ProxyState {
   fetchProxyStatus: () => Promise<void>
   fetchProxyStatistics: () => Promise<void>
   fetchAppConfig: () => Promise<void>
-  saveAppConfig: (config: Partial<AppConfig>) => Promise<boolean>
+  saveAppConfig: (config: Partial<AppConfig>,
+    options?: { expectedModelMappings?: AppConfig['modelMappings'] }) => Promise<boolean>
   startProxy: (port?: number) => Promise<boolean>
   stopProxy: () => Promise<boolean>
 }
@@ -67,6 +68,9 @@ const DEFAULT_STATISTICS: ProxyStatistics = {
   providerUsage: {},
   accountUsage: {},
 }
+
+// An older IPC Settings snapshot must not reverse a later model mapping save.
+let appConfigReadGeneration = 0
 
 export const useProxyStore = create<ProxyState>((set, get) => ({
   proxyStatus: null,
@@ -124,7 +128,7 @@ export const useProxyStore = create<ProxyState>((set, get) => ({
 
   fetchProxyStatistics: async () => {
     if (!window.electronAPI?.statistics?.get) {
-      set({ proxyStatistics: DEFAULT_STATISTICS })
+      set({ error: 'Statistics IPC is unavailable; previous values were retained.' })
       return
     }
     try {
@@ -155,18 +159,20 @@ export const useProxyStore = create<ProxyState>((set, get) => ({
         accountUsage: persistentStats?.accountUsage || {},
       }
       
-      set({ proxyStatistics: statistics || DEFAULT_STATISTICS })
+      set({ proxyStatistics: statistics || DEFAULT_STATISTICS, error: null })
     } catch (error) {
-      set({ proxyStatistics: DEFAULT_STATISTICS })
+      // A failed read is unknown, not proof that requests were reset to zero.
+      set({ error: 'Statistics could not be refreshed; showing last confirmed values.' })
     }
   },
 
   fetchAppConfig: async () => {
     if (!window.electronAPI?.config?.get) return
+    const generation = ++appConfigReadGeneration
     try {
       set({ isLoading: true })
       const config = await window.electronAPI.config.get()
-      if (config) {
+      if (config && generation === appConfigReadGeneration) {
         set({
           appConfig: config,
           loadBalanceStrategy: config.loadBalanceStrategy,
@@ -181,43 +187,30 @@ export const useProxyStore = create<ProxyState>((set, get) => ({
         })
       }
     } catch (error) {
-      set({ error: (error as Error).message })
+      if (generation === appConfigReadGeneration) {
+        set({ error: (error as Error).message })
+      }
     } finally {
-      set({ isLoading: false })
+      if (generation === appConfigReadGeneration) set({ isLoading: false })
     }
   },
 
-  saveAppConfig: async (config) => {
+  saveAppConfig: async (config, options) => {
     if (!window.electronAPI?.config?.update) return false
     try {
+      // Invalidate a pre-save IPC read before the next durable write starts.
+      ++appConfigReadGeneration
       set({ isLoading: true, error: null })
-      const currentConfig = get().appConfig
-      
-      // Deep merge for nested objects like toolCallingConfig and sessionConfig
-      let newConfig = { ...currentConfig, ...config } as AppConfig
-      
-      // Handle toolCallingConfig deep merge
-      if (config.toolCallingConfig && currentConfig?.toolCallingConfig) {
-        newConfig.toolCallingConfig = {
-          ...currentConfig.toolCallingConfig,
-          ...config.toolCallingConfig,
-          advanced: {
-            ...currentConfig.toolCallingConfig.advanced,
-            ...config.toolCallingConfig.advanced,
-          },
-        }
-      }
-      
-      // Handle sessionConfig deep merge
-      if (config.sessionConfig && currentConfig?.sessionConfig) {
-        newConfig.sessionConfig = {
-          ...currentConfig.sessionConfig,
-          ...config.sessionConfig,
-        }
-      }
-      
-      await window.electronAPI.config.update(newConfig)
-      set({ appConfig: newConfig })
+      // The displayed snapshot can predate a management HTTP mutation
+      // (including a regenerated key or newly mapped model). The IPC writer
+      // must receive ONLY the fields this GUI action changed; otherwise an
+      // unrelated proxy setting can roll back freshly committed credentials.
+      const isMappingWrite = Object.prototype.hasOwnProperty.call(config, 'modelMappings')
+      const expectedModelMappings = options?.expectedModelMappings ?? get().appConfig?.modelMappings
+      if (isMappingWrite && !expectedModelMappings) return false
+      await window.electronAPI.config.update(config,
+        isMappingWrite ? { expectedModelMappings } : undefined)
+      await get().fetchAppConfig()
       return true
     } catch (error) {
       set({ error: (error as Error).message })

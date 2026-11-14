@@ -50,11 +50,16 @@ export type ChatCompletionToolChoice = 'none' | 'auto' | 'required' | {
  * Message Content (supports multimodal)
  */
 export interface ChatMessageContent {
-  type: 'text' | 'image_url'
+  // GLM supports file_url parts in addition to OpenAI's text/image parts.
+  // Routes must reject file parts for every other provider before dispatch.
+  type: 'text' | 'image_url' | 'file'
   text?: string
   image_url?: {
     url: string
     detail?: 'auto' | 'low' | 'high'
+  }
+  file_url?: {
+    url: string
   }
 }
 
@@ -72,6 +77,9 @@ export interface ChatCompletionRequest {
   stream?: boolean
   stop?: string | string[]
   max_tokens?: number
+  /** Web adapters cannot guarantee a modern total completion-token cap;
+   * the public route rejects non-null values before any remote effect. */
+  max_completion_tokens?: number | null
   presence_penalty?: number
   frequency_penalty?: number
   logit_bias?: Record<string, number>
@@ -100,6 +108,8 @@ export interface ChatCompletionRequest {
   tools?: ChatCompletionTool[]
   /** Tool choice strategy */
   tool_choice?: ChatCompletionToolChoice
+  /** Explicit false is enforced against the fully completed tool-call count. */
+  parallel_tool_calls?: boolean
   /** Tool format - determines response format for tool calls */
   tool_format?: 'native' | 'json' | 'auto'
 }
@@ -237,7 +247,7 @@ export interface ForwardResult {
   /** Fixed internal phase enum only; never a raw provider exception or body. */
   failureStage?: 'auth-preflight' | 'chat-creation' | 'chat-completion' | 'response-decoding' | 'unclassified'
   /** Literal-only diagnostic, never a raw upstream exception or response. */
-  failureCode?: 'kimi_upstream_operation_failed' | 'qwen_ai_upstream_operation_failed' | 'provider_completion_unconfirmed'
+  failureCode?: 'deepseek_upstream_operation_failed' | 'qwen_upstream_operation_failed' | 'kimi_upstream_operation_failed' | 'qwen_ai_upstream_operation_failed' | 'glm_upstream_operation_failed' | 'glm_attachment_invalid_input' | 'provider_completion_unconfirmed' | 'context_summary_additional_effect_not_allowed' | 'context_history_unrepresentable' | 'context_strategy_failed'
   headers?: Record<string, string>
   body?: any
   stream?: NodeJS.ReadableStream

@@ -28,6 +28,16 @@ export interface CustomProviderValidation {
 }
 
 export class CustomProviderManager {
+  /** A successful provider-store write must not appear failed to the renderer
+   * solely because the independent app-log subsystem is unavailable. */
+  private static logCommittedProviderChange(message: string, providerId: string): void {
+    try {
+      storeManager.addLog('info', message, { providerId })
+    } catch {
+      // Never replay a completed creation, update or deletion.
+    }
+  }
+
   private static validateName(name: string, existingId?: string): CustomProviderValidation {
     const errors: string[] = []
     
@@ -190,9 +200,7 @@ export class CustomProviderManager {
     
     storeManager.addProvider(provider)
     
-    storeManager.addLog('info', `Created provider: ${provider.name}`, {
-      providerId: provider.id,
-    })
+    this.logCommittedProviderChange(`Created provider: ${provider.name}`, provider.id)
     
     return provider
   }
@@ -246,9 +254,7 @@ export class CustomProviderManager {
     })
     
     if (updated) {
-      storeManager.addLog('info', `Updated custom provider: ${existing.name}`, {
-        providerId: id,
-      })
+      this.logCommittedProviderChange(`Updated custom provider: ${existing.name}`, id)
     }
     
     return updated!
@@ -267,17 +273,12 @@ export class CustomProviderManager {
       throw new Error('Built-in providers cannot be deleted; disable them instead')
     }
     
-    const accounts = storeManager.getAccountsByProviderId(id)
-    for (const account of accounts) {
-      storeManager.deleteAccount(account.id)
-    }
-    
+    // The storage layer performs the full cascade atomically. Never delete
+    // children before the provider's durable removal is accepted.
     const result = storeManager.deleteProvider(id)
     
     if (result) {
-      storeManager.addLog('info', `Deleted provider: ${provider.name}`, {
-        providerId: id,
-      })
+      this.logCommittedProviderChange(`Deleted provider: ${provider.name}`, id)
     }
     
     return result

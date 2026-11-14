@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import { useEffect } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import {
@@ -13,16 +13,16 @@ import { Settings, Scale, Activity, Settings2 } from 'lucide-react'
 export function ProxySettings() {
   const { t } = useTranslation()
   const { fetchAppConfig, fetchProxyStatus, fetchProxyStatistics } = useProxyStore()
-  const hasLoadedRef = useRef(false)
-
   useEffect(() => {
-    if (hasLoadedRef.current) return
-    hasLoadedRef.current = true
-    
-    fetchAppConfig()
-    fetchProxyStatus()
-    fetchProxyStatistics()
-  }, [])
+    void fetchAppConfig()
+    void fetchProxyStatus()
+    void fetchProxyStatistics()
+    const unsubscribe = window.electronAPI?.store?.onChanged?.(kind => {
+      if (kind === 'config') void fetchAppConfig()
+      if (kind === 'accounts') void fetchProxyStatistics()
+    })
+    return () => unsubscribe?.()
+  }, [fetchAppConfig, fetchProxyStatus, fetchProxyStatistics])
 
   return (
     <div className="space-y-6">

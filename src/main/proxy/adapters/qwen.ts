@@ -17,6 +17,7 @@ import { createBaseChunk } from '../utils/streamToolHandler'
 import { getProviderToolProfile } from '../toolCalling/providerProfiles'
 import { ToolStreamParser } from '../toolCalling/ToolStreamParser'
 import type { ToolCallingPlan } from '../toolCalling/types'
+import { selectQwenChinaTicket } from '../../providers/qwenTicket'
 
 /**
  * Check if content contains tool calls (both bracket and XML formats)
@@ -64,6 +65,8 @@ interface QwenMessage {
 interface ChatCompletionRequest {
   model: string
   originalModel?: string
+  /** The LoadBalancer already selected an exact effective-catalog wire ID. */
+  resolvedModelId?: boolean
   messages: QwenMessage[]
   tools?: any[]
   stream?: boolean
@@ -106,7 +109,7 @@ function extractTextContent(content: string | any[]): string {
     return content
       .filter((item) => item.type === 'text')
       .map((item) => item.text || '')
-      .join('\n')
+      .join('')
   }
   return ''
 }
@@ -116,6 +119,7 @@ export class QwenAdapter {
   private account: Account
   private axiosInstance = axios.create({
     timeout: 120000,
+    maxRedirects: 0,
     maxBodyLength: Infinity,
     maxContentLength: Infinity,
   })
@@ -126,8 +130,7 @@ export class QwenAdapter {
   }
 
   private getTicket(): string {
-    const credentials = this.account.credentials
-    return credentials.ticket || credentials.tongyi_sso_ticket || ''
+    return selectQwenChinaTicket(this.account.credentials) ?? ''
   }
 
   private mapModel(model: string): string {
@@ -205,6 +208,7 @@ export class QwenAdapter {
         headers: this.getApiHeaders(ticket),
         params: this.getApiParams(),
         timeout: 15000,
+        maxRedirects: 0,
         validateStatus: () => true,
       }
     )
@@ -240,6 +244,7 @@ export class QwenAdapter {
           timestamp,
         }),
         timeout: 15000,
+        maxRedirects: 0,
         validateStatus: () => true,
       }
     )
@@ -265,6 +270,7 @@ export class QwenAdapter {
         headers: this.getApiHeaders(ticket),
         params: this.getApiParams(),
         timeout: 15000,
+        maxRedirects: 0,
         validateStatus: () => true,
       }
     )
@@ -301,7 +307,10 @@ export class QwenAdapter {
     const reqId = uuid(false)
     const sessionId = uuid(false)
     
-    let actualModel = this.mapModel(request.model)
+    // A selected catalog actualModelId is the wire contract. Historical
+    // display aliases are mapped only for direct callers without this flag.
+    let actualModel = request.resolvedModelId === true
+      ? request.model : this.mapModel(request.model)
     
     // Determine if thinking and web search should be enabled
     // Priority: explicit parameters > model name detection
@@ -313,17 +322,17 @@ export class QwenAdapter {
     let enableWebSearch = request.enableWebSearch ?? false
     
     // Auto-enable based on model name (if not explicitly set)
-    if (!enableThinking && (modelLower.includes('think') || modelLower.includes('r1'))) {
+    if (request.enableThinking === undefined && (modelLower.includes('think') || modelLower.includes('r1'))) {
       enableThinking = true
       console.log('[Qwen] Thinking mode enabled (from model name)')
     }
-    if (!enableWebSearch && modelLower.includes('search')) {
+    if (request.enableWebSearch === undefined && modelLower.includes('search')) {
       enableWebSearch = true
       console.log('[Qwen] Web search enabled (from model name)')
     }
 
     // Map thinking mode to model
-    if (enableThinking) {
+    if (enableThinking && request.resolvedModelId !== true) {
       // Use thinking model if available
       if (actualModel === 'Qwen3-Max') {
         actualModel = 'Qwen3-Max-Thinking-Preview'
@@ -342,10 +351,18 @@ export class QwenAdapter {
     
     for (const msg of request.messages) {
       if (msg.role === 'system') {
-        systemPrompt = extractTextContent(msg.content)
+        // The consumer endpoint accepts one combined prompt, not multiple
+        // system roles. Preserve every supplied leading system instruction in
+        // order instead of silently overwriting all but the last one.
+        const systemContent = extractTextContent(msg.content)
+        systemPrompt = systemPrompt ? systemPrompt + '\n\n' + systemContent : systemContent
       } else if (msg.role === 'user') {
         conversationParts.push(extractTextContent(msg.content))
       } else if (msg.role === 'assistant' && msg.tool_calls && msg.tool_calls.length > 0) {
+        // An assistant can explain its intent and issue a tool call in the
+        // same OpenAI turn. Keep the explanation before the serialized call.
+        const precedingText = extractTextContent(msg.content)
+        if (precedingText) conversationParts.push(`Assistant: ${precedingText}`)
         conversationParts.push(toolProfile.formatAssistantToolCalls(msg.tool_calls.map(tc => ({
           id: tc.id,
           name: tc.function.name,
@@ -422,6 +439,8 @@ export class QwenAdapter {
       },
       responseType: 'stream',
       timeout: 120000,
+      maxRedirects: 0,
+      validateStatus: () => true,
       decompress: false,
     })
 
@@ -492,7 +511,21 @@ export class QwenAdapter {
   }
 
   static isQwenProvider(provider: Provider): boolean {
-    return provider.id === 'qwen' || provider.apiEndpoint.includes('qianwen.com') || provider.apiEndpoint.includes('aliyun.com')
+    if (provider.id === 'qwen') return true
+    // The China consumer-web adapter talks to fixed first-party Qianwen
+    // origins. A custom API whose hostname/path merely contains qianwen.com
+    // or aliyun.com must retain its configured generic endpoint and identity.
+    try {
+      const url = new URL(provider.apiEndpoint)
+      const trustedHost = [
+        'qianwen.com', 'www.qianwen.com', 'chat2.qianwen.com',
+        'chat2-api.qianwen.com', 'chat-side.qianwen.com',
+      ].includes(url.hostname)
+      return url.protocol === 'https:' && trustedHost &&
+        !url.username && !url.password && !url.port
+    } catch {
+      return false
+    }
   }
 }
 

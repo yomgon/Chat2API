@@ -116,25 +116,37 @@ export class DeepSeekHash {
 }
 
 let deepSeekHashInstance: DeepSeekHash | null = null
+let deepSeekHashInitialization: Promise<DeepSeekHash> | null = null
 
 export async function getDeepSeekHash(): Promise<DeepSeekHash> {
-  if (!deepSeekHashInstance) {
-    deepSeekHashInstance = new DeepSeekHash()
-    // Use different paths for development and production environments
-    const wasmPath = app.isPackaged
-      ? path.join(process.resourcesPath, 'sha3_wasm_bg.7b9ca65ddd.wasm')
-      : path.join(app.getAppPath(), 'sha3_wasm_bg.7b9ca65ddd.wasm')
-    console.log('[DeepSeekHash] WASM path:', wasmPath)
-    console.log('[DeepSeekHash] File exists:', fs.existsSync(wasmPath))
-    try {
-      await deepSeekHashInstance.init(wasmPath)
-      console.log('[DeepSeekHash] WASM initialized successfully')
-    } catch (error) {
-      console.error('[DeepSeekHash] WASM initialization failed:', error)
-      throw error
-    }
+  if (deepSeekHashInstance) return deepSeekHashInstance
+
+  if (!deepSeekHashInitialization) {
+    // Install the shared promise before initialization or synchronous setup
+    // can fail. Only a fully initialized candidate becomes the cached instance.
+    deepSeekHashInitialization = Promise.resolve()
+      .then(async () => {
+        const candidate = new DeepSeekHash()
+        // Use different paths for development and production environments
+        const wasmPath = app.isPackaged
+          ? path.join(process.resourcesPath, 'sha3_wasm_bg.7b9ca65ddd.wasm')
+          : path.join(app.getAppPath(), 'sha3_wasm_bg.7b9ca65ddd.wasm')
+        console.log('[DeepSeekHash] WASM path:', wasmPath)
+        console.log('[DeepSeekHash] File exists:', fs.existsSync(wasmPath))
+        await candidate.init(wasmPath)
+        console.log('[DeepSeekHash] WASM initialized successfully')
+        deepSeekHashInstance = candidate
+        return candidate
+      })
+      .catch(error => {
+        console.error('[DeepSeekHash] WASM initialization failed')
+        throw error
+      })
+      .finally(() => {
+        deepSeekHashInitialization = null
+      })
   }
-  return deepSeekHashInstance
+  return deepSeekHashInitialization
 }
 
 export default DeepSeekHash

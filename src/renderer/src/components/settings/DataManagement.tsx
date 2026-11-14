@@ -51,12 +51,19 @@ export function DataManagement() {
   const updateRequestLogConfig = async (
     updates: Partial<typeof requestLogConfig>,
   ) => {
-    await updateConfig({
+    const committed = await updateConfig({
       requestLogConfig: {
         ...requestLogConfig,
         ...updates,
       },
     })
+    if (!committed) {
+      toast({
+        title: t('common.error'),
+        description: t('settings.configSaveFailed'),
+        variant: 'destructive',
+      })
+    }
   }
 
   const handleExportConfig = async () => {

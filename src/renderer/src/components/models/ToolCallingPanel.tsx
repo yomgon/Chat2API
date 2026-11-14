@@ -197,7 +197,10 @@ export function ToolCallingPanel() {
                 className="min-h-[160px] font-mono text-xs"
                 value={config.advanced.customPromptTemplate ?? ''}
                 onChange={(event) => saveConfig({
-                  advanced: { customPromptTemplate: event.target.value || undefined },
+                  advanced: {
+                    ...config.advanced,
+                    customPromptTemplate: event.target.value || undefined,
+                  },
                 })}
                 placeholder={t('toolCalling.advanced.customTemplatePlaceholder')}
               />

@@ -73,7 +73,8 @@ function readKimiMessageText(message: KimiMessage): string {
     const parts: string[] = []
     for (const part of message.content) {
       if (!part || typeof part !== 'object' || Array.isArray(part) ||
-          part.type !== 'text' || typeof part.text !== 'string') {
+          part.type !== 'text' || typeof part.text !== 'string' ||
+          Object.keys(part).some(key => key !== 'type' && key !== 'text')) {
         throw new Error('Kimi message content is not supported')
       }
       parts.push(part.text)
@@ -1001,7 +1002,7 @@ export class KimiStreamHandler {
       const finish = () => {
         if (settled) return
         const { content: cleanContent, toolCalls } =
-          (this.toolCallingPlan?.toolChoiceMode === 'none' || this.toolCallingPlan?.shouldParseResponse)
+          (this.toolCallingPlan?.mode === 'disabled' || this.toolCallingPlan?.toolChoiceMode === 'none' || this.toolCallingPlan?.shouldParseResponse)
           ? { content, toolCalls: [] }
           : parseToolCallsFromText(content, 'kimi')
         if (!cleanContent.trim() && toolCalls.length === 0) {
@@ -1025,6 +1026,9 @@ export class KimiStreamHandler {
         if (settled) return
         try {
           decoder.push(chunk, data => {
+            // Match streaming: validated heartbeats do not update answer state.
+            if (data.heartbeat) return
+
             if (data.chat?.id && !this.realChatId) {
               this.realChatId = data.chat.id
               console.log('[Kimi] Non-stream chat identifier received')

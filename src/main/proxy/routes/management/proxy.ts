@@ -21,6 +21,15 @@ router.use(managementAuthMiddleware)
 
 let pendingTransition: 'stop' | 'restart' | null = null
 
+function logFailedTransition(message: string): void {
+  try {
+    storeManager.addLog('error', message)
+  } catch {
+    // A response-accepted control transition must not produce an unhandled
+    // rejection just because its optional error diagnostics are unavailable.
+  }
+}
+
 function scheduleAfterResponse(
   ctx: Context,
   transition: 'stop' | 'restart',
@@ -34,9 +43,9 @@ function scheduleAfterResponse(
     if (started) return
     started = true
     void operation().then(success => {
-      if (!success) storeManager.addLog('error', 'Management proxy ' + transition + ' failed')
+      if (!success) logFailedTransition('Management proxy ' + transition + ' failed')
     }).catch(() => {
-      storeManager.addLog('error', 'Management proxy ' + transition + ' encountered an error')
+      logFailedTransition('Management proxy ' + transition + ' encountered an error')
     }).finally(() => {
       pendingTransition = null
     })

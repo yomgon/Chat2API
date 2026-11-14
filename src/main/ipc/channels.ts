@@ -9,6 +9,9 @@ export const IpcChannels = {
   CONFIG_GET: 'config:get',
   CONFIG_UPDATE: 'config:update',
   CONFIG_CHANGED: 'config:changed',
+  API_KEYS_CREATE: 'apiKeys:create',
+  API_KEYS_SET_ENABLED: 'apiKeys:setEnabled',
+  API_KEYS_DELETE: 'apiKeys:delete',
 
   STORE_GET: 'store:get',
   STORE_SET: 'store:set',
@@ -16,6 +19,7 @@ export const IpcChannels = {
   STORE_CLEAR_ALL: 'store:clearAll',
   STORE_INIT_ERROR: 'store:initError',
   STORE_RETRY_INIT: 'store:retryInit',
+  STORE_CHANGED: 'store:changed',
 
   PROVIDERS_GET_ALL: 'providers:getAll',
   PROVIDERS_GET_BUILTIN: 'providers:getBuiltin',
@@ -79,6 +83,7 @@ export const IpcChannels = {
   STATISTICS_GET_TODAY: 'statistics:getToday',
 
   APP_GET_VERSION: 'app:getVersion',
+  APP_GET_TEST_QUIET_STARTUP: 'app:getTestQuietStartup',
   APP_CHECK_UPDATE: 'app:checkUpdate',
   APP_DOWNLOAD_UPDATE: 'app:downloadUpdate',
   APP_INSTALL_UPDATE: 'app:installUpdate',

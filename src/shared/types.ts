@@ -50,6 +50,8 @@ export interface Account {
   requestCount?: number
   dailyLimit?: number
   todayUsed?: number
+  /** Local calendar date for todayUsed; missing on historical account rows. */
+  usageDay?: string
 }
 
 export interface Provider {
@@ -179,6 +181,12 @@ export interface ValidationResult {
   valid: boolean
   error?: string
   validatedAt: number
+  /** Account changed while validation was awaiting an external provider. */
+  superseded?: boolean
+  /** Same account already has an unfinished validation operation. */
+  inProgress?: boolean
+  /** Canceled local caller: the external effect may still be unknown. */
+  canceled?: boolean
   accountInfo?: {
     name?: string
     email?: string

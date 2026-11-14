@@ -12,6 +12,7 @@ import { parseToolCalls } from './utils/toolParser/index'
  */
 export class SSEParser {
   private buffer: string = ''
+  private currentEvent: Partial<SSEEvent> = {}
 
   /**
    * Parse SSE data
@@ -22,21 +23,24 @@ export class SSEParser {
     const lines = this.buffer.split('\n')
     this.buffer = lines.pop() || ''
 
-    let currentEvent: Partial<SSEEvent> = {}
-
-    for (const line of lines) {
+    for (const rawLine of lines) {
+      // An SSE delimiter is an empty LF or CRLF line, including when the CR
+      // and LF arrive in different transport chunks.
+      const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine
       if (line === '') {
-        if (currentEvent.data !== undefined) {
+        if (this.currentEvent.data !== undefined) {
           events.push({
-            event: currentEvent.event,
-            data: currentEvent.data,
-            id: currentEvent.id,
-            retry: currentEvent.retry,
+            event: this.currentEvent.event,
+            data: this.currentEvent.data,
+            id: this.currentEvent.id,
+            retry: this.currentEvent.retry,
           })
         }
-        currentEvent = {}
+        this.currentEvent = {}
         continue
       }
+
+      if (line.startsWith(':')) continue
 
       const colonIndex = line.indexOf(':')
       if (colonIndex === -1) {
@@ -52,16 +56,17 @@ export class SSEParser {
 
       switch (field) {
         case 'event':
-          currentEvent.event = value
+          this.currentEvent.event = value
           break
         case 'data':
-          currentEvent.data = (currentEvent.data || '') + value
+          this.currentEvent.data = this.currentEvent.data === undefined
+            ? value : this.currentEvent.data + '\n' + value
           break
         case 'id':
-          currentEvent.id = value
+          this.currentEvent.id = value
           break
         case 'retry':
-          currentEvent.retry = parseInt(value, 10)
+          this.currentEvent.retry = parseInt(value, 10)
           break
       }
     }
@@ -74,6 +79,7 @@ export class SSEParser {
    */
   reset(): void {
     this.buffer = ''
+    this.currentEvent = {}
   }
 }
 
@@ -126,11 +132,9 @@ export class SSEFormatter {
  * Stream Response Handler
  */
 export class StreamHandler {
-  private parser: SSEParser
   private formatter: SSEFormatter
 
   constructor() {
-    this.parser = new SSEParser()
     this.formatter = new SSEFormatter()
   }
 
@@ -145,7 +149,14 @@ export class StreamHandler {
   ): Transform {
     let isFirstChunk = true
     const created = Math.floor(Date.now() / 1000)
-    const parser = this.parser
+    // StreamHandler is a singleton shared across HTTP requests. Each
+    // request must own its incomplete SSE bytes: otherwise concurrent
+    // transports can parse one another's messages into a different response.
+    const parser = new SSEParser()
+    // Decode before parsing SSE lines. Buffer.toString() on each transport
+    // chunk corrupts split Korean/emoji bytes and silently replaces invalid
+    // upstream UTF-8, which could otherwise be counted as a completed answer.
+    const decoder = new TextDecoder('utf-8', { fatal: true })
     const formatter = this.formatter
     const transformChunk = this.transformChunk.bind(this)
 
@@ -158,7 +169,8 @@ export class StreamHandler {
       objectMode: true,
       transform(chunk: Buffer, encoding, callback) {
         try {
-          const events = parser.parse(chunk.toString())
+          const bytes = typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : chunk
+          const events = parser.parse(decoder.decode(bytes, { stream: true }))
 
           for (const event of events) {
             if (event.data === '[DONE]') {
@@ -317,39 +329,48 @@ export class StreamHandler {
       },
 
       flush(callback) {
-        if (contentBuffer) {
-          // Final check for tool calls in buffer
-          const { content: cleanContent, toolCalls } = parseToolCalls(contentBuffer)
+        try {
+          // A transport ending in half a UTF-8 codepoint is unconfirmed.
+          // Do not complete the transformer or call onEnd in that case.
+          if (decoder.decode()) throw new Error('Unterminated UTF-8 text')
+          if (contentBuffer) {
+            // Final check for tool calls in buffer
+            const { content: cleanContent, toolCalls } = parseToolCalls(contentBuffer)
 
-          if (toolCalls.length > 0) {
-            for (const tc of toolCalls) {
-              tc.index = toolCallIndex++
-              const toolCallData = {
-                id: responseId,
-                object: 'chat.completion.chunk',
-                created,
-                model,
-                choices: [{
-                  index: 0,
-                  delta: {
-                    tool_calls: [tc]
-                  },
-                  finish_reason: null
-                }]
+            if (toolCalls.length > 0) {
+              for (const tc of toolCalls) {
+                tc.index = toolCallIndex++
+                const toolCallData = {
+                  id: responseId,
+                  object: 'chat.completion.chunk',
+                  created,
+                  model,
+                  choices: [{
+                    index: 0,
+                    delta: {
+                      tool_calls: [tc]
+                    },
+                    finish_reason: null
+                  }]
+                }
+                this.push(formatter.formatJSON(toolCallData))
               }
-              this.push(formatter.formatJSON(toolCallData))
-            }
-          } else {
-            // No tool calls, just flush content
-            const finalData = transformChunk({ content: contentBuffer }, model, responseId, created, isFirstChunk)
-            if (finalData) {
-              this.push(formatter.formatJSON(finalData))
+            } else {
+              // No tool calls, just flush content
+              const finalData = transformChunk({ content: contentBuffer }, model, responseId, created, isFirstChunk)
+              if (finalData) {
+                this.push(formatter.formatJSON(finalData))
+              }
             }
           }
+          // The upstream [DONE] frame, if actually observed, was forwarded by
+          // transform() above. Never invent a terminal at clean EOF or emit a
+          // second [DONE]: the final HTTP gate verifies both [DONE] and EOF.
+          onEnd?.()
+          callback()
+        } catch (error) {
+          callback(error as Error)
         }
-        this.push(formatter.formatDone())
-        onEnd?.()
-        callback()
       },
     })
   }
@@ -424,6 +445,7 @@ export class StreamHandler {
     model: string,
     responseId: string
   ): Promise<ChatCompletionResponse> {
+    const parser = new SSEParser()
     return new Promise((resolve, reject) => {
       let content = ''
       let reasoningContent = ''
@@ -432,7 +454,7 @@ export class StreamHandler {
       const created = Math.floor(Date.now() / 1000)
 
       stream.on('data', (chunk: Buffer) => {
-        const events = this.parser.parse(chunk.toString())
+        const events = parser.parse(chunk.toString())
 
         for (const event of events) {
           if (event.data === '[DONE]') continue

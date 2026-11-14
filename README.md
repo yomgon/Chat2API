@@ -3,7 +3,7 @@
 > **Windows maintenance fork** of [xiaoY233/Chat2API](https://github.com/xiaoY233/Chat2API). Original copyright and GPL-3.0 license are retained.
 >
 > Focus: local proxy security, credential handling, Windows desktop compatibility and web-chat model catalog management.
-> Version `1.4.0-local.22`: 1,286 offline/security tests passed and Windows Electron build passed (2026-11-10). These use synthetic/offline tests; not every provider or live model inference path is verified. No binaries are distributed here.
+> Version `1.4.0-local.101`: 3,789 offline/security tests passed (2026-11-15); Windows Electron installer and portable builds completed and packaged content was checked. Tests are largely synthetic/offline, and not every provider or live model inference path has been verified. The Windows packages are unsigned. No binaries are distributed in this repository.
 >
 > Website integrations may rely on unofficial interfaces, which can change. Follow applicable provider terms. This is an independent community-maintained fork.
 
@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.3.0-blue?style=flat-square&logo=github" alt="Release">
+  <img src="https://img.shields.io/badge/Release-v1.4.0--local.101-blue?style=flat-square&logo=github" alt="Release">
   <img src="https://img.shields.io/badge/License-GPL--3.0-blue?style=flat-square" alt="License">
   <br>
   <a href="https://www.electronjs.org/"><img src="https://img.shields.io/badge/Electron-33+-47848F?style=flat-square&logo=electron&logoColor=white" alt="Electron"></a>
@@ -35,6 +35,11 @@
 
 ![Product Preview](docs/screenshots/preview.png)
 
+## Security and maintenance status (local.101)
+
+This independent maintenance fork updates an older Electron/TypeScript codebase and adds defensive regression coverage around local proxy admission, API-key generation, credential handling, log redaction, settings persistence, provider-error handling, and chat/tool-call message fidelity. The private development build passed **3,789 offline/security tests** with **0 failures**, and produced Windows setup and portable packages. Public commits contain source and test code, **not** account data, credentials, private test artifacts, or binary releases.
+
+Passing offline tests does **not** certify the application as vulnerability-free, guarantee real-world provider compatibility, or establish that every web integration is operational. Unofficial website integrations can change and may be subject to provider restrictions. See [maintenance scope and verification](docs/MAINTENANCE-v1.4.0-local.101.md) for limitations.
 ## ✨ Features
 
 - OpenAI Compatible API: Provides standard OpenAI-compatible API endpoints for seamless integration
@@ -72,7 +77,7 @@ Provider adaptation notes and manual model-addition guides are in [docs/provider
 
 ### Download
 
-Download the latest release from [GitHub Releases](https://github.com/xiaoY233/Chat2API/releases):
+**This fork currently distributes source only.** The upstream project publishes separate binaries at [upstream GitHub Releases](https://github.com/xiaoY233/Chat2API/releases), which are **not** builds of `1.4.0-local.101`. To use this fork, build it from source:
 
 | Platform              | Download                                |
 | --------------------- | --------------------------------------- |
@@ -91,7 +96,7 @@ Download the latest release from [GitHub Releases](https://github.com/xiaoY233/C
 
 ```bash
 # Clone the repository
-git clone https://github.com/xiaoY233/Chat2API.git
+git clone https://github.com/yomgon/Chat2API.git
 cd Chat2API
 
 # Install dependencies

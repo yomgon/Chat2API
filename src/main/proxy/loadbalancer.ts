@@ -3,9 +3,10 @@
  * Implements Round Robin and Fill First strategies
  */
 
-import { Account, Provider, LoadBalanceStrategy } from '../store/types'
+import { Account, Provider, LoadBalanceStrategy, type EffectiveModel } from '../store/types'
 import { AccountSelection } from './types'
 import { storeManager } from '../store/store'
+import { modelMapper } from './modelMapper'
 
 /**
  * Load Balancer
@@ -13,8 +14,43 @@ import { storeManager } from '../store/store'
 export class LoadBalancer {
   private roundRobinIndex: Map<string, number> = new Map()
   private failedAccounts: Map<string, { count: number; lastFailTime: number }> = new Map()
+  // Account usage is settled only after a confirmed answer. Reserve scarce
+  // daily slots synchronously before sending upstream so concurrent HTTP
+  // requests cannot both spend the same last available slot. In-flight work
+  // remains counted across midnight: a late settlement can land on the new day.
+  private inFlightAccountSlots: Map<string, number> = new Map()
   private static readonly FAIL_THRESHOLD = 3
   private static readonly RECOVERY_TIME = 60000 // 1 minute
+
+  private accountSlotKey(account: Account): string {
+    return JSON.stringify([account.providerId, account.id])
+  }
+
+  /**
+   * Acquire exactly one provisional slot for the already selected identity.
+   * Called by the HTTP routes synchronously between selection and provider
+   * dispatch. The returned idempotent release belongs to this request only.
+   * This is process-local concurrency protection, not a durable provider
+   * charge or a proof about what an upstream received after a crash.
+   */
+  reserveSelectedAccount(selection: AccountSelection): (() => void) | null {
+    // Use the same provider-scoped account snapshot that account selection
+    // already requires, without introducing a second store lookup contract.
+    const latest = storeManager.getAccountsByProviderId(selection.provider.id)
+      .find(account => account.id === selection.account.id)
+    if (!latest || latest.providerId !== selection.provider.id ||
+        !this.isAccountAvailable(latest)) return null
+    const key = this.accountSlotKey(latest)
+    this.inFlightAccountSlots.set(key, (this.inFlightAccountSlots.get(key) || 0) + 1)
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      const remaining = (this.inFlightAccountSlots.get(key) || 0) - 1
+      if (remaining > 0) this.inFlightAccountSlots.set(key, remaining)
+      else this.inFlightAccountSlots.delete(key)
+    }
+  }
 
   /**
    * Mark account as failed
@@ -93,6 +129,24 @@ export class LoadBalancer {
     return this.selectRoundRobin(candidates)
   }
 
+  /** Check whether the same requested model and explicit pins could be
+   * selected without advancing round-robin state or dispatching a request.
+   * GET /v1/models must not advertise a temporary failover account failure
+   * that POST /v1/chat/completions would deterministically reject. */
+  hasSelectableAccount(
+    model: string,
+    strategy: LoadBalanceStrategy = 'round-robin',
+    preferredProviderId?: string,
+    preferredAccountId?: string
+  ): boolean {
+    const candidates = this.getAvailableAccounts(model, preferredProviderId, strategy === 'failover')
+    if (preferredAccountId) {
+      return candidates.some(candidate =>
+        candidate.account.id === preferredAccountId && !this.isAccountInFailure(preferredAccountId))
+    }
+    return candidates.length > 0
+  }
+
   /**
    * Get available accounts list
    */
@@ -101,6 +155,10 @@ export class LoadBalancer {
     preferredProviderId?: string,
     excludeFailed: boolean = false
   ): AccountSelection[] {
+    // Ambiguous management wildcard mappings cannot become an unpinned raw
+    // model request when getMatchingMapping returns undefined. Fail before
+    // selecting any account or issuing any provider/auth operation.
+    if (modelMapper.hasAmbiguousMatchingMapping(model)) return []
     const providers = storeManager.getProviders().filter(p => p.enabled)
     const candidates: AccountSelection[] = []
 
@@ -136,27 +194,55 @@ export class LoadBalancer {
    */
   private providerSupportsModel(provider: Provider, model: string): boolean {
     const effectiveModels = storeManager.getEffectiveModels(provider.id)
-    const mapping = storeManager.getConfig().modelMappings[model]
+    const mapping = modelMapper.getMatchingMapping(model)
     if (mapping?.preferredProviderId && mapping.preferredProviderId !== provider.id) return false
     // Validate the actual mapped target, not merely the presence of a provider
     // preference or a coincidentally matching public alias.
-    const target = mapping ? mapping.actualModel : model
+    const target = modelMapper.mapModel(model, provider)
     if (typeof target !== 'string' || !target.trim()) return false
     if (effectiveModels.length === 0) {
-      return true
+      // Keep the historical raw-model passthrough for providers without a
+      // catalog, but an explicit exact/wildcard mapping promises a specific
+      // configured wire target. GET /v1/models correctly withholds that alias
+      // without catalog evidence; POST must not dispatch it anyway merely
+      // because this provider has an active account.
+      return mapping === undefined
     }
 
-    const normalizedTarget = target.toLowerCase()
-    return effectiveModels.some(m => {
-      // Wire IDs are preserved exactly. Display aliases retain their existing
-      // case-insensitive and wildcard matching behavior.
-      if (m.actualModelId === target) return true
-      const normalizedSupported = m.displayName.toLowerCase()
-      if (normalizedSupported.endsWith('*')) {
-        return normalizedTarget.startsWith(normalizedSupported.slice(0, -1))
-      }
-      return normalizedSupported === normalizedTarget
+    // Validate against the same effective catalog wire resolver used for
+    // dispatch, not just whether some display wildcard looks plausible.
+    // Equally specific conflicting catalog targets must fail closed.
+    return this.resolveCatalogWireModel(target, effectiveModels) !== null
+  }
+
+  /** Resolve the exact configured wire before any remote effect. A bare
+   * wildcard whose actualModelId is itself the display pattern preserves
+   * historical dynamic passthrough; an explicitly mapped provider wildcard
+   * uses its configured wire ID. Distinct equally specific wire IDs are an
+   * ambiguity, not permission to guess or switch providers. */
+  private resolveCatalogWireModel(target: string, models: EffectiveModel[]): string | null {
+    const exactWire = models.find(model => model.actualModelId === target)
+    if (exactWire) return target
+
+    const normalized = target.toLowerCase()
+    const exactDisplays = models.filter(model =>
+      model.displayName.toLowerCase() === normalized
+    )
+    if (exactDisplays.length > 0) {
+      const wires = new Set(exactDisplays.map(model => model.actualModelId))
+      return wires.size === 1 ? exactDisplays[0].actualModelId : null
+    }
+
+    const wildcards = models.filter(model => {
+      const display = model.displayName.toLowerCase()
+      return display.endsWith('*') && normalized.startsWith(display.slice(0, -1))
     })
+    if (wildcards.length === 0) return null
+    const mostSpecific = Math.max(...wildcards.map(model => model.displayName.length - 1))
+    const wires = new Set(wildcards
+      .filter(model => model.displayName.length - 1 === mostSpecific)
+      .map(model => model.actualModelId === model.displayName ? target : model.actualModelId))
+    return wires.size === 1 ? [...wires][0] : null
   }
 
   /**
@@ -167,7 +253,8 @@ export class LoadBalancer {
       return false
     }
 
-    if (account.dailyLimit && account.todayUsed && account.todayUsed >= account.dailyLimit) {
+    const reserved = this.inFlightAccountSlots.get(this.accountSlotKey(account)) || 0
+    if (account.dailyLimit && (account.todayUsed || 0) + reserved >= account.dailyLimit) {
       return false
     }
 
@@ -180,21 +267,21 @@ export class LoadBalancer {
   private mapModel(model: string, provider: Provider): string {
     console.log(`[LoadBalancer] mapModel called with model="${model}", provider="${provider.name}"`)
 
-    const mapping = storeManager.getConfig().modelMappings[model]
-    const target = mapping && (!mapping.preferredProviderId || mapping.preferredProviderId === provider.id)
-      ? mapping.actualModel : model
+    const target = modelMapper.mapModel(model, provider)
     const effectiveModels = storeManager.getEffectiveModels(provider.id)
-    const effectiveModel = effectiveModels.find(m =>
-      m.actualModelId === target || m.displayName.toLowerCase() === target.toLowerCase()
-    )
+    // Resolve exactly the same catalog target that made this account
+    // selectable, including specific wildcard displays and wire conflicts.
+    const resolvedWireId = this.resolveCatalogWireModel(target, effectiveModels)
+    const effectiveModel = resolvedWireId === null
+      ? undefined : { actualModelId: resolvedWireId }
 
     if (effectiveModel) {
       console.log(`[LoadBalancer] Model mapped from "${model}" to "${effectiveModel.actualModelId}" via effective models`)
       return effectiveModel.actualModelId
     }
 
-    // Only the existing empty-catalog/wildcard passthrough reaches this path
-    // after providerSupportsModel has checked the same mapped target.
+    // Only the existing empty-catalog passthrough reaches this path after
+    // providerSupportsModel has checked all nonempty catalog conflicts.
     return target
   }
 

@@ -133,3 +133,17 @@ test('tool-call metadata cannot conceal an unsupported assistant content part', 
   assert.equal(failure.message, 'Kimi message content is not supported')
   assert.equal(h.calls.length, 0)
 })
+
+test('Kimi direct adapter must reject extra text-part metadata rather than silently remove it', async () => {
+  const h = harness()
+  const failure = await h.adapter.chatCompletion({
+    model: 'k2d6-chat',
+    messages: [{ role: 'user', content: [
+      { type: 'text', text: 'Visible text', provenance: PRIVATE },
+    ] }],
+  }).catch(error => error)
+  assert.equal(failure instanceof Error, true)
+  assert.equal(failure.message, 'Kimi message content is not supported')
+  assert.equal(h.calls.length, 0, 'Unexpected metadata must fail before ChatService POST')
+  assert.equal(inspect({ failure, logs: h.logs }).includes(PRIVATE), false)
+})

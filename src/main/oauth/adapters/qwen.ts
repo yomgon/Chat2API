@@ -6,6 +6,7 @@
 import axios from 'axios'
 import { shell } from 'electron'
 import { BaseOAuthAdapter } from './base'
+import { selectQwenChinaTicket } from '../../providers/qwenTicket'
 import {
   OAuthResult,
   OAuthOptions,
@@ -64,7 +65,7 @@ export class QwenAdapter extends BaseOAuthAdapter {
         error: 'Please log in via browser, extract tongyi_sso_ticket from Developer Tools and enter manually',
       }
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Failed to open browser'
+      const errorMessage = 'Failed to open Qwen China login page'
       this.emitProgress('error', errorMessage)
       
       return {
@@ -101,7 +102,7 @@ export class QwenAdapter extends BaseOAuthAdapter {
         accountInfo: validation.accountInfo,
       }
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error'
+      const errorMessage = 'Qwen China ticket validation failed'
       this.emitProgress('error', `Ticket validation failed: ${errorMessage}`)
       
       return {
@@ -117,12 +118,12 @@ export class QwenAdapter extends BaseOAuthAdapter {
   }
 
   async validateToken(credentials: Record<string, string>): Promise<TokenValidationResult> {
-    const ticket = credentials.ticket || credentials.tongyi_sso_ticket
+    const ticket = selectQwenChinaTicket(credentials)
     
     if (!ticket) {
       return {
         valid: false,
-        error: 'Ticket cannot be empty',
+        error: 'Qwen China ticket validation failed',
       }
     }
     
@@ -146,24 +147,17 @@ export class QwenAdapter extends BaseOAuthAdapter {
             ut: '5b68c267-cd8e-fd0e-148a-18345bc9a104',
           },
           timeout: 15000,
+          maxRedirects: 0,
           validateStatus: () => true,
         }
       )
       
-      if (response.status !== 200) {
-        return {
-          valid: false,
-          error: 'Ticket is invalid or expired',
-        }
-      }
-      
-      const { success, errorCode, errorMsg, data } = response.data
-      
-      if (success === false) {
-        return {
-          valid: false,
-          error: errorMsg || `Validation failed: ${errorCode}`,
-        }
+      const data: unknown = response.data
+      if (response.status !== 200 || !data || typeof data !== 'object' ||
+          Array.isArray(data) ||
+          (data as { success?: unknown }).success !== true ||
+          (data as { error?: unknown }).error != null) {
+        return { valid: false, error: 'Qwen China ticket validation failed' }
       }
       
       return {
@@ -171,12 +165,8 @@ export class QwenAdapter extends BaseOAuthAdapter {
         tokenType: 'cookie',
         accountInfo: {},
       }
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Validation request failed'
-      return {
-        valid: false,
-        error: errorMessage,
-      }
+    } catch {
+      return { valid: false, error: 'Qwen China ticket validation failed' }
     }
   }
 
@@ -185,6 +175,7 @@ export class QwenAdapter extends BaseOAuthAdapter {
   }
 
   async getSessionList(ticket: string): Promise<unknown[] | null> {
+    if (!selectQwenChinaTicket({ ticket })) return null
     try {
       const response = await axios.post(
         `${QWEN_API_BASE}/api/v2/session/page/list`,
@@ -205,6 +196,7 @@ export class QwenAdapter extends BaseOAuthAdapter {
             ut: '5b68c267-cd8e-fd0e-148a-18345bc9a104',
           },
           timeout: 15000,
+          maxRedirects: 0,
           validateStatus: () => true,
         }
       )
@@ -220,7 +212,7 @@ export class QwenAdapter extends BaseOAuthAdapter {
   }
 
   async deleteSession(sessionId: string, ticket: string): Promise<boolean> {
-    if (!sessionId || !ticket) {
+    if (!sessionId || !selectQwenChinaTicket({ ticket })) {
       return false
     }
 
@@ -244,6 +236,7 @@ export class QwenAdapter extends BaseOAuthAdapter {
             ut: '5b68c267-cd8e-fd0e-148a-18345bc9a104',
           },
           timeout: 15000,
+          maxRedirects: 0,
           validateStatus: () => true,
         }
       )

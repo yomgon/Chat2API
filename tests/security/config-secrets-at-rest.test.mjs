@@ -118,20 +118,22 @@ test('roundtrip protects every secret and preserves settings, metadata, and orig
   assert.equal(hasUnprotectedConfigSecrets(decoded), true)
 })
 
-test('legacy migration accepts only the two management formats and UI API key format', () => {
+test('legacy migration accepts GUI and management-issued proxy API keys plus management secrets', () => {
   for (const managementSecret of [
     MANAGEMENT_HEX,
     MANAGEMENT_UUID,
     'mgmt_01234567-89AB-CDEF-0123-456789ABCDEF',
   ]) {
-    const original = fixture([API_KEY], managementSecret)
-    assert.equal(hasUnprotectedConfigSecrets(original), true)
-    const legacy = decodeConfigSecrets(original, () => assert.fail('Plain legacy data needs no decryption'))
-    assert.deepEqual(legacy, original)
-    const os = codec()
-    const encoded = encodeConfigSecrets(legacy, os.encrypt)
-    assert.equal(hasUnprotectedConfigSecrets(encoded), false)
-    assert.deepEqual(decodeConfigSecrets(encoded, os.decrypt), original)
+    for (const key of [API_KEY, MANAGEMENT_HEX]) {
+      const original = fixture([key], managementSecret)
+      assert.equal(hasUnprotectedConfigSecrets(original), true)
+      const legacy = decodeConfigSecrets(original, () => assert.fail('Plain legacy data needs no decryption'))
+      assert.deepEqual(legacy, original)
+      const os = codec()
+      const encoded = encodeConfigSecrets(legacy, os.encrypt)
+      assert.equal(hasUnprotectedConfigSecrets(encoded), false)
+      assert.deepEqual(decodeConfigSecrets(encoded, os.decrypt), original)
+    }
   }
 })
 
@@ -167,7 +169,9 @@ test('already marked ciphertext is not double encrypted and mixed data migrates 
 test('unknown plaintext, wrong field formats, and whitespace are rejected', () => {
   const invalidApiKeys = [
     'plain-secret', 'sk-' + 'a'.repeat(47), 'sk-' + 'a'.repeat(49),
-    'sk-' + '_'.repeat(48), MANAGEMENT_HEX, MANAGEMENT_UUID,
+    'sk-' + '_'.repeat(48), MANAGEMENT_UUID,
+    'sk-mgmt-' + 'a'.repeat(31), 'sk-mgmt-' + 'a'.repeat(33),
+    'sk-mgmt-' + 'z'.repeat(32),
     API_KEY + '\n', ' ' + API_KEY, API_KEY + ' ',
   ]
   const invalidManagementSecrets = [
@@ -250,7 +254,8 @@ test('invalid encryption callback outputs are never returned or stored', () => {
 test('decrypted output must have the correct field type and supported secret format', () => {
   for (const result of [
     undefined, null, 123, {}, new String(API_KEY), 'unknown-plaintext',
-    MANAGEMENT_HEX, MANAGEMENT_UUID, marked('nested'), API_KEY + '\n', Promise.resolve(API_KEY),
+    MANAGEMENT_UUID, 'sk-mgmt-' + 'g'.repeat(32), marked('nested'),
+    API_KEY + '\n', Promise.resolve(API_KEY),
   ]) {
     const original = freezeData(fixture([marked('api-key')], ''))
     expectRedactedError(() => decodeConfigSecrets(original, () => result), DECRYPT_ERROR)

@@ -67,10 +67,9 @@ router.get('/accounts', managementAuthMiddleware, async (ctx: Context) => {
     
     ctx.set('Content-Type', 'application/json')
     ctx.body = createSuccessResponse(maskedAccounts)
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : 'Failed to get accounts'
+  } catch {
     ctx.status = 500
-    ctx.body = createErrorResponse('internal_error', errorMessage)
+    ctx.body = createErrorResponse('internal_error', 'Failed to get accounts')
   }
 })
 
@@ -86,10 +85,9 @@ router.get('/providers/:providerId/accounts', managementAuthMiddleware, async (c
     
     ctx.set('Content-Type', 'application/json')
     ctx.body = createSuccessResponse(maskedAccounts)
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : 'Failed to get accounts by provider'
+  } catch {
     ctx.status = 500
-    ctx.body = createErrorResponse('internal_error', errorMessage)
+    ctx.body = createErrorResponse('internal_error', 'Failed to get accounts by provider')
   }
 })
 
@@ -112,10 +110,9 @@ router.get('/accounts/:id', managementAuthMiddleware, async (ctx: Context) => {
     const maskedAccount = maskCredentials(account)
     ctx.set('Content-Type', 'application/json')
     ctx.body = createSuccessResponse(maskedAccount)
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : 'Failed to get account'
+  } catch {
     ctx.status = 500
-    ctx.body = createErrorResponse('internal_error', errorMessage)
+    ctx.body = createErrorResponse('internal_error', 'Failed to get account')
   }
 })
 
@@ -126,20 +123,25 @@ router.get('/accounts/:id', managementAuthMiddleware, async (ctx: Context) => {
 router.post('/accounts', managementAuthMiddleware, async (ctx: Context) => {
   try {
     const request = ctx.request.body as CreateAccountRequest
+    if (!request || typeof request !== 'object' || Array.isArray(request)) {
+      ctx.status = 400
+      ctx.body = createErrorResponse('invalid_request', 'Request body must be an object')
+      return
+    }
     
-    if (!request.providerId) {
+    if (typeof request.providerId !== 'string' || request.providerId.trim() === '') {
       ctx.status = 400
       ctx.body = createErrorResponse('invalid_request', 'Missing required field: providerId')
       return
     }
     
-    if (!request.name) {
+    if (typeof request.name !== 'string' || request.name.trim() === '') {
       ctx.status = 400
       ctx.body = createErrorResponse('invalid_request', 'Missing required field: name')
       return
     }
     
-    if (!request.credentials || typeof request.credentials !== 'object') {
+    if (!request.credentials || typeof request.credentials !== 'object' || Array.isArray(request.credentials)) {
       ctx.status = 400
       ctx.body = createErrorResponse('invalid_request', 'Missing or invalid required field: credentials')
       return
@@ -160,12 +162,15 @@ router.post('/accounts', managementAuthMiddleware, async (ctx: Context) => {
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Failed to create account'
     
-    if (errorMessage.includes('not found')) {
+    if (errorMessage === 'Use the protected Z.ai account connection flow') {
+      ctx.status = 400
+      ctx.body = createErrorResponse('protected_login_required', 'Use the protected Z.ai account connection flow')
+    } else if (errorMessage.includes('not found')) {
       ctx.status = 404
-      ctx.body = createErrorResponse('provider_not_found', errorMessage)
+      ctx.body = createErrorResponse('provider_not_found', 'Provider not found')
     } else {
       ctx.status = 500
-      ctx.body = createErrorResponse('internal_error', errorMessage)
+      ctx.body = createErrorResponse('internal_error', 'Failed to create account')
     }
   }
 })
@@ -178,6 +183,34 @@ router.put('/accounts/:id', managementAuthMiddleware, async (ctx: Context) => {
   try {
     const id = ctx.params.id
     const request = ctx.request.body as UpdateAccountRequest
+    if (!request || typeof request !== 'object' || Array.isArray(request)) {
+      ctx.status = 400
+      ctx.body = createErrorResponse('invalid_request', 'Request body must be an object')
+      return
+    }
+    if (request.credentials !== undefined &&
+        (!request.credentials || typeof request.credentials !== 'object' || Array.isArray(request.credentials))) {
+      ctx.status = 400
+      ctx.body = createErrorResponse('invalid_request', 'Invalid field: credentials must be an object')
+      return
+    }
+    if (request.name !== undefined &&
+        (typeof request.name !== 'string' || request.name.trim() === '')) {
+      ctx.status = 400
+      ctx.body = createErrorResponse('invalid_request', 'Invalid field: name must be a non-empty string')
+      return
+    }
+    if (request.email !== undefined && typeof request.email !== 'string') {
+      ctx.status = 400
+      ctx.body = createErrorResponse('invalid_request', 'Invalid field: email must be a string')
+      return
+    }
+    if (request.dailyLimit !== undefined &&
+        (!Number.isSafeInteger(request.dailyLimit) || request.dailyLimit < 0)) {
+      ctx.status = 400
+      ctx.body = createErrorResponse('invalid_request', 'Invalid field: dailyLimit must be a non-negative integer')
+      return
+    }
     
     const existingAccount = AccountManager.getById(id, false)
     if (!existingAccount) {
@@ -189,7 +222,7 @@ router.put('/accounts/:id', managementAuthMiddleware, async (ctx: Context) => {
     const updates: Partial<Omit<Account, 'id' | 'createdAt'>> = {}
     
     if (request.name !== undefined) {
-      updates.name = request.name
+      updates.name = request.name.trim()
     }
     
     if (request.email !== undefined) {
@@ -204,7 +237,10 @@ router.put('/accounts/:id', managementAuthMiddleware, async (ctx: Context) => {
       updates.dailyLimit = request.dailyLimit
     }
     
-    const updatedAccount = AccountManager.update(id, updates)
+    // Management HTTP and renderer IPC share the same editable-field and
+    // credential-merge contract. Replacing just a token must not silently
+    // erase associated cookies/refresh aliases or retain unverified active.
+    const updatedAccount = AccountManager.updateEditable(id, updates)
     
     if (!updatedAccount) {
       ctx.status = 500
@@ -216,9 +252,13 @@ router.put('/accounts/:id', managementAuthMiddleware, async (ctx: Context) => {
     ctx.set('Content-Type', 'application/json')
     ctx.body = createSuccessResponse(maskedAccount)
   } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : 'Failed to update account'
-    ctx.status = 500
-    ctx.body = createErrorResponse('internal_error', errorMessage)
+    if (error instanceof Error && error.message === 'Use the protected Z.ai account reconnection flow') {
+      ctx.status = 400
+      ctx.body = createErrorResponse('protected_login_required', 'Use the protected Z.ai account reconnection flow')
+    } else {
+      ctx.status = 500
+      ctx.body = createErrorResponse('internal_error', 'Failed to update account')
+    }
   }
 })
 
@@ -240,10 +280,9 @@ router.delete('/accounts/:id', managementAuthMiddleware, async (ctx: Context) =>
     
     ctx.set('Content-Type', 'application/json')
     ctx.body = createSuccessResponse({ id, deleted: true })
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : 'Failed to delete account'
+  } catch {
     ctx.status = 500
-    ctx.body = createErrorResponse('internal_error', errorMessage)
+    ctx.body = createErrorResponse('internal_error', 'Failed to delete account')
   }
 })
 
@@ -262,14 +301,40 @@ router.post('/accounts/:id/validate', managementAuthMiddleware, async (ctx: Cont
       return
     }
     
-    const validationResult: ValidationResult = await AccountManager.validate(id)
+    const validationResult: ValidationResult = await AccountManager.validate(
+      id,
+      () => ctx.res?.destroyed === true || ctx.req?.aborted === true,
+    )
+
+    if (validationResult.canceled) {
+      // In real HTTP disconnects the response is already gone. This safe
+      // status remains useful for controlled callers without disclosing
+      // credentials or assuming the provider did no work.
+      ctx.status = 409
+      ctx.body = createErrorResponse('account_validation_canceled',
+        'Account validation was canceled before local settlement')
+      return
+    }
+
+    if (validationResult.superseded) {
+      ctx.status = 409
+      ctx.body = createErrorResponse('account_validation_superseded',
+        'Account changed while validation was in progress')
+      return
+    }
+
+    if (validationResult.inProgress) {
+      ctx.status = 409
+      ctx.body = createErrorResponse('account_validation_in_progress',
+        'Account validation already in progress')
+      return
+    }
     
     ctx.set('Content-Type', 'application/json')
     ctx.body = createSuccessResponse(validationResult)
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : 'Failed to validate account'
+  } catch {
     ctx.status = 500
-    ctx.body = createErrorResponse('internal_error', errorMessage)
+    ctx.body = createErrorResponse('internal_error', 'Failed to validate account')
   }
 })
 

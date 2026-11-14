@@ -12,7 +12,7 @@ import { proxyStatusManager } from './status'
 import { storeManager } from '../store/store'
 import { DeepSeekAdapter } from './adapters/deepseek'
 import { DeepSeekStreamHandler } from './adapters/deepseek-stream'
-import { GLMAdapter, GLMStreamHandler } from './adapters/glm'
+import { GLMAdapter, GLMAttachmentInputFailure, GLMAuthPreflightFailure, GLMStreamHandler } from './adapters/glm'
 import { KimiAdapter, KimiProxyFailure, KimiStreamHandler } from './adapters/kimi'
 import { MimoAdapter, MimoStreamHandler } from './adapters/mimo'
 import { QwenAdapter, QwenStreamHandler } from './adapters/qwen'
@@ -53,6 +53,31 @@ function unconfirmedProviderCompletion(latency: number): ForwardResult {
     failureCode: 'provider_completion_unconfirmed',
     latency,
   }
+}
+
+/** A window/token strategy may remove older turns, but it cannot publish an
+ * orphan tool result, leave an unanswered tool call, or erase every user turn.
+ * Check the *processed* list before a generic/custom upstream POST; the Chat
+ * route's original-history validation alone cannot protect a later trim. */
+function hasRepresentableTrimmedContext(messages: ChatCompletionRequest['messages']): boolean {
+  if (!messages.length || !messages.some(message => message.role === 'user')) return false
+  let pending: Set<string> | null = null
+  for (const message of messages) {
+    if (message.role === 'tool') {
+      if (!pending || !message.tool_call_id || !pending.delete(message.tool_call_id)) return false
+      if (pending.size === 0) pending = null
+      continue
+    }
+    if (pending) return false
+    if (message.role === 'assistant' && message.tool_calls !== undefined) {
+      if (!Array.isArray(message.tool_calls) || !message.tool_calls.length) return false
+      const ids = message.tool_calls.map(call => call.id)
+      if (ids.some(id => typeof id !== 'string' || !id.trim()) ||
+          new Set(ids).size !== ids.length) return false
+      pending = new Set(ids)
+    }
+  }
+  return pending === null
 }
 
 type ProviderForwarder = {
@@ -134,6 +159,19 @@ export class RequestForwarder {
     },
   ]
 
+  /** The same ordered, real adapter selector used for an eventual remote
+   * effect must inform the route's capability preflight. A custom provider
+   * pointing at a trusted first-party consumer-web origin can select a web
+   * adapter even though its immutable ID is not one of the six builtin IDs.
+   * Never promise unsupported sampling or message content for that alias. */
+  getConsumerWebProviderId(provider: Provider): string | undefined {
+    const selected = this.providerForwarders.find(forwarder => forwarder.matches(provider))
+    if (selected && ['deepseek', 'qwen', 'glm', 'zai', 'qwen-ai', 'kimi'].includes(selected.name)) {
+      return selected.name
+    }
+    return undefined
+  }
+
   /**
    * Transform request for prompt-based tool calling
    * For models that don't support native function calling
@@ -168,73 +206,44 @@ export class RequestForwarder {
     engine.applyNonStreamResponse(result, transformed.plan)
   }
 
-  /**
-   * Create summary generator function for context management
-   * Uses the current provider and account to generate summaries
-   */
-  private createSummaryGenerator(
-    account: Account,
+  /** Preview a configured summary without creating a second provider effect.
+   * A summary is an independent upstream model call, not a harmless retry.
+   * Signal the caller instead of inventing a completed summary or sending it.
+   * The callback never sees credentials and performs no network operation. */
+  private createSummaryGenerator(markRequired: () => void): SummaryGenerator {
+    return async () => {
+      markRequired()
+      return ''
+    }
+  }
+
+  /** Run the actual configured context strategy with an inert summary probe.
+   * Chat and Legacy call this before reserving account quota; direct forwarder
+   * callers receive the same preflight before any provider request. */
+  async requiresAdditionalSummary(
+    request: ChatCompletionRequest,
     provider: Provider,
-    actualModel: string,
-    context: ProxyContext
-  ): SummaryGenerator {
-    return async (messages: ContextChatMessage[], prompt?: string): Promise<string> => {
-      try {
-        console.log('[SummaryGenerator] Generating summary for', messages.length, 'messages')
+    contextConfig = storeManager.getConfig().contextManagement
+  ): Promise<boolean> {
+    if (!contextConfig?.enabled || !contextConfig.strategies?.summary?.enabled ||
+        !contextConfig.executionOrder?.includes('summary') ||
+        !Array.isArray(request.messages) || request.messages.length === 0 ||
+        this.providerForwarders.some(forwarder => forwarder.matches(provider))) return false
 
-        const summaryPrompt = prompt || 'Please summarize the following conversation concisely, keeping key information and context:'
-
-        const conversationText = messages
-          .map(msg => {
-            const role = msg.role.toUpperCase()
-            const content = typeof msg.content === 'string'
-              ? msg.content
-              : Array.isArray(msg.content)
-                ? msg.content
-                    .filter(part => part.type === 'text' && part.text)
-                    .map(part => part.text)
-                    .join('\n')
-                : ''
-            return `${role}: ${content}`
-          })
-          .join('\n\n')
-
-        const summaryRequest: ChatCompletionRequest = {
-          model: actualModel,
-          messages: [
-            {
-              role: 'system',
-              content: summaryPrompt,
-            },
-            {
-              role: 'user',
-              content: conversationText,
-            },
-          ],
-          stream: false,
-          temperature: 0.3,
-        }
-
-        const result = await this.doForward(
-          summaryRequest,
-          account,
-          provider,
-          actualModel,
-          context
-        )
-
-        if (result.success && result.body) {
-          const summaryContent = result.body.choices?.[0]?.message?.content || ''
-          console.log('[SummaryGenerator] Summary generated successfully, length:', summaryContent.length)
-          return summaryContent
-        }
-
-        console.warn('[SummaryGenerator] Failed to generate summary')
-        return 'Failed to generate conversation summary.'
-      } catch (error) {
-        console.error('[SummaryGenerator] Error generating summary')
-        return 'Failed to generate conversation summary due to an error.'
-      }
+    let summaryRequired = false
+    try {
+      const service = createContextManagementService(
+        contextConfig, this.createSummaryGenerator(() => { summaryRequired = true })
+      )
+      await service.process(request.messages.map(msg => ({
+        role: msg.role as 'user' | 'assistant' | 'system' | 'tool',
+        content: msg.content,
+        timestamp: Date.now(),
+      })))
+      return summaryRequired
+    } catch {
+      // Invalid configured strategy cannot authorize a hidden model call.
+      return true
     }
   }
 
@@ -250,12 +259,27 @@ export class RequestForwarder {
   ): Promise<ForwardResult> {
     const startTime = Date.now()
     const config = storeManager.getConfig()
-    // Every dedicated consumer-web adapter may create a remote conversation
-    // before its completion POST. A timeout, rejection or lost ACK is not an
-    // idempotent operation, irrespective of provider. Do not replay ANY of
-    // these web-session effects, including aliases that match a web adapter.
+    // Both consumer-web and generic/custom POSTs can have effects before a
+    // timeout, rejected response, lost ACK or a 5xx. The configured retryCount
+    // cannot establish idempotency, so do not auto-replay ANY completion.
+    // Keep the consumer-web matcher for the separate context summary boundary.
     const consumerWebAdapter = this.providerForwarders.some(forwarder => forwarder.matches(provider))
-    const maxRetries = consumerWebAdapter ? 0 : config.retryCount
+    const maxRetries = 0
+
+    // Even with retryCount=0, automatic summarization could issue one model
+    // POST followed by the caller's POST. Refuse this hidden extra effect.
+    if (!consumerWebAdapter && await this.requiresAdditionalSummary(
+      request, provider, config.contextManagement
+    )) {
+      return {
+        success: false,
+        status: 400,
+        failureStage: 'auth-preflight',
+        failureCode: 'context_summary_additional_effect_not_allowed',
+        error: 'Automatic context summary requires a separate provider operation',
+        latency: Date.now() - startTime,
+      }
+    }
 
     let lastError: string | undefined
     let lastStatus: number | undefined
@@ -269,18 +293,14 @@ export class RequestForwarder {
 
       let modifiedRequest = request
 
-      // Context summarization can issue an additional independent upstream
-      // model request. Never add such an implicit effect to a stateful
-      // consumer-web chat operation from any dedicated provider.
+      // Local window/token trimming is allowed; no provider-backed summary
+      // generator is ever passed here. The inert probe prevents a race from
+      // turning a newly configured summary into a hidden second POST.
       if (!consumerWebAdapter && config.contextManagement?.enabled &&
           modifiedRequest.messages && modifiedRequest.messages.length > 0) {
         try {
-          const summaryGenerator = this.createSummaryGenerator(
-            account,
-            provider,
-            actualModel,
-            context
-          )
+          let summaryRequired = false
+          const summaryGenerator = this.createSummaryGenerator(() => { summaryRequired = true })
 
           const contextService = createContextManagementService(
             config.contextManagement || {},
@@ -288,15 +308,59 @@ export class RequestForwarder {
           )
 
           const originalCount = modifiedRequest.messages.length
+          // Preserve actual OpenAI history metadata through each local context
+          // strategy. Reconstructing role/content alone silently loses the
+          // assistant tool_calls and matching tool_call_id before the POST.
           const contextMessages: ContextChatMessage[] = modifiedRequest.messages.map(msg => ({
-            role: msg.role as 'user' | 'assistant' | 'system' | 'tool',
-            content: msg.content,
+            ...msg,
             timestamp: Date.now(),
           }))
 
           const processResult = await contextService.process(contextMessages)
 
+          if (summaryRequired) {
+            return {
+              success: false,
+              status: 400,
+              failureStage: 'auth-preflight',
+              failureCode: 'context_summary_additional_effect_not_allowed',
+              error: 'Automatic context summary requires a separate provider operation',
+              latency: Date.now() - startTime,
+            }
+          }
+
           if (processResult.finalCount !== originalCount) {
+            // The existing sliding/token strategies retain original object
+            // references. Reject any move of surviving turns (notably a late
+            // system message shifted ahead of earlier users); the configured
+            // window may remove history, never rearrange its meaning.
+            const positions = new Map(contextMessages.map((message, index) => [message, index]))
+            let previousPosition = -1
+            let orderPreserved = true
+            for (const message of processResult.messages) {
+              const position = positions.get(message)
+              if (position === undefined || position <= previousPosition) {
+                orderPreserved = false
+                break
+              }
+              previousPosition = position
+            }
+            const trimmedMessages = processResult.messages.map(msg => {
+              const { timestamp: _timestamp, ...message } = msg as ContextChatMessage & {
+                timestamp?: number
+              }
+              return message
+            })
+            if (!orderPreserved || !hasRepresentableTrimmedContext(trimmedMessages)) {
+              return {
+                success: false,
+                status: 400,
+                failureStage: 'auth-preflight',
+                failureCode: 'context_history_unrepresentable',
+                error: 'Local context trimming cannot preserve conversation history',
+                latency: Date.now() - startTime,
+              }
+            }
             console.log(
               `[Forwarder] Context management applied: ${originalCount} -> ${processResult.finalCount} messages`
             )
@@ -311,14 +375,21 @@ export class RequestForwarder {
 
             modifiedRequest = {
               ...modifiedRequest,
-              messages: processResult.messages.map(msg => ({
-                role: msg.role,
-                content: msg.content,
-              })),
+              messages: trimmedMessages,
             }
           }
-        } catch (error) {
+        } catch {
           console.error('[Forwarder] Context management failed')
+          // An invalid configured local strategy must not secretly bypass
+          // trimming and send the full original private conversation instead.
+          return {
+            success: false,
+            status: 400,
+            failureStage: 'auth-preflight',
+            failureCode: 'context_strategy_failed',
+            error: 'Configured local context strategy did not complete',
+            latency: Date.now() - startTime,
+          }
         }
       }
 
@@ -453,6 +524,8 @@ export class RequestForwarder {
     actualModel: string,
     startTime: number
   ): Promise<ForwardResult> {
+    let responseAvailable = false
+    let originalResponseBody: { destroy?: () => void } | undefined
     try {
       const transformed = this.transformRequestForPromptToolUse(request, provider)
       const transformedRequest = {
@@ -475,24 +548,22 @@ export class RequestForwarder {
         web_search: transformedRequest.web_search,
         reasoning_effort: transformedRequest.reasoning_effort,
       })
+      responseAvailable = true
+      originalResponseBody = response.data
 
       const latency = Date.now() - startTime
 
-      if (response.status >= 400) {
-        let errorMessage = `HTTP ${response.status}`
-        if (response.data) {
-          if (typeof response.data === 'string') {
-            errorMessage = response.data
-          } else if (response.data.msg) {
-            errorMessage = response.data.msg
-          } else if (response.data.error?.message) {
-            errorMessage = response.data.error.message
-          }
-        }
+      if (response.status !== 200) {
+        // No 3xx/odd 2xx can count as a model answer. A stateful web session
+        // may already have had an effect; do not follow redirects or retry.
+        try { response.data?.destroy?.() } catch { /* local transport only */ }
         return {
           success: false,
-          status: response.status,
-          error: errorMessage,
+          status: Number.isInteger(response.status) && response.status >= 400 && response.status <= 599
+            ? response.status : 502,
+          error: 'Provider completion did not return HTTP 200',
+          failureStage: 'chat-completion',
+          failureCode: 'deepseek_upstream_operation_failed',
           latency,
         }
       }
@@ -551,11 +622,17 @@ export class RequestForwarder {
         latency,
         providerSessionId: sessionId,
       }
-    } catch (error) {
+    } catch {
       const latency = Date.now() - startTime
+      // A decoder or late local failure must release the original transport;
+      // its exception may contain URLs, token material or raw provider data.
+      try { originalResponseBody?.destroy?.() } catch { /* local close only */ }
       return {
         success: false,
-        error: error instanceof Error ? error.message : 'Unknown error',
+        status: 502,
+        error: 'DeepSeek provider operation failed',
+        failureStage: responseAvailable ? 'response-decoding' : 'unclassified',
+        failureCode: 'deepseek_upstream_operation_failed',
         latency,
       }
     }
@@ -571,6 +648,8 @@ export class RequestForwarder {
     actualModel: string,
     startTime: number
   ): Promise<ForwardResult> {
+    let responseAvailable = false
+    let originalResponseBody: { destroy?: () => void } | undefined
     try {
       const transformed = this.transformRequestForPromptToolUse(request, provider)
       const transformedRequest = {
@@ -590,26 +669,23 @@ export class RequestForwarder {
         reasoning_effort: transformedRequest.reasoning_effort,
         deep_research: transformedRequest.deep_research,
       })
+      responseAvailable = true
+      originalResponseBody = response.data
 
       const latency = Date.now() - startTime
 
-      if (response.status >= 400) {
-        let errorMessage = `HTTP ${response.status}`
-        if (response.data) {
-          if (typeof response.data === 'string') {
-            errorMessage = response.data
-          } else if (response.data.msg) {
-            errorMessage = response.data.msg
-          } else if (response.data.message) {
-            errorMessage = response.data.message
-          } else if (response.data.error?.message) {
-            errorMessage = response.data.error.message
-          }
-        }
+      if (response.status !== 200) {
+        try { response.data?.destroy?.() } catch { /* local transport only */ }
         return {
           success: false,
-          status: response.status,
-          error: errorMessage,
+          status: Number.isInteger(response.status) && response.status >= 400 && response.status <= 599
+            ? response.status : 502,
+          error: 'Provider completion did not return HTTP 200',
+          // The adapter returned a concrete completion response, not just a
+          // preflight exception. Preserve this safe phase without exposing
+          // remote headers/body or treating local status as upstream proof.
+          failureStage: 'chat-completion',
+          failureCode: 'glm_upstream_operation_failed',
           latency,
         }
       }
@@ -668,9 +744,25 @@ export class RequestForwarder {
       }
     } catch (error) {
       const latency = Date.now() - startTime
+      // Axios, refresh/upload failures and downstream decoders may carry an
+      // Authorization header, attachment URL or raw provider content in their
+      // error text. Keep only fixed provenance and abort the original body.
+      try { originalResponseBody?.destroy?.() } catch { /* local transport only */ }
+      // Only the adapter's pure, pre-transport attachment validation can
+      // distinguish invalid client input. DNS/download/upload failures may
+      // have remote effects; never reclassify them as a harmless input error.
+      const invalidLocalAttachment = typeof GLMAttachmentInputFailure === 'function' &&
+        error instanceof GLMAttachmentInputFailure
+      const authPreflightFailure = typeof GLMAuthPreflightFailure === 'function' &&
+        error instanceof GLMAuthPreflightFailure
       return {
         success: false,
-        error: error instanceof Error ? error.message : 'Unknown error',
+        status: invalidLocalAttachment ? 400 :
+          (authPreflightFailure ? safeWebErrorStatus(error) ?? 502 : 502),
+        error: invalidLocalAttachment ? 'GLM attachment input is invalid' : 'GLM provider operation failed',
+        failureCode: invalidLocalAttachment ? 'glm_attachment_invalid_input' : 'glm_upstream_operation_failed',
+        failureStage: invalidLocalAttachment || authPreflightFailure ? 'auth-preflight' :
+          (responseAvailable ? 'response-decoding' : 'unclassified'),
         latency,
       }
     }
@@ -787,6 +879,8 @@ export class RequestForwarder {
     actualModel: string,
     startTime: number
   ): Promise<ForwardResult> {
+    let responseAvailable = false
+    let originalResponseBody: { destroy?: () => void } | undefined
     try {
       const transformed = this.transformRequestForPromptToolUse(request, provider)
       const transformedRequest = {
@@ -798,22 +892,28 @@ export class RequestForwarder {
       const adapter = new QwenAdapter(provider, account)
       const { response, sessionId, reqId } = await adapter.chatCompletion({
         model: actualModel,
+        resolvedModelId: true,
         originalModel: request.model,
         messages: transformedRequest.messages as any,
         stream: request.stream,
         temperature: request.temperature,
-        enableThinking: !!request.reasoning_effort,
-        enableWebSearch: !!request.web_search,
+        enableThinking: request.reasoning_effort === undefined ? undefined : !!request.reasoning_effort,
+        enableWebSearch: request.web_search === undefined ? undefined : !!request.web_search,
       })
+      responseAvailable = true
+      originalResponseBody = response.data
 
       const latency = Date.now() - startTime
 
-      if (response.status >= 400) {
-        let errorMessage = `HTTP ${response.status}`
+      if (response.status !== 200) {
+        try { response.data?.destroy?.() } catch { /* local transport only */ }
         return {
           success: false,
-          status: response.status,
-          error: errorMessage,
+          status: Number.isInteger(response.status) && response.status >= 400 && response.status <= 599
+            ? response.status : 502,
+          error: 'Qwen provider operation failed',
+          failureStage: 'chat-completion',
+          failureCode: 'qwen_upstream_operation_failed',
           latency,
         }
       }
@@ -862,11 +962,17 @@ export class RequestForwarder {
         latency,
         providerSessionId: sessionId,
       }
-    } catch (error) {
+    } catch {
       const latency = Date.now() - startTime
+      // Decoder failures can leave a live SSE transport behind. Never expose
+      // a raw Axios exception, token-bearing URL or provider response text.
+      try { originalResponseBody?.destroy?.() } catch { /* local close only */ }
       return {
         success: false,
-        error: error instanceof Error ? error.message : 'Unknown error',
+        status: 502,
+        error: 'Qwen provider operation failed',
+        failureStage: responseAvailable ? 'response-decoding' : 'unclassified',
+        failureCode: 'qwen_upstream_operation_failed',
         latency,
       }
     }
@@ -889,11 +995,12 @@ export class RequestForwarder {
       const adapter = new QwenAiAdapter(provider, account)
       const { response, chatId, parentId } = await adapter.chatCompletion({
         model: actualModel,
+        resolvedModelId: true,
         originalModel: request.model,
         messages: transformed.messages as any,
         stream: request.stream,
         temperature: request.temperature,
-        enable_thinking: !!request.reasoning_effort,
+        enable_thinking: request.reasoning_effort === undefined ? undefined : !!request.reasoning_effort,
       })
       responseAvailable = true
 
@@ -910,7 +1017,10 @@ export class RequestForwarder {
       }
 
       const handler = new QwenAiStreamHandler(actualModel, undefined,
-        request.tool_choice !== 'none')
+        request.tool_choice !== 'none' && transformed.plan.mode !== 'disabled',
+        transformed.plan.shouldParseResponse
+          ? result => this.applyToolCallsToResponse(result, transformed)
+          : undefined)
       handler.setChatId(chatId)
 
       if (request.stream) {
@@ -985,6 +1095,7 @@ export class RequestForwarder {
       const adapter = new ZaiAdapter(provider, account)
       const { response, chatId, requestId } = await adapter.chatCompletion({
         model: actualModel,
+        resolvedModelId: true,
         originalModel: request.model,
         messages: transformed.messages as any,
         stream: request.stream,
@@ -1021,7 +1132,10 @@ export class RequestForwarder {
         : undefined
 
       const handler = new ZaiStreamHandler(actualModel, deleteChatCallback,
-        request.tool_choice !== 'none')
+        request.tool_choice !== 'none' && transformed.plan.mode !== 'disabled',
+        transformed.plan.shouldParseResponse
+          ? result => this.applyToolCallsToResponse(result, transformed)
+          : undefined)
       handler.setChatId(chatId)
       
       if (request.stream === true) {
@@ -1468,6 +1582,21 @@ export class RequestForwarder {
 
     if (request.logit_bias !== undefined) {
       body.logit_bias = request.logit_bias
+    }
+
+    // Generic OpenAI-compatible endpoints may offer native function calling.
+    // Do not silently drop a caller's tool definitions, forced/disabled
+    // choice or parallelism constraint after account selection and a POST.
+    // The six dedicated consumer-web adapters use their own prompt/parse
+    // strategy and never reach this generic wire constructor.
+    if (request.tools !== undefined) {
+      body.tools = request.tools
+    }
+    if (request.tool_choice !== undefined) {
+      body.tool_choice = request.tool_choice
+    }
+    if (request.parallel_tool_calls !== undefined) {
+      body.parallel_tool_calls = request.parallel_tool_calls
     }
 
     if (request.user !== undefined) {

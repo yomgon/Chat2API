@@ -1,5 +1,8 @@
 import axios, { AxiosError } from 'axios'
 import { getBuiltinProvider } from './builtin'
+import { selectQwenChinaTicket } from './qwenTicket'
+import { selectQwenAiToken } from './qwenAiToken'
+import { readZaiTokenIdentity, readZaiSessionClaims } from '../oauth/zaiSession'
 import type { Provider, ProviderCheckResult, Account } from '../../shared/types'
 import type { BuiltinProviderConfig } from '../store/types'
 
@@ -50,12 +53,16 @@ export class ProviderChecker {
         method: 'GET',
         url: checkUrl,
         timeout: CHECK_TIMEOUT,
+        // A mere reachability check must never follow a redirect with
+        // credentials or create more requests than the user requested.
+        maxRedirects: 0,
         validateStatus: () => true,
       })
       
       const latency = Date.now() - startTime
       
-      if (response.status >= 200 && response.status < 500) {
+      if (response.status >= 200 && response.status < 500 &&
+          (response.status < 300 || response.status >= 400)) {
         return {
           providerId: config.id,
           status: 'online',
@@ -88,12 +95,14 @@ export class ProviderChecker {
         url: `${provider.apiEndpoint}/models`,
         headers: provider.headers,
         timeout: CHECK_TIMEOUT,
+        maxRedirects: 0,
         validateStatus: () => true,
       })
       
       const latency = Date.now() - startTime
       
-      if (response.status >= 200 && response.status < 500) {
+      if (response.status >= 200 && response.status < 500 &&
+          (response.status < 300 || response.status >= 400)) {
         return {
           providerId: provider.id,
           status: 'online',
@@ -132,8 +141,27 @@ export class ProviderChecker {
     switch (provider.id) {
       case 'deepseek':
         return this.checkDeepSeekToken(account.credentials.token)
-      case 'glm':
-        return this.checkGLMToken(account.credentials.refresh_token)
+      case 'glm': {
+        const credentials: unknown = account?.credentials
+        if (!credentials || typeof credentials !== 'object' || Array.isArray(credentials)) {
+          return { valid: false, error: 'GLM token validation failed' }
+        }
+        const values = credentials as Record<string, unknown>
+        let selected: string | undefined
+        // Match the consumer adapter; never replace a malformed/conflicting alias.
+        for (const field of ['refresh_token', 'chatglm_refresh_token', 'refreshToken', 'token']) {
+          if (!Object.prototype.hasOwnProperty.call(values, field)) continue
+          const value = values[field]
+          if (typeof value !== 'string' || !/^[\x21-\x7e]+$/.test(value) ||
+              (selected !== undefined && selected !== value)) {
+            return { valid: false, error: 'GLM token validation failed' }
+          }
+          selected = value
+        }
+        return selected === undefined
+          ? { valid: false, error: 'GLM token validation failed' }
+          : this.checkGLMToken(selected)
+      }
       case 'kimi':
         {
           // Manual Kimi login saves accessToken. Match the exact precedence of
@@ -146,10 +174,15 @@ export class ProviderChecker {
           account.credentials.realUserID || '',
           account.credentials.token
         )
-      case 'qwen':
-        return this.checkQwenToken(account.credentials.ticket)
+      case 'qwen': {
+        const ticket = selectQwenChinaTicket(account?.credentials)
+        return ticket ? this.checkQwenToken(ticket)
+          : { valid: false, error: 'Qwen China ticket validation failed' }
+      }
       case 'qwen-ai':
-        return this.checkQwenAiToken(account.credentials.token)
+        return this.checkQwenAiToken(selectQwenAiToken(account?.credentials))
+      case 'zai':
+        return this.checkZaiToken(account?.credentials)
       case 'perplexity':
         return this.checkPerplexityToken(account.credentials.sessionToken || account.credentials.token)
       case 'mimo':
@@ -184,6 +217,9 @@ export class ProviderChecker {
   }
 
   private static async checkDeepSeekToken(token: string): Promise<TokenCheckResult> {
+    if (typeof token !== 'string' || !/^[\x21-\x7e]+$/.test(token)) {
+      return { valid: false, error: 'DeepSeek token validation failed' }
+    }
     try {
       console.log('[DeepSeek] Validating token')
       
@@ -198,6 +234,7 @@ export class ProviderChecker {
             'Referer': 'https://chat.deepseek.com/',
           },
           timeout: CHECK_TIMEOUT,
+          maxRedirects: 0,
           validateStatus: () => true,
         }
       )
@@ -220,19 +257,20 @@ export class ProviderChecker {
         return { valid: false, error: 'Token expired or invalid' }
       }
       
-      return { valid: false, error: `Validation failed: ${response.data?.msg || response.data?.message || JSON.stringify(response.data)}` }
-    } catch (error) {
+      return { valid: false, error: 'DeepSeek token validation failed' }
+    } catch {
       console.error('[DeepSeek] Validation request failed')
       return {
         valid: false,
-        error: error instanceof AxiosError 
-          ? error.message 
-          : 'Connection failed',
+        error: 'DeepSeek token validation failed',
       }
     }
   }
 
   private static async checkGLMToken(refreshToken: string): Promise<TokenCheckResult> {
+    if (typeof refreshToken !== 'string' || !/^[\x21-\x7e]+$/.test(refreshToken)) {
+      return { valid: false, error: 'GLM token validation failed' }
+    }
     try {
       console.log('[GLM] Validating token')
       
@@ -274,13 +312,19 @@ export class ProviderChecker {
             'X-Timestamp': `${sign.timestamp}`,
           },
           timeout: CHECK_TIMEOUT,
+          maxRedirects: 0,
           validateStatus: () => true,
         }
       )
       
       console.log('[GLM] Validation response received')
       
-      if (response.status === 200 && response.data?.result?.access_token) {
+      const result = response.data?.result
+      const isSuccess = response.data?.code === 0 || response.data?.status === 0
+      if (response.status === 200 && isSuccess &&
+          result && typeof result === 'object' && !Array.isArray(result) &&
+          typeof result.access_token === 'string' && /^[\x21-\x7e]+$/.test(result.access_token) &&
+          typeof result.refresh_token === 'string' && /^[\x21-\x7e]+$/.test(result.refresh_token)) {
         return {
           valid: true,
           userInfo: {
@@ -293,14 +337,12 @@ export class ProviderChecker {
         return { valid: false, error: 'Token expired or invalid' }
       }
       
-      return { valid: false, error: `Validation failed: ${response.data?.message || response.data?.msg || JSON.stringify(response.data)}` }
-    } catch (error) {
+      return { valid: false, error: 'GLM token validation failed' }
+    } catch {
       console.error('[GLM] Validation request failed')
       return {
         valid: false,
-        error: error instanceof AxiosError 
-          ? error.message 
-          : 'Connection failed',
+        error: 'GLM token validation failed',
       }
     }
   }
@@ -501,6 +543,8 @@ export class ProviderChecker {
   }
 
   private static async checkQwenToken(ticket: string): Promise<TokenCheckResult> {
+    const invalid = (): TokenCheckResult => ({ valid: false, error: 'Qwen China ticket validation failed' })
+    if (!selectQwenChinaTicket({ ticket })) return invalid()
     try {
       const response = await axios.post(
         'https://chat2-api.qianwen.com/api/v2/session/page/list',
@@ -524,32 +568,85 @@ export class ProviderChecker {
             ut: '5b68c267-cd8e-fd0e-148a-18345bc9a104',
           },
           timeout: CHECK_TIMEOUT,
+          maxRedirects: 0,
           validateStatus: () => true,
         }
       )
       
-      if (response.status === 200 && response.data?.success) {
+      if (response.status === 200 && response.data &&
+          typeof response.data === 'object' && !Array.isArray(response.data) &&
+          response.data.success === true && response.data.error == null) {
         return {
           valid: true,
         }
       }
-      
-      if (!response.data?.success) {
-        return { valid: false, error: 'SSO ticket expired or invalid' }
-      }
-      
-      return { valid: false, error: `Validation failed: ${response.data?.errorMsg || 'Unknown error'}` }
-    } catch (error) {
-      return {
-        valid: false,
-        error: error instanceof AxiosError 
-          ? error.message 
-          : 'Connection failed',
-      }
+      return invalid()
+    } catch {
+      // A transport exception may embed the Cookie, URL or upstream body.
+      return invalid()
     }
   }
 
-  private static async checkQwenAiToken(token: string): Promise<TokenCheckResult> {
+  /** A successful generic /settings HTTP 200 is reachability, not proof that
+   * this stored Z.ai JWT belongs to the current first-party account. Verify
+   * the exact subject (including no-exp JWTs) against the established official
+   * /auths/ endpoint before reporting a valid account. Read-only, once only:
+   * never refresh/rewrite, redirect, retry, or accept an unrelated subject. */
+  private static async checkZaiToken(credentials: unknown): Promise<TokenCheckResult> {
+    const invalid = (): TokenCheckResult => ({ valid: false, error: 'Z.ai session identity verification failed' })
+    if (!credentials || typeof credentials !== 'object' || Array.isArray(credentials)) return invalid()
+    const fields = credentials as Record<string, unknown>
+    let token: unknown
+    for (const key of ['token', 'accessToken', 'jwt']) {
+      const candidate = fields[key]
+      if (candidate === undefined || candidate === null || candidate === '') continue
+      token = candidate
+      break
+    }
+    const identity = readZaiTokenIdentity(token)
+    if (!identity || (identity.expiryKnown && !readZaiSessionClaims(token)?.usable)) return invalid()
+    try {
+      const response = await axios.get('https://chat.z.ai/api/v1/auths/', {
+        headers: {
+          Accept: 'application/json',
+          Authorization: `Bearer ${token}`,
+          Cookie: `token=${token}`,
+          Origin: 'https://chat.z.ai',
+          Referer: 'https://chat.z.ai/',
+        },
+        timeout: 12000,
+        maxRedirects: 0,
+        maxContentLength: 64 * 1024,
+        responseType: 'json',
+        validateStatus: () => true,
+      })
+      const contentType = response.headers?.['content-type']
+      const body: unknown = response.data
+      if (response.status !== 200 || typeof contentType !== 'string' ||
+          !/^application\/(?:[\w.+-]+\+)?json(?:\s*;|$)/i.test(contentType) ||
+          !body || typeof body !== 'object' || Array.isArray(body)) return invalid()
+      const user = body as Record<string, unknown>
+      if (user.id !== identity.subject || user.error != null ||
+          (Object.hasOwn(user, 'success') && user.success !== true)) return invalid()
+      if (Object.hasOwn(user, 'token')) {
+        const rotated = readZaiTokenIdentity(user.token)
+        if (!rotated || rotated.subject !== identity.subject ||
+            (rotated.expiryKnown && !readZaiSessionClaims(user.token)?.usable)) return invalid()
+      }
+      return { valid: true }
+    } catch {
+      // Axios exceptions may contain URL, Authorization, Cookie, or response.
+      return invalid()
+    }
+  }
+
+  private static async checkQwenAiToken(token: unknown): Promise<TokenCheckResult> {
+    const invalid = (): TokenCheckResult => ({ valid: false, error: 'Qwen AI token validation failed' })
+    // Match the proxy's opaque header-token boundary without inferring a JWT.
+    if (typeof token !== 'string' || !/^[\x21-\x7e]+$/.test(token)) return invalid()
+    const isRecord = (value: unknown): value is Record<string, unknown> =>
+      value !== null && typeof value === 'object' && !Array.isArray(value)
+
     try {
       const response = await axios.get(
         'https://chat.qwen.ai/api/v2/user',
@@ -561,32 +658,33 @@ export class ProviderChecker {
             source: 'web',
           },
           timeout: CHECK_TIMEOUT,
+          maxRedirects: 0,
           validateStatus: () => true,
         }
       )
 
-      if (response.status === 200 && response.data?.data) {
-        return {
-          valid: true,
-          userInfo: {
-            name: response.data.data.name || response.data.data.email,
-            email: response.data.data.email,
-          },
-        }
+      const body: unknown = response.data
+      // Keep the existing /user response with omitted success compatible.
+      // A supplied failure/error or guest record cannot authenticate an account.
+      if (response.status !== 200 || !isRecord(body) || body.error != null ||
+          (Object.prototype.hasOwnProperty.call(body, 'success') && body.success !== true)) {
+        return invalid()
       }
-
-      if (response.status === 401) {
-        return { valid: false, error: 'Token expired or invalid' }
+      const user = body.data
+      if (!isRecord(user) || Object.keys(user).length === 0 || user.error != null ||
+          (Object.prototype.hasOwnProperty.call(user, 'is_guest') && user.is_guest !== false)) {
+        return invalid()
       }
-
-      return { valid: false, error: `Validation failed: HTTP ${response.status}` }
-    } catch (error) {
+      const email = typeof user.email === 'string' ? user.email : ''
+      if (email.trim().toLowerCase().endsWith('@guest.com')) return invalid()
+      const name = typeof user.name === 'string' ? user.name : ''
       return {
-        valid: false,
-        error: error instanceof AxiosError
-          ? error.message
-          : 'Connection failed',
+        valid: true,
+        userInfo: { name: name || email, email },
       }
+    } catch {
+      // Axios errors can contain credential-bearing URLs, headers or bodies.
+      return invalid()
     }
   }
 

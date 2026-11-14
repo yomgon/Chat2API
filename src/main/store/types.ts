@@ -119,6 +119,9 @@ export interface Account {
   dailyLimit?: number
   /** Today used count */
   todayUsed?: number
+  /** Local calendar day YYYY-MM-DD to which todayUsed belongs.
+   * Absent on old stored accounts; lastUsed is the conservative legacy anchor. */
+  usageDay?: string
 }
 
 /**
@@ -578,6 +581,13 @@ export interface ValidationResult {
   error?: string
   /** Validation time */
   validatedAt: number
+  /** In-flight validation was invalidated by a local account mutation.
+   * Do not auto-retry external validation or alter the replacement row. */
+  superseded?: boolean
+  /** A second validation was refused before contacting the same provider. */
+  inProgress?: boolean
+  /** Canceled local caller: do not commit a late provider validation result. */
+  canceled?: boolean
   /** Account info (returned when validation succeeds) */
   accountInfo?: {
     name?: string

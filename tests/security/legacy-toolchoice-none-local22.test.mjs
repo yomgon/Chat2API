@@ -7,6 +7,7 @@ import * as zlib from 'node:zlib'
 import { createRequire } from 'node:module'
 import vm from 'node:vm'
 import ts from 'typescript'
+import { QWEN_TICKET_MODULE } from './helpers/qwenTicketModule.mjs'
 
 // Tests the real four legacy dedicated nonstream decoders with the real
 // bracket-style tool parser. No Electron/profile/account/HTTP/remote effects.
@@ -41,6 +42,7 @@ const parser = evaluate(loadCode('src/main/proxy/utils/toolParser.ts'), {}, 'too
 const optionModule = evaluate(loadCode('src/main/proxy/adapters/providerModelOptions.ts'),
   {}, 'providerModelOptions.ts')
 const common = {
+  '../../providers/qwenTicket': QWEN_TICKET_MODULE,
   axios: { __esModule: true, default: {
     get: forbidden, post: forbidden, delete: forbidden,
     create: () => ({ get: forbidden, post: forbidden, request: forbidden }),

@@ -59,7 +59,7 @@ export function TokenInput({
             variant="ghost"
             size="sm"
             className="h-6 px-2 text-xs text-muted-foreground hover:text-foreground"
-            onClick={() => window.electronAPI?.invoke('app:openExternal', helpUrl)}
+            onClick={() => { void window.electronAPI?.app?.openExternal(helpUrl) }}
           >
             <HelpCircle className="mr-1 h-3 w-3" />
             {t('oauth.help')}

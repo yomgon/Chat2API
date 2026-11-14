@@ -202,7 +202,7 @@ test('upstream error, early close, completion without answer and timeout do not 
 })
 
 test('Z.ai replay/failover protections are explicit in production routing', () => {
-  assert.match(source('src/main/proxy/forwarder.ts'), /const maxRetries = consumerWebAdapter \? 0 : config\.retryCount/)
+  assert.match(source('src/main/proxy/forwarder.ts'), /const maxRetries = 0/)
   assert.match(source('src/main/proxy/loadbalancer.ts'), /if \(preferredProviderId === 'zai'\) return null/)
   assert.match(source(proxyPath), /title_generation: false/)
   assert.match(source(proxyPath), /readZaiSessionClaims\(token\)/)

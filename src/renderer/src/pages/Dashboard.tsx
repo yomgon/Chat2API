@@ -67,16 +67,22 @@ export function Dashboard() {
     if (!window.electronAPI?.proxy) return
     
     try {
+      let committed = false
       if (proxyStatus?.isRunning) {
-        await window.electronAPI.proxy.stop()
-        setProxyEnabled(false)
+        committed = await window.electronAPI.proxy.stop()
       } else {
-        await window.electronAPI.proxy.start()
-        setProxyEnabled(true)
+        committed = await window.electronAPI.proxy.start()
       }
-      refreshData()
+      // An occupied port, unavailable listener or rejected native start/stop
+      // returns false without throwing. Never advertise the opposite running
+      // state until the main process confirms the transition.
+      if (committed === true) setProxyEnabled(!proxyStatus?.isRunning)
+      await refreshData()
     } catch (err) {
       console.error('Failed to toggle proxy:')
+      // The operation may have committed before a later read failed; the
+      // authoritative status read does not send any extra provider request.
+      try { await refreshData() } catch {}
     }
   }, [proxyStatus, setProxyEnabled, refreshData])
 

@@ -58,3 +58,9 @@ src/renderer/next-app/
 
 # Backup
 backup/
+package.pre-electron-upgrade.json
+package-lock.pre-electron-upgrade.json
+
+# Private local smoke profiles and transient security audits
+.smoke-test-private*/
+audit-production.json

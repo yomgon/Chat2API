@@ -41,7 +41,15 @@ class SessionManagerClass {
     const CLEANUP_INTERVAL_MS = 60 * 1000
     
     this.cleanupInterval = setInterval(() => {
-      this.cleanExpiredSessions()
+      try {
+        this.cleanExpiredSessions()
+      } catch {
+        // Storage refusal is not a successful session deletion and must not
+        // escape a timer callback into the Electron main process. Preserve
+        // stored sessions and allow the next normal scheduled cleanup tick.
+        // Do not print potentially sensitive storage exception details.
+        console.error('[SessionManager] Session cleanup failed; stored sessions were not confirmed deleted')
+      }
     }, CLEANUP_INTERVAL_MS)
     
     console.log('[SessionManager] Cleanup scheduler started, interval: 1 minute')

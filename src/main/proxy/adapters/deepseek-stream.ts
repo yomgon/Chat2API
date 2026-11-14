@@ -198,12 +198,28 @@ export class DeepSeekStreamHandler {
     let buffer = ''
     let sawDone = false
     let failed = false
+    let completed = false
+    const releaseRaw = () => {
+      // This adapter owns the original HTTP response stream. Closing a
+      // normalized downstream alone cannot leave the original body alive.
+      const raw = stream as NodeJS.ReadableStream & { destroy?: () => void; destroyed?: boolean }
+      try { if (typeof raw.destroy === 'function' && !raw.destroyed) raw.destroy() } catch { /* local only */ }
+    }
     const fail = () => {
-      if (failed || this.isDone) return
+      if (failed || completed) return
       failed = true
       // A transport failure is never an assistant response or normal [DONE].
       transStream.end('data: {"error":{"code":"deepseek_response_incomplete","type":"api_error"}}\n\n')
+      releaseRaw()
     }
+    transStream.once('close', () => {
+      // A client can cancel after provider [DONE] but before raw EOF.
+      // In that case no late source 'end' may trigger onEnd/cleanup.
+      if (!completed && !failed) {
+        failed = true
+        releaseRaw()
+      }
+    })
 
     stream.on('data', (chunk: Buffer) => {
       if (failed || this.isDone) return
@@ -241,10 +257,12 @@ export class DeepSeekStreamHandler {
     })
 
     stream.on('end', () => {
-      if (failed || this.isDone) return
+      if (failed || this.isDone || transStream.destroyed) return
       try {
         if (decoder.decode() || buffer.trim() || !sawDone) { fail(); return }
+        if (failed || transStream.destroyed) return
         this.handleDone(transStream, isFoldModel, isSearchSilentModel)
+        completed = true
       } catch {
         fail()
       }
@@ -648,7 +666,7 @@ export class DeepSeekStreamHandler {
         }
         // Parse tool calls from accumulated content
         const { content: cleanContent, toolCalls } =
-          (this.toolCallingPlan?.toolChoiceMode === 'none' || this.toolCallingPlan?.shouldParseResponse)
+          (this.toolCallingPlan?.mode === 'disabled' || this.toolCallingPlan?.toolChoiceMode === 'none' || this.toolCallingPlan?.shouldParseResponse)
           ? { content: accumulatedContent, toolCalls: [] }
           : parseToolCallsFromText(accumulatedContent)
         const citations = isSearchSilentModel

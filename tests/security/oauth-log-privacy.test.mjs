@@ -7,6 +7,9 @@ import vm from 'node:vm'
 import crypto from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import ts from 'typescript'
+import { QWEN_TICKET_MODULE } from './helpers/qwenTicketModule.mjs'
+import { QWEN_AI_TOKEN_MODULE } from './helpers/qwenAiTokenModule.mjs'
+import { ZAI_SESSION_MODULE } from './helpers/zaiSessionModule.mjs'
 
 const root = fileURLToPath(new URL('../../', import.meta.url))
 const inAppFile = 'src/main/oauth/inAppLogin.ts'
@@ -120,6 +123,10 @@ function harness(options = {}) {
     request: dispatch,
   })
   const dependencies = {
+    '../../providers/qwenTicket': QWEN_TICKET_MODULE,
+    './qwenTicket': QWEN_TICKET_MODULE,
+    './qwenAiToken': QWEN_AI_TOKEN_MODULE,
+    '../oauth/zaiSession': ZAI_SESSION_MODULE,
     axios: { __esModule: true, default: axios, AxiosError: FakeAxiosError },
     crypto,
     events: { EventEmitter },
@@ -409,8 +416,9 @@ for (const fixture of adapterCases) {
         const result = await new Adapter({}).validateToken(fixture.credentials)
         assert.equal(result.valid, false)
         if (failure === 'exception') {
-          if (fixture.name === 'GLM') {
-            assert.equal(result.error, 'GLM token validation request failed')
+          if (fixture.name === 'GLM' || fixture.name === 'DeepSeek') {
+            assert.equal(result.error, fixture.name === 'GLM'
+              ? 'GLM token validation request failed' : 'DeepSeek token validation failed')
             assert.equal(result.error.includes(accessToken), false)
             assert.equal(result.error.includes(refreshToken), false)
           } else {
@@ -512,13 +520,13 @@ test('Kimi OAuth validation uses the selected proxy credential, accepts legacy f
   }
 })
 
-test('DeepSeek browser failure preserves the error result without logging its URL', async () => {
+test('DeepSeek browser failure returns fixed error without exposing its URL', async () => {
   const error = sensitiveError()
   const h = harness({ electron: { shell: { openExternal: async () => { throw error } } } })
   const { DeepSeekAdapter } = h.load(adapterDir + 'deepseek.ts')
   const result = await new DeepSeekAdapter({}).startLogin({ providerId: 'deepseek' })
   assert.equal(result.success, false)
-  assert.equal(result.error, error.message)
+  assert.equal(result.error, 'Failed to open DeepSeek login page')
   h.assertPrivate()
 })
 
@@ -540,7 +548,7 @@ for (const [label, mockResponse, expected] of [
 
 const checkerCases = [
   ['deepseek', { code: 0, data: { biz_data: { id_profile: { name: userName }, email } } }],
-  ['glm', { result: { ...sensitiveData, user: { name: userName } } }],
+  ['glm', { code: 0, result: { ...sensitiveData, user: { name: userName } } }],
   ['kimi', { subscription: { userName } }],
   ['minimax', { data: { deviceIDStr: 'device_canary', userInfo: { name: userName, email } } }],
 ]
@@ -555,12 +563,18 @@ for (const [providerId, successData] of checkerCases) {
       const { ProviderChecker } = h.load(checkerFile)
       const result = await ProviderChecker.checkAccountToken(
         { id: providerId, type: 'builtin' },
-        { credentials: { token: jwt, refresh_token: refreshToken } },
+        // The GLM checker refuses conflicting refresh aliases; unlike other
+        // providers, its valid account uses only the actual refresh key.
+        { credentials: providerId === 'glm'
+          ? { refresh_token: refreshToken }
+          : { token: jwt, refresh_token: refreshToken } },
       )
       assert.equal(result.valid, outcome === 'success')
       if (outcome === 'success') assert.equal(result.userInfo.name, userName)
       if (outcome === 'exception') assert.equal(result.error,
-        providerId === 'kimi' ? 'Kimi token validation failed' : error.message)
+        providerId === 'deepseek' ? 'DeepSeek token validation failed'
+          : providerId === 'kimi' ? 'Kimi token validation failed'
+          : providerId === 'glm' ? 'GLM token validation failed' : error.message)
       assert.equal(h.requests.length, 1)
       const headers = h.requests[0].headers
       if (providerId === 'minimax') assert.equal(headers.token, jwt)

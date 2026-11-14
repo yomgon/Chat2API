@@ -11,7 +11,6 @@ import { PassThrough } from 'stream'
 import { createParser } from 'eventsource-parser'
 import FormData from 'form-data'
 import mime from 'mime-types'
-import path from 'path'
 import { toolsToSystemPrompt, TOOL_WRAP_HINT, hasToolPromptInjected } from '../utils/tools'
 import { parseToolCallsFromText } from '../utils/toolParser'
 import { 
@@ -26,6 +25,124 @@ const DEFAULT_ASSISTANT_ID = '65940acff94777010aa6b796'
 const SIGN_SECRET = '8a1317a7468aa3ad86e997d08f3f31cb'
 const ACCESS_TOKEN_EXPIRES = 3600
 const FILE_MAX_SIZE = 100 * 1024 * 1024 // 100MB
+// Local resource limits, not claims about an undocumented provider contract.
+const ATTACHMENT_MAX_COUNT = 8
+const ATTACHMENT_URL_MAX_LENGTH = 8192
+const ATTACHMENT_DNS_TIMEOUT = 15000
+
+type AttachmentKind = 'file' | 'image'
+type AttachmentAddress = { address: string; family: 4 | 6 }
+type AttachmentSource =
+  | { kind: AttachmentKind; type: 'data'; encoded: string; mimeType: string; size: number }
+  | { kind: AttachmentKind; type: 'https'; url: URL; hostname: string; literal?: AttachmentAddress }
+type PreparedAttachment = { kind: AttachmentKind; data: Buffer; mimeType: string }
+
+/** Only thrown by the complete, pure preflight before DNS or any transport. */
+export class GLMAttachmentInputFailure extends Error {
+  constructor() {
+    super('GLM attachment input is invalid')
+    this.name = 'GLMAttachmentInputFailure'
+  }
+}
+
+/** Fixed private-free auth failure, with only a bounded observed HTTP status. */
+export class GLMAuthPreflightFailure extends Error {
+  readonly upstreamStatus?: number
+
+  constructor(message: string, observedStatus?: unknown) {
+    super(message)
+    this.name = 'GLMAuthPreflightFailure'
+    if (Number.isInteger(observedStatus) &&
+        (observedStatus as number) >= 100 && (observedStatus as number) <= 599) {
+      this.upstreamStatus = observedStatus as number
+    }
+  }
+}
+
+function attachmentFailure(): Error {
+  return new Error('GLM attachment processing failed')
+}
+
+function isAttachmentMimeType(value: string): boolean {
+  return value.length <= 128 && /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/i.test(value)
+}
+
+/** Accept only global addresses; mapped, local and transition IPv6 are excluded. */
+function publicAttachmentAddress(value: unknown): AttachmentAddress | undefined {
+  if (typeof value !== 'string' || value.length > 64) return undefined
+  if (/^(?:0|[1-9]\d{0,2})(?:\.(?:0|[1-9]\d{0,2})){3}$/.test(value)) {
+    const [a, b, c, d] = value.split('.').map(Number)
+    if ([a, b, c, d].some(n => n > 255) || a === 0 || a === 10 || a === 127 || a >= 224 ||
+        (a === 100 && b >= 64 && b <= 127) || (a === 169 && b === 254) ||
+        (a === 172 && b >= 16 && b <= 31) ||
+        (a === 192 && (b === 168 || (b === 0 && (c === 0 || c === 2)) || (b === 88 && c === 99))) ||
+        (a === 198 && (b === 18 || b === 19 || (b === 51 && c === 100))) ||
+        (a === 203 && b === 0 && c === 113)) return undefined
+    return { address: value, family: 4 }
+  }
+  if (!value.includes(':') || !/^[a-f0-9:.]+$/i.test(value)) return undefined
+  try {
+    const address = new URL(`https://[${value}]/`).hostname.slice(1, -1)
+    const [first, second] = address.split(':').map(part => parseInt(part || '0', 16))
+    if (first < 0x2000 || first > 0x3fff || first === 0x2002 || first === 0x3ffe || first === 0x3fff ||
+        (first === 0x2001 && (second < 0x0200 || second === 0x0db8))) return undefined
+    return { address, family: 6 }
+  } catch { return undefined }
+}
+
+function parseAttachmentSource(kind: AttachmentKind, value: string): AttachmentSource {
+  if (value.slice(0, 5).toLowerCase() === 'data:') {
+    const comma = value.indexOf(',')
+    if (comma < 0 || comma > 1024) throw attachmentFailure()
+    const metadata = value.slice(5, comma).split(';')
+    if (metadata.length < 2) throw attachmentFailure()
+    const encoding = metadata.pop()?.toLowerCase()
+    const mimeType = (metadata.shift() || 'application/octet-stream').toLowerCase()
+    if (encoding !== 'base64' || !isAttachmentMimeType(mimeType) ||
+        metadata.some(param => !/^[a-z0-9!#$&^_.+-]+=[a-z0-9!#$&^_.+%-]+$/i.test(param))) {
+      throw attachmentFailure()
+    }
+    const encoded = value.slice(comma + 1)
+    if (!encoded.length || encoded.length > 4 * Math.ceil(FILE_MAX_SIZE / 3) ||
+        encoded.length % 4 !== 0 || !/^[a-z0-9+/]+={0,2}$/i.test(encoded)) throw attachmentFailure()
+    const padding = encoded.endsWith('==') ? 2 : encoded.endsWith('=') ? 1 : 0
+    const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+    const finalValue = alphabet.indexOf(encoded[encoded.length - padding - 1])
+    if ((padding === 2 && (finalValue & 15) !== 0) || (padding === 1 && (finalValue & 3) !== 0)) {
+      throw attachmentFailure()
+    }
+    const size = encoded.length / 4 * 3 - padding
+    if (size < 1 || size > FILE_MAX_SIZE) throw attachmentFailure()
+    return { kind, type: 'data', encoded, mimeType, size }
+  }
+  if (!value.length || value.length > ATTACHMENT_URL_MAX_LENGTH || /[\s\\\u0000-\u001f\u007f]/.test(value)) {
+    throw attachmentFailure()
+  }
+  const url = new URL(value)
+  if (url.protocol !== 'https:' || url.username || url.password || url.hash || url.port === '0') {
+    throw attachmentFailure()
+  }
+  const hostname = url.hostname.replace(/^\[|\]$/g, '').toLowerCase()
+  const literal = publicAttachmentAddress(hostname)
+  const authority = /^https:\/\/([^/?#]+)/i.exec(value)?.[1]
+  if (!authority || authority.includes('@')) throw attachmentFailure()
+  const rawHost = authority?.startsWith('[') ? authority.slice(1, authority.indexOf(']')) : authority?.split(':')[0]
+  if (!rawHost) throw attachmentFailure()
+  if (hostname.includes(':') || /^\d+(?:\.\d+){3}$/.test(hostname)) {
+    if (!literal || (literal.family === 4 && rawHost !== hostname)) throw attachmentFailure()
+  } else {
+    const labels = hostname.split('.')
+    const suffix = labels.at(-1) || ''
+    if (rawHost.toLowerCase() !== hostname || hostname.length > 253 || labels.length < 2 ||
+        !labels.every(label => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label)) ||
+        !/^(?:[a-z]{2,63}|xn--[a-z0-9-]+)$/.test(suffix) ||
+        ['localhost', 'local', 'localdomain', 'lan', 'internal', 'intranet', 'corp', 'home',
+          'private', 'arpa', 'onion', 'alt', 'test', 'invalid', 'example'].includes(suffix)) {
+      throw attachmentFailure()
+    }
+  }
+  return { kind, type: 'https', url, hostname, literal }
+}
 
 const FAKE_HEADERS = {
   Accept: 'text/event-stream',
@@ -115,8 +232,25 @@ export class GLMAdapter {
   }
 
   private getRefreshToken(): string {
-    const credentials = this.account.credentials
-    return credentials.refresh_token || credentials.token || ''
+    const credentials: unknown = this.account.credentials
+    if (!credentials || typeof credentials !== 'object' || Array.isArray(credentials)) {
+      throw new Error('GLM credentials are invalid')
+    }
+    const values = credentials as Record<string, unknown>
+    let selected: string | undefined
+    // OAuth, browser capture and manual accounts use different refresh aliases.
+    // A malformed or conflicting alias must never select a different identity.
+    for (const field of ['refresh_token', 'chatglm_refresh_token', 'refreshToken', 'token']) {
+      if (!Object.prototype.hasOwnProperty.call(values, field)) continue
+      const value = values[field]
+      if (typeof value !== 'string' || !/^[\x21-\x7e]+$/.test(value) ||
+          (selected !== undefined && selected !== value)) {
+        throw new Error('GLM credentials are invalid')
+      }
+      selected = value
+    }
+    if (selected === undefined) throw new Error('GLM credentials are invalid')
+    return selected
   }
 
   private async acquireToken(): Promise<string> {
@@ -125,6 +259,9 @@ export class GLMAdapter {
     if (cached && Date.now() < cached.expiresAt) {
       return cached.accessToken
     }
+
+    const failure = (message: string, observedStatus?: unknown): GLMAuthPreflightFailure =>
+      new GLMAuthPreflightFailure(message, observedStatus)
 
     console.log('[GLM] Refreshing Token...')
     const sign = generateSign()
@@ -142,119 +279,243 @@ export class GLMAdapter {
           'X-Timestamp': sign.timestamp,
         },
         timeout: 15000,
+        maxRedirects: 0,
         validateStatus: () => true,
       }
-    )
+    ).catch((error: unknown) => {
+      const status = error && typeof error === 'object'
+        ? (error as { response?: { status?: unknown } }).response?.status : undefined
+      throw failure('GLM token refresh failed', status)
+    })
 
     console.log('[GLM] Token response received')
-    const { code, status, message } = response.data || {}
+    const { code, status } = response.data || {}
     const isSuccess = code === 0 || status === 0
     if (response.status !== 200 || !isSuccess) {
-      const errorMsg = message || `HTTP ${response.status}`
-      throw new Error(`Token refresh failed: ${errorMsg}`)
+      throw failure('GLM token refresh failed', response.status)
     }
 
-    const { access_token, refresh_token } = response.data.result
+    const result = response.data?.result
+    if (!result || typeof result !== 'object' || Array.isArray(result) ||
+        typeof result.access_token !== 'string' || !/^[\x21-\x7e]+$/.test(result.access_token) ||
+        typeof result.refresh_token !== 'string' || !/^[\x21-\x7e]+$/.test(result.refresh_token)) {
+      throw failure('GLM token refresh response is invalid', response.status)
+    }
+    const { access_token, refresh_token } = result
     const tokenInfo: TokenInfo = {
       accessToken: access_token,
       refreshToken: refresh_token,
       expiresAt: Date.now() + ACCESS_TOKEN_EXPIRES * 1000,
     }
-    tokenCache.set(refreshToken, tokenInfo)
 
     if (refresh_token !== refreshToken) {
       console.log('[GLM] Token updated, saving new token')
-      const decryptedCredentials = {
-        refresh_token,
+      try {
+        // Refresh can rotate a stateful login. Never replace the complete
+        // credentials object with one refresh_token: that discards the OAuth
+        // refreshToken/accessToken pair and legacy browser aliases, breaking
+        // later validation, manual reconnect and persisted account settings.
+        // Also recheck the originally selected row after the awaited provider
+        // effect: a concurrent login/edit must not be overwritten by a stale
+        // rotation response. The check and store write are synchronous.
+        const current = storeManager.getAccountById(this.account.id, true)
+        const original = this.account
+        const originalKeys = Object.keys(original.credentials || {})
+        const currentKeys = Object.keys(current?.credentials || {})
+        if (!current || current.providerId !== original.providerId ||
+            current.id !== original.id ||
+            current.createdAt !== original.createdAt ||
+            current.updatedAt !== original.updatedAt ||
+            current.status !== original.status ||
+            originalKeys.length !== currentKeys.length ||
+            originalKeys.some(key =>
+              !Object.prototype.hasOwnProperty.call(current.credentials, key) ||
+              current.credentials[key] !== original.credentials[key])) {
+          throw new Error('GLM account changed during token rotation')
+        }
+        const rotatedCredentials: Record<string, string> = {
+          ...current.credentials,
+          refresh_token,
+        }
+        for (const alias of ['chatglm_refresh_token', 'refreshToken', 'token']) {
+          if (Object.prototype.hasOwnProperty.call(rotatedCredentials, alias)) {
+            rotatedCredentials[alias] = refresh_token
+          }
+        }
+        for (const alias of ['accessToken', 'access_token']) {
+          if (Object.prototype.hasOwnProperty.call(rotatedCredentials, alias)) {
+            rotatedCredentials[alias] = access_token
+          }
+        }
+        const updated = storeManager.updateAccount(this.account.id, {
+          credentials: rotatedCredentials,
+        })
+        if (!updated || updated.id !== original.id ||
+            updated.providerId !== original.providerId) {
+          throw new Error('GLM credential persistence failed')
+        }
+      } catch {
+        throw failure('GLM credential persistence failed', response.status)
       }
-      await storeManager.updateAccount(this.account.id, {
-        credentials: decryptedCredentials,
-      })
     }
 
+    // Publish only validated credentials after any required durable update.
+    // Existing selected snapshots and the newly stored refresh key share access.
+    tokenCache.set(refreshToken, tokenInfo)
+    if (refresh_token !== refreshToken) tokenCache.set(refresh_token, tokenInfo)
     console.log('[GLM] Token refresh successful')
     return access_token
   }
 
-  /**
-   * Check if URL is base64 data
-   */
-  private isBase64Data(url: string): boolean {
-    return url.startsWith('data:')
-  }
-
-  /**
-   * Extract MIME type from base64 data URL
-   */
-  private extractBase64Format(url: string): string {
-    const match = url.match(/^data:([^;]+);/)
-    return match ? match[1] : 'application/octet-stream'
-  }
-
-  /**
-   * Remove base64 data header
-   */
-  private removeBase64Header(url: string): string {
-    return url.replace(/^data:[^;]+;base64,/, '')
-  }
-
-  /**
-   * Upload file to GLM
-   */
-  private async uploadFile(fileUrl: string): Promise<{ source_id: string; file_url?: string }> {
-    console.log('[GLM] Uploading file')
-    
-    let filename: string
-    let fileData: Buffer
-    let mimeType: string
-
-    if (this.isBase64Data(fileUrl)) {
-      mimeType = this.extractBase64Format(fileUrl)
-      const ext = mime.extension(mimeType) || 'bin'
-      filename = `${uuid()}.${ext}`
-      fileData = Buffer.from(this.removeBase64Header(fileUrl), 'base64')
-    } else {
-      filename = path.basename(fileUrl.split('?')[0])
-      const response = await axios.get(fileUrl, {
-        responseType: 'arraybuffer',
-        maxContentLength: FILE_MAX_SIZE,
-        timeout: 60000,
-      })
-      fileData = Buffer.from(response.data)
-      mimeType = typeof response.headers['content-type'] === 'string'
-        ? response.headers['content-type']
-        : mime.lookup(filename) || 'application/octet-stream'
-    }
-
-    const formData = new FormData()
-    formData.append('file', fileData, {
-      filename,
-      contentType: mimeType,
-    })
-
-    const token = await this.acquireToken()
-    const response = await axios.post(
-      `${GLM_API_BASE}/backend-api/assistant/file_upload`,
-      formData,
-      {
-        headers: {
-          Authorization: `Bearer ${token}`,
-          Referer: 'https://chatglm.cn/',
-          ...FAKE_HEADERS,
-          ...formData.getHeaders(),
-        },
-        maxBodyLength: FILE_MAX_SIZE,
-        timeout: 60000,
-        validateStatus: () => true,
+  /** Validate the entire request and prepare bounded bytes before provider auth. */
+  private async prepareAttachments(messages: GLMMessage[]): Promise<PreparedAttachment[]> {
+    let sources: AttachmentSource[]
+    let remainingInline: number
+    try {
+      const { fileUrls, imageUrls } = this.extractFileUrls(messages)
+      if (fileUrls.length + imageUrls.length > ATTACHMENT_MAX_COUNT) throw attachmentFailure()
+      sources = [
+        ...fileUrls.map(url => parseAttachmentSource('file', url)),
+        ...imageUrls.map(url => parseAttachmentSource('image', url)),
+      ]
+      remainingInline = sources.reduce((sum, source) => sum + (source.type === 'data' ? source.size : 0), 0)
+      if (remainingInline + sources.filter(source => source.type === 'https').length > FILE_MAX_SIZE) {
+        throw attachmentFailure()
       }
-    )
+    } catch { throw new GLMAttachmentInputFailure() }
+    try {
+      const pins = new Map<string, readonly AttachmentAddress[]>()
+      for (const source of sources) {
+        if (source.type !== 'https' || pins.has(source.hostname)) continue
+        if (source.literal) {
+          pins.set(source.hostname, Object.freeze([Object.freeze(source.literal)]))
+          continue
+        }
+        // Lazy imports keep text-only/stream consumers free of attachment I/O.
+        const { lookup } = await import('node:dns/promises')
+        let timer: ReturnType<typeof setTimeout> | undefined
+        let answers: import('node:dns').LookupAddress[]
+        try {
+          answers = await Promise.race([
+            lookup(source.hostname, { all: true, verbatim: true }),
+            new Promise<never>((_, reject) => { timer = setTimeout(() => reject(attachmentFailure()), ATTACHMENT_DNS_TIMEOUT) }),
+          ])
+        } finally { if (timer !== undefined) clearTimeout(timer) }
+        if (!Array.isArray(answers) || answers.length < 1 || answers.length > 64) throw attachmentFailure()
+        const verified = answers.map(answer => {
+          const address = publicAttachmentAddress(answer?.address)
+          if (!address || address.family !== answer.family) throw attachmentFailure()
+          return Object.freeze(address)
+        })
+        pins.set(source.hostname, Object.freeze(verified))
+      }
+      const prepared: PreparedAttachment[] = []
+      let used = 0
+      for (const source of sources) {
+        if (source.type === 'data') {
+          remainingInline -= source.size
+          const data = Buffer.from(source.encoded, 'base64')
+          if (data.length !== source.size) throw attachmentFailure()
+          used += data.length
+          prepared.push({ kind: source.kind, data, mimeType: source.mimeType })
+        } else {
+          const limit = FILE_MAX_SIZE - used - remainingInline
+          if (limit < 1) throw attachmentFailure()
+          const file = await this.downloadAttachment(source, pins.get(source.hostname)!, limit)
+          used += file.data.length
+          prepared.push(file)
+        }
+      }
+      return prepared
+    } catch { throw attachmentFailure() }
+  }
 
-    if (response.status !== 200 || !response.data?.result) {
-      throw new Error(`File upload failed: HTTP ${response.status}`)
+  private async downloadAttachment(
+    source: Extract<AttachmentSource, { type: 'https' }>,
+    addresses: readonly AttachmentAddress[],
+    limit: number,
+  ): Promise<PreparedAttachment> {
+    const { Agent } = await import('node:https')
+    // The socket's lookup can ONLY return the already verified addresses. It
+    // cannot perform a second DNS lookup or follow a changed private answer.
+    const lookup: import('node:net').LookupFunction = (hostname, options, callback) => {
+      const expectedHost = hostname.replace(/^\[|\]$/g, '').toLowerCase()
+      const family = typeof options === 'number' ? options : options?.family || 0
+      const all = typeof options === 'object' && (options as { all?: boolean }).all === true
+      const selected = addresses.filter(address => !family || address.family === family)
+      queueMicrotask(() => {
+        if (expectedHost !== source.hostname || !selected.length ||
+            selected.some(address => !publicAttachmentAddress(address.address))) {
+          callback(attachmentFailure(), '', 0)
+        } else if (all) {
+          const allCallback = callback as unknown as (error: Error | null, records: AttachmentAddress[]) => void
+          allCallback(null, selected.map(address => ({ ...address })))
+        } else {
+          callback(null, selected[0].address, selected[0].family)
+        }
+      })
     }
+    const agent = new Agent({ keepAlive: false, maxSockets: 1, maxCachedSessions: 0,
+      rejectUnauthorized: true, lookup })
+    try {
+      const response = await axios.get(source.url.href, {
+        responseType: 'arraybuffer',
+        maxContentLength: limit,
+        timeout: 60000,
+        httpsAgent: agent,
+        proxy: false,
+        maxRedirects: 0,
+        // Axios treats false as a disabled header even when defaults contain it.
+        headers: { Authorization: false, Cookie: false, 'Proxy-Authorization': false },
+        validateStatus: status => status === 200,
+      })
+      if (response.status !== 200 || !Buffer.isBuffer(response.data) ||
+          response.data.length < 1 || response.data.length > limit) throw attachmentFailure()
+      const length = response.headers?.['content-length']
+      if (length !== undefined && ((typeof length !== 'string' && typeof length !== 'number') ||
+          !/^\d+$/.test(String(length)) || !Number.isSafeInteger(Number(length)) || Number(length) > limit)) {
+        throw attachmentFailure()
+      }
+      const contentType = response.headers?.['content-type']
+      if (contentType !== undefined && (typeof contentType !== 'string' || contentType.length > 256 ||
+          /[\u0000-\u001f\u007f]/.test(contentType))) throw attachmentFailure()
+      const mimeType = typeof contentType === 'string' ? contentType.split(';')[0].trim().toLowerCase()
+        : mime.lookup(source.url.pathname) || 'application/octet-stream'
+      if (!isAttachmentMimeType(mimeType)) throw attachmentFailure()
+      return { kind: source.kind, data: response.data, mimeType }
+    } catch { throw attachmentFailure() }
+    finally { agent.destroy() }
+  }
 
-    console.log('[GLM] File uploaded successfully')
-    return response.data.result
+  private async uploadFile(file: PreparedAttachment, token: string): Promise<{ source_id: string; file_url?: string }> {
+    try {
+      console.log('[GLM] Uploading file')
+      const extension = mime.extension(file.mimeType) || 'bin'
+      const filename = `${uuid()}.${/^[a-z0-9]{1,16}$/i.test(extension) ? extension : 'bin'}`
+      const formData = new FormData()
+      formData.append('file', file.data, { filename, contentType: file.mimeType })
+      const response = await axios.post(
+        `${GLM_API_BASE}/backend-api/assistant/file_upload`, formData,
+        {
+          headers: {
+            Authorization: `Bearer ${token}`, Referer: 'https://chatglm.cn/',
+            ...FAKE_HEADERS, ...formData.getHeaders(),
+          },
+          maxBodyLength: FILE_MAX_SIZE + 16384, // bounded multipart overhead
+          timeout: 60000, maxRedirects: 0, validateStatus: () => true,
+        }
+      )
+      const result = response.data?.result
+      if (response.status !== 200 || !result || typeof result !== 'object' || Array.isArray(result) ||
+          typeof result.source_id !== 'string' || !result.source_id.trim() || result.source_id.length > 512 ||
+          /[\u0000-\u001f\u007f]/.test(result.source_id) ||
+          (result.file_url !== undefined && (typeof result.file_url !== 'string' || !result.file_url.trim() ||
+            result.file_url.length > ATTACHMENT_URL_MAX_LENGTH || /[\u0000-\u001f\u007f]/.test(result.file_url)))) {
+        throw attachmentFailure()
+      }
+      console.log('[GLM] File uploaded successfully')
+      return { source_id: result.source_id, ...(result.file_url !== undefined ? { file_url: result.file_url } : {}) }
+    } catch { throw attachmentFailure() }
   }
 
   /**
@@ -265,12 +526,16 @@ export class GLMAdapter {
     const imageUrls: string[] = []
 
     for (const msg of messages) {
+      if (!msg || typeof msg !== 'object') throw attachmentFailure()
       if (Array.isArray(msg.content)) {
         for (const part of msg.content) {
-          if (part.type === 'image_url' && part.image_url?.url) {
-            imageUrls.push(part.image_url.url)
-          } else if (part.type === 'file' && part.file_url?.url) {
-            fileUrls.push(part.file_url.url)
+          if (!part || typeof part !== 'object' || Array.isArray(part)) throw attachmentFailure()
+          if (part.type === 'image_url' || part.type === 'file') {
+            const value = part.type === 'image_url' ? part.image_url?.url : part.file_url?.url
+            if (typeof value !== 'string' || !value.length) throw attachmentFailure()
+            if (part.type === 'image_url') imageUrls.push(value)
+            else fileUrls.push(value)
+            if (fileUrls.length + imageUrls.length > ATTACHMENT_MAX_COUNT) throw attachmentFailure()
           }
         }
       }
@@ -283,7 +548,7 @@ export class GLMAdapter {
     const toolProfile = getProviderToolProfile('glm')
     // Separate image refs and file refs
     const imageRefs = refs.filter((ref) => ref.width !== undefined || ref.height !== undefined || ref.image_url)
-    const fileRefs = refs.filter((ref) => !ref.width && !ref.height && !ref.image_url)
+    const fileRefs = refs.filter((ref) => ref.width === undefined && ref.height === undefined && !ref.image_url)
 
     // Build content array
     const content: any[] = []
@@ -313,23 +578,49 @@ export class GLMAdapter {
     const processedMessages = messages.map(msg => {
       // Handle tool calls in assistant message
       if (msg.role === 'assistant' && msg.tool_calls && msg.tool_calls.length > 0) {
+        const callsText = toolProfile.formatAssistantToolCalls(msg.tool_calls.map(tc => ({
+          id: tc.id,
+          name: tc.function.name,
+          arguments: tc.function.arguments,
+        })))
+        const precedingText = typeof msg.content === 'string' ? msg.content
+          : Array.isArray(msg.content)
+            ? msg.content.filter((part: any) => part.type === 'text')
+              .map((part: any) => part.text).join('')
+            : ''
         return {
           ...msg,
-          content: toolProfile.formatAssistantToolCalls(msg.tool_calls.map(tc => ({
-            id: tc.id,
-            name: tc.function.name,
-            arguments: tc.function.arguments,
-          }))),
+          // Keep the assistant's actual text before the serialized tool call;
+          // the next tool-result turn depends on both pieces of history.
+          content: precedingText ? precedingText + '\n' + callsText : callsText,
         }
       }
       // Handle tool response message
       if (msg.role === 'tool' && msg.tool_call_id) {
+        let toolResultText: string
+        if (typeof msg.content === 'string') {
+          toolResultText = msg.content
+        } else if (Array.isArray(msg.content) && msg.content.length > 0) {
+          toolResultText = msg.content.map((part: unknown) => {
+            if (!part || typeof part !== 'object' || Array.isArray(part)) {
+              throw new Error('GLM tool result content is not supported')
+            }
+            const item = part as { type?: unknown, text?: unknown }
+            if (item.type !== 'text' || typeof item.text !== 'string' ||
+                Object.keys(item).some(key => key !== 'type' && key !== 'text')) {
+              throw new Error('GLM tool result content is not supported')
+            }
+            return item.text
+          }).join('')
+        } else {
+          throw new Error('GLM tool result content is not supported')
+        }
         return { 
           ...msg, 
           role: 'user' as const,
           content: toolProfile.formatToolResult({
             toolCallId: msg.tool_call_id,
-            content: String(msg.content || ''),
+            content: toolResultText,
           }),
         }
       }
@@ -420,11 +711,11 @@ export class GLMAdapter {
   }
 
   async chatCompletion(request: ChatCompletionRequest): Promise<{ response: AxiosResponse; conversationId: string }> {
-    const token = await this.acquireToken()
-    const sign = generateSign()
-
     // Clone messages to avoid modifying original request
     const messages = [...request.messages]
+    const attachments = await this.prepareAttachments(messages)
+    const token = await this.acquireToken()
+    const sign = generateSign()
 
     // Check if tool prompt has already been injected by client
     const toolPromptExists = hasToolPromptInjected(messages)
@@ -456,36 +747,14 @@ GLM STRICT RULES:
       }
     }
 
-    // Extract and upload files
-    const { fileUrls, imageUrls } = this.extractFileUrls(messages)
+    // All sources and bytes were verified before authentication. Upload failure
+    // aborts this request; it must never silently produce an answer without files.
     const refs: any[] = []
-
-    // Upload files
-    for (const fileUrl of fileUrls) {
-      try {
-        const result = await this.uploadFile(fileUrl)
-        refs.push({
-          source_id: result.source_id,
-          file_url: result.file_url || fileUrl,
-        })
-      } catch (error) {
-        console.error('[GLM] Failed to upload file')
-      }
-    }
-
-    // Upload images
-    for (const imageUrl of imageUrls) {
-      try {
-        const result = await this.uploadFile(imageUrl)
-        refs.push({
-          source_id: result.source_id,
-          image_url: result.file_url || imageUrl,
-          width: 0,
-          height: 0,
-        })
-      } catch (error) {
-        console.error('[GLM] Failed to upload image')
-      }
+    for (const attachment of attachments) {
+      const result = await this.uploadFile(attachment, token)
+      refs.push(attachment.kind === 'file'
+        ? { source_id: result.source_id, file_url: result.file_url }
+        : { source_id: result.source_id, image_url: result.file_url, width: 0, height: 0 })
     }
 
     const preparedMessages = this.messagesToPrompt(messages, refs, toolsPrompt, false)
@@ -514,11 +783,11 @@ GLM STRICT RULES:
     // Use originalModel for feature detection (preserves user's intent before mapping)
     const modelForDetection = request.originalModel || request.model
     const modelLower = modelForDetection.toLowerCase()
-    if (!chatMode && (modelLower.includes('think') || modelLower.includes('zero'))) {
+    if (!chatMode && request.reasoning_effort === undefined && (modelLower.includes('think') || modelLower.includes('zero'))) {
       chatMode = 'zero'
       console.log('[GLM] Using reasoning mode (from model name)')
     }
-    if (!chatMode && modelLower.includes('deepresearch')) {
+    if (!chatMode && request.deep_research === undefined && modelLower.includes('deepresearch')) {
       chatMode = 'deep_research'
       console.log('[GLM] Using deep research mode (from model name)')
     }
@@ -564,6 +833,7 @@ GLM STRICT RULES:
           'X-Nonce': sign.nonce,
         },
         timeout: 120000,
+        maxRedirects: 0,
         validateStatus: () => true,
         responseType: 'stream',
       }
@@ -594,6 +864,7 @@ GLM STRICT RULES:
             ...FAKE_HEADERS,
           },
           timeout: 15000,
+          maxRedirects: 0,
           validateStatus: () => true,
         }
       )
@@ -631,6 +902,7 @@ GLM STRICT RULES:
               ...FAKE_HEADERS,
             },
             timeout: 30000,
+            maxRedirects: 0,
             validateStatus: () => true,
           }
         )
@@ -680,6 +952,7 @@ GLM STRICT RULES:
             ...FAKE_HEADERS,
           },
           timeout: 60000,
+          maxRedirects: 0,
           validateStatus: () => true,
         }
       )
@@ -699,8 +972,23 @@ GLM STRICT RULES:
   }
 
   static isGLMProvider(provider: Provider): boolean {
-    return provider.id === 'glm' || provider.apiEndpoint.includes('chatglm.cn')
+    if (provider.id === 'glm') return true
+    // Only the actual first-party chat origin may act as an alias. A URL path
+    // or unrelated hostname containing chatglm.cn is a generic provider.
+    try {
+      const url = new URL(provider.apiEndpoint)
+      return url.origin === 'https://chatglm.cn' &&
+        !url.username && !url.password
+    } catch {
+      return false
+    }
   }
+}
+
+function hasValidGLMTextContent(part: any): boolean {
+  return !Array.isArray(part?.content) ||
+    part.content.every((item: any) =>
+      item?.type !== 'text' || typeof item.text === 'string')
 }
 
 export class GLMStreamHandler {
@@ -732,14 +1020,27 @@ export class GLMStreamHandler {
     let failed = false
     const decoder = new TextDecoder('utf-8', { fatal: true })
     let pendingWire = ''
+    let completed = false
+    const releaseRaw = () => {
+      // A rejected or client-aborted converted stream must release the
+      // original HTTP response. No remote retry or delete is attempted.
+      try { if (typeof stream?.destroy === 'function' && !stream.destroyed) stream.destroy() } catch { /* local only */ }
+    }
     const fail = () => {
-      if (failed || transStream.writableEnded) return
+      if (failed || completed) return
       failed = true
+      releaseRaw()
       transStream.end('data: {"error":{"code":"glm_response_incomplete","type":"api_error"}}\n\n')
     }
 
+    transStream.once('close', () => {
+      if (!completed && !failed) {
+        failed = true
+        releaseRaw()
+      }
+    })
     const finalize = () => {
-      if (failed || transStream.writableEnded) return
+      if (failed || transStream.destroyed || transStream.writableEnded) return
       if (!sawFinish) {
         fail()
         return
@@ -760,6 +1061,7 @@ export class GLMStreamHandler {
         created: this.created,
       }) + '\n\n')
       transStream.end('data: [DONE]\n\n')
+      completed = true
       this.onEnd?.()
     }
 
@@ -798,6 +1100,7 @@ export class GLMStreamHandler {
           if (result.status !== 'finish') {
             if (result.parts) {
               result.parts.forEach((part: any) => {
+                if (!hasValidGLMTextContent(part)) throw new Error('GLM text part is invalid')
                 const index = cachedParts.findIndex((p) => p.logic_id === part.logic_id)
                 if (index !== -1) {
                   cachedParts[index] = part
@@ -988,6 +1291,7 @@ export class GLMStreamHandler {
                 // Accumulate parts (same as handleStream), don't replace
                 // GLM sends incremental parts, each event only contains new content
                 result.parts.forEach((part: any) => {
+                  if (!hasValidGLMTextContent(part)) throw new Error('GLM text part is invalid')
                   const index = cachedParts.findIndex((p) => p.logic_id === part.logic_id)
                   if (index !== -1) {
                     cachedParts[index] = part
@@ -1060,7 +1364,7 @@ export class GLMStreamHandler {
               })
 
               const { content: cleanContent, toolCalls } =
-                (this.toolCallingPlan?.toolChoiceMode === 'none' || this.toolCallingPlan?.shouldParseResponse)
+                (this.toolCallingPlan?.mode === 'disabled' || this.toolCallingPlan?.toolChoiceMode === 'none' || this.toolCallingPlan?.shouldParseResponse)
                 ? { content: fullText, toolCalls: [] }
                 : parseToolCallsFromText(fullText, 'glm')
 

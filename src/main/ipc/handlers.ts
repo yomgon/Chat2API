@@ -3,7 +3,7 @@ import type { IpcMainInvokeEvent } from 'electron'
 import { join } from 'path'
 import { pathToFileURL } from 'url'
 import axios from 'axios'
-import { randomUUID } from 'crypto'
+import { randomUUID, randomBytes } from 'crypto'
 import { IpcChannels } from './channels'
 import { storeManager } from '../store/store'
 import { ProviderManager } from '../store/providers'
@@ -18,6 +18,7 @@ import { parseKimiWebChatCatalog, parseMimoWebChatCatalog } from '../providers/w
 import { getBuiltinProviders, getBuiltinProvider } from '../providers/builtin'
 import { oauthManager } from '../oauth/manager'
 import { isTrustedIpcSender } from './trustedSender'
+import { isTestQuietStartup } from '../quietStartup'
 import { isSafeExternalLink } from '../window/navigationGuard'
 import { proxyServer } from '../proxy/server'
 import { proxyStatusManager } from '../proxy/status'
@@ -58,6 +59,15 @@ function makeTrustedHandler(owner: BrowserWindow | null) {
       return listener(event, ...args)
     })
   }
+}
+
+/** Account list/detail/edit receipts contain metadata, not OS ciphertext or
+ * decrypted login secrets. A renderer may submit new credentials deliberately,
+ * but reading or renaming an existing account must not round-trip them via IPC.
+ * Keep a structurally valid Account object for existing React consumers. */
+function toRendererAccountMetadata(account: Account): Account {
+  const { credentials: _credentials, ...metadata } = account
+  return { ...metadata, credentials: {} }
 }
 
 const clearChatsHandlers: Record<string, (provider: Provider, account: Account) => Promise<boolean>> = {
@@ -343,7 +353,7 @@ export async function registerIpcHandlers(mainWindow: BrowserWindow | null): Pro
 
   // Check if auto-start proxy is needed
   const config = storeManager.getConfig()
-  if (config.autoStartProxy) {
+  if (config.autoStartProxy && !isTestQuietStartup()) {
     console.log('[App] Auto-starting proxy service...')
     const proxyPort = config.proxyPort
     const proxyHost = config.proxyHost || '127.0.0.1'
@@ -464,15 +474,96 @@ export async function registerIpcHandlers(mainWindow: BrowserWindow | null): Pro
     return storeManager.getConfig()
   })
 
-  handleTrusted(IpcChannels.CONFIG_UPDATE, async (_, updates: Partial<AppConfig>) => {
+  handleTrusted(IpcChannels.CONFIG_UPDATE, async (_, updates: Partial<AppConfig>,
+    options?: { expectedModelMappings?: StoreAppConfig['modelMappings'] }) => {
+    // Generic preferences are not an API-key CRUD endpoint. Whole-list
+    // snapshots from a stale GUI could resurrect a key deleted or regenerated
+    // through management HTTP, including an already revoked credential.
+    if (!updates || typeof updates !== 'object' || Array.isArray(updates) ||
+        Object.prototype.hasOwnProperty.call(updates, 'apiKeys')) {
+      throw new Error('API keys require dedicated key mutation operations')
+    }
+    // The mapping editor saves a complete draft list. Refuse it if an
+    // independently committed management HTTP mapping edit occurred since the
+    // editor loaded that draft; otherwise it could erase new aliases or pins.
+    if (Object.prototype.hasOwnProperty.call(updates, 'modelMappings')) {
+      const baseline = options?.expectedModelMappings
+      if (!baseline || typeof baseline !== 'object' || Array.isArray(baseline) ||
+          JSON.stringify(storeManager.getConfig().modelMappings) !== JSON.stringify(baseline)) {
+        throw new Error('Model mappings changed externally; reload before saving')
+      }
+    }
     const newConfig = storeManager.updateConfig(updates as Partial<StoreAppConfig>)
     
-    BrowserWindow.getAllWindows().forEach((win) => {
-      if (!win.isDestroyed()) {
-        win.webContents.send(IpcChannels.CONFIG_CHANGED, newConfig)
+    // The full config includes API keys and management credentials. Only the
+    // trusted application owner window may receive it. In-app OAuth/login
+    // windows must never receive a copy, even if a window was opened while
+    // this setting changed. It is also optional after the durable commit.
+    try {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send(IpcChannels.CONFIG_CHANGED, newConfig)
       }
-    })
+    } catch {
+      // A failed postcommit renderer notification cannot undo the write.
+    }
     
+    return true
+  })
+
+  // Read the authoritative list immediately before each single synchronous
+  // durable write. Never accept a renderer-supplied API key list, full secret,
+  // usage count or stale row snapshot. The trusted IPC sender check is applied
+  // to these handlers by handleTrusted.
+  handleTrusted(IpcChannels.API_KEYS_CREATE, async (_, name: string) => {
+    if (typeof name !== 'string' || !name.trim() || name.length > 200) {
+      throw new Error('Invalid API key name')
+    }
+    const current = storeManager.getConfig()
+    // Retain the private GUI's existing sk- + 48 alphanumeric wire format.
+    // Rejection sampling (not modulo on the full 0..255 byte range) avoids
+    // bias. Generation now occurs only inside the trusted main process.
+    const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
+    const rejectionLimit = 256 - (256 % alphabet.length)
+    let rawKey = 'sk-'
+    while (rawKey.length < 51) {
+      for (const byte of randomBytes(64)) {
+        if (byte >= rejectionLimit) continue
+        rawKey += alphabet[byte % alphabet.length]
+        if (rawKey.length === 51) break
+      }
+    }
+    const key = {
+      id: randomUUID(),
+      name: name.trim(),
+      key: rawKey,
+      enabled: true,
+      createdAt: Date.now(),
+      usageCount: 0,
+    }
+    storeManager.updateConfig({ apiKeys: [...current.apiKeys, key] })
+    return key
+  })
+
+  handleTrusted(IpcChannels.API_KEYS_SET_ENABLED, async (_, id: string, enabled: boolean) => {
+    if (typeof id !== 'string' || !id.trim() || typeof enabled !== 'boolean') {
+      throw new Error('Invalid API key status update')
+    }
+    const current = storeManager.getConfig()
+    const key = current.apiKeys.find(k => k.id === id)
+    if (!key) throw new Error('API key not found')
+    if (key.enabled === enabled) return key
+    const updatedKey = { ...key, enabled }
+    storeManager.updateConfig({
+      apiKeys: current.apiKeys.map(k => k.id === id ? updatedKey : k),
+    })
+    return updatedKey
+  })
+
+  handleTrusted(IpcChannels.API_KEYS_DELETE, async (_, id: string) => {
+    if (typeof id !== 'string' || !id.trim()) throw new Error('Invalid API key identifier')
+    const current = storeManager.getConfig()
+    if (!current.apiKeys.some(k => k.id === id)) return false
+    storeManager.updateConfig({ apiKeys: current.apiKeys.filter(k => k.id !== id) })
     return true
   })
 
@@ -542,6 +633,13 @@ export async function registerIpcHandlers(mainWindow: BrowserWindow | null): Pro
   })
 
   handleTrusted(IpcChannels.PROVIDERS_CHECK_STATUS, async (_, providerId: string): Promise<ProviderCheckResult> => {
+    // Reject BEFORE looking up a provider or touching its status/storage.
+    // A renderer can invoke this channel directly even if its Dashboard
+    // avoids the automatic refresh.
+    if (isTestQuietStartup()) {
+      return { providerId: typeof providerId === 'string' ? providerId : '',
+        status: 'unknown', error: 'Provider status checks paused for isolated test startup' }
+    }
     const provider = ProviderManager.getById(providerId)
 
     if (!provider) {
@@ -564,6 +662,7 @@ export async function registerIpcHandlers(mainWindow: BrowserWindow | null): Pro
   })
 
   handleTrusted(IpcChannels.PROVIDERS_CHECK_ALL_STATUS, async (): Promise<Record<string, ProviderCheckResult>> => {
+    if (isTestQuietStartup()) return {}
     const providers = ProviderManager.getAll()
     const results: Record<string, ProviderCheckResult> = {}
     
@@ -662,15 +761,17 @@ export async function registerIpcHandlers(mainWindow: BrowserWindow | null): Pro
   })
 
   handleTrusted(IpcChannels.ACCOUNTS_GET_ALL, async (_, includeCredentials?: boolean): Promise<Account[]> => {
-    return AccountManager.getAll(includeCredentials)
+    // Legacy callers may pass true; that must not expose decrypted credentials.
+    return AccountManager.getAll(false).map(toRendererAccountMetadata)
   })
 
   handleTrusted(IpcChannels.ACCOUNTS_GET_BY_ID, async (_, id: string, includeCredentials?: boolean): Promise<Account | null> => {
-    return storeManager.getAccountById(id, includeCredentials) || null
+    const account = storeManager.getAccountById(id, false)
+    return account ? toRendererAccountMetadata(account) : null
   })
 
   handleTrusted(IpcChannels.ACCOUNTS_GET_BY_PROVIDER, async (_, providerId: string): Promise<Account[]> => {
-    return storeManager.getAccountsByProviderId(providerId)
+    return storeManager.getAccountsByProviderId(providerId, false).map(toRendererAccountMetadata)
   })
 
   handleTrusted(IpcChannels.ACCOUNTS_ADD, async (_, data: {
@@ -680,11 +781,12 @@ export async function registerIpcHandlers(mainWindow: BrowserWindow | null): Pro
     credentials: Record<string, string>
     dailyLimit?: number
   }): Promise<Account> => {
-    return AccountManager.create(data)
+    return toRendererAccountMetadata(AccountManager.create(data))
   })
 
   handleTrusted(IpcChannels.ACCOUNTS_UPDATE, async (_, id: string, updates: Partial<Account>): Promise<Account | null> => {
-    return AccountManager.update(id, updates)
+    const account = AccountManager.updateEditable(id, updates)
+    return account ? toRendererAccountMetadata(account) : null
   })
 
   handleTrusted(IpcChannels.ACCOUNTS_DELETE, async (_, id: string): Promise<boolean> => {
@@ -952,6 +1054,10 @@ export async function registerIpcHandlers(mainWindow: BrowserWindow | null): Pro
 
   handleTrusted(IpcChannels.APP_GET_VERSION, async (): Promise<string> => {
     return app.getVersion()
+  })
+
+  handleTrusted(IpcChannels.APP_GET_TEST_QUIET_STARTUP, async (): Promise<boolean> => {
+    return isTestQuietStartup()
   })
 
   handleTrusted(IpcChannels.APP_CHECK_UPDATE, async () => {
